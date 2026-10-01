@@ -22,7 +22,7 @@
 
 ## 🆕 本仓库相比上游新增的功能
 
-以下功能为本仓库独有，上游 [Johnny520/WeKit](https://github.com/Johnny520/WeKit) 暂未包含：
+以下功能为本仓库独有，上游 [Johnny520/wcx](https://github.com/Johnny520/wcx) 暂未包含：
 
 > **一句话总结**：在上游基础上新增定时发送消息、自定义通知铃声、一键关闭所有日志、联系人选择全屏化，并维护每日自动同步上游的云端构建。
 
@@ -52,7 +52,7 @@
 
 | 机制 | 说明 |
 |---|---|
-| **每日自动检查** | 每天北京时间 09:00 检查上游 [Johnny520/WeKit](https://github.com/Johnny520/WeKit) 是否更新（上游已重构改名，默认仅检测、不自动合并） |
+| **每日自动检查** | 每天北京时间 09:00 检查上游 [Johnny520/wcx](https://github.com/Johnny520/wcx) 是否更新 |
 | **自动同步出包** | 上游有更新 → 自动合并本仓库改动 → 云端构建 4 个 APK → 自动发布到 Releases（标签 `auto-<上游提交号>`） |
 | **无更新省配额** | 上游无更新时跳过构建，不消耗 Actions 时长 |
 | **手动出包** | Actions 页 → 选工作流 → Run workflow；勾选 `force_release` 可强制发布 Release |
@@ -103,7 +103,7 @@
 
 ## 📚 原仓库功能总览（275 项）
 
-以下为上游 [Johnny520/WeKit](https://github.com/Johnny520/WeKit) 的全部功能（含本仓库新增）。`API` 类为内部服务接口，供脚本引擎与 WeAgent AI 助手调用。
+以下为上游 [Johnny520/wcx](https://github.com/Johnny520/wcx) 的全部功能（含本仓库新增）。`API` 类为内部服务接口，供脚本引擎与 WeAgent AI 助手调用。
 
 ### 💬 聊天（89 项）
 
@@ -201,7 +201,7 @@ API + MCP 服务器 · WeAgent 内置 AI 助手 · 禁止微信检测 Xposed · 
 
 ## 🙏 致谢
 
-- 上游项目：[Johnny520/WeKit](https://github.com/Johnny520/WeKit)（原仓库名 wcx，现已整包重构并改名，本仓库暂不自动合并其代码）
+- 上游项目：[Johnny520/wcx](https://github.com/Johnny520/wcx)（WeKit）
 - 本分支的全部功能实现均基于上游代码，新增功能见「本仓库相比上游新增的功能」一节
 
 ## 💝 捐赠
