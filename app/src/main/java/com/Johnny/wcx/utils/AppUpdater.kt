@@ -55,6 +55,9 @@ sealed interface UpdateResult {
 
     /** Something went wrong while checking or downloading. */
     data class Error(val cause: Throwable) : UpdateResult
+
+    /** 本 fork 已关闭应用内更新检查（见 [UPDATE_CHECK_ENABLED]）。 */
+    data object Disabled : UpdateResult
 }
 
 // ─── GitHub Release API ────────────────────────────────────────────────────
@@ -64,6 +67,15 @@ private const val GITHUB_API_LATEST =
 private const val GITHUB_API_RELEASES =
     "https://api.github.com/repos/dostume/wcx/releases?per_page=20"
 private const val RELEASES_PAGE = "https://github.com/dostume/wcx/releases"
+
+/**
+ * 本 fork (Bronzesakon/wcx) 关闭应用内更新检查。
+ *
+ * 原因: 上面的 release 接口指向 dostume/wcx, 而本 fork 的包与 dostume/上游签名不同、
+ * 版本号体系也不同 —— 检查结果必然误报"有新版本", 且下载到的包无法覆盖安装本 fork
+ * (必须先卸载)。改动后发布走 CI 的 latest release, 用户从 release 页手动下载。
+ */
+private const val UPDATE_CHECK_ENABLED = false
 
 // APKs are published per entry-point flavor: app-<flavor>-<abi>-release.apk.
 // Stay on the same flavor the installed build was compiled for.
@@ -136,6 +148,10 @@ object AppUpdater {
      * 兼容 CI 构建版和正式发行版，自动适配不同的 tag 命名
      */
     suspend fun checkForUpdate(): UpdateResult = withContext(Dispatchers.IO) {
+        if (!UPDATE_CHECK_ENABLED) {
+            WeLogger.i("AppUpdater", "${WeLogger.FORK_LOG_PREFIX} update check disabled in this fork, skipping")
+            return@withContext UpdateResult.Disabled
+        }
         runCatching {
             val release = fetchLatestRelease()
 
@@ -169,6 +185,8 @@ object AppUpdater {
      * @return 按发布时间倒序排列的 Release 列表，最多 20 个
      */
     suspend fun getReleaseHistory(): Result<List<ReleaseItem>> = withContext(Dispatchers.IO) {
+        // 更新检查关闭时不再请求 dostume 的 release 接口, UI 显示"暂无更新记录"
+        if (!UPDATE_CHECK_ENABLED) return@withContext Result.success(emptyList())
         runCatching {
             val releases = fetchAllReleases()
             releases.map { release ->

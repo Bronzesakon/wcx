@@ -196,6 +196,8 @@ fun HomePager(onOpenFeatures: () -> Unit) {
     var latestVersion by remember { mutableStateOf<String?>(null) }
     var isLatest by remember { mutableStateOf(false) }
     var isChecking by remember { mutableStateOf(true) }
+    // 本 fork 关闭了应用内更新检查 (AppUpdater.UPDATE_CHECK_ENABLED=false), 用于 UI 如实显示
+    var updateCheckDisabled by remember { mutableStateOf(false) }
 
     // 设备信息：微信版本和运行环境在重组间保持稳定
     val wechatVersion = remember { safeGetWeChatVersionInfo(context) }
@@ -217,6 +219,11 @@ fun HomePager(onOpenFeatures: () -> Unit) {
                 }
                 is UpdateResult.Error -> {
                     WeLogger.e("HomePager", "Failed to check update", result.cause)
+                    latestVersion = null
+                    isLatest = false
+                }
+                is UpdateResult.Disabled -> {
+                    updateCheckDisabled = true
                     latestVersion = null
                     isLatest = false
                 }
@@ -259,7 +266,7 @@ fun HomePager(onOpenFeatures: () -> Unit) {
         // ---- 大状态卡片 ----
         item {
             Spacer(Modifier.height(8.dp))
-            ActivationCard(latestVersion, isLatest, isChecking)
+            ActivationCard(latestVersion, isLatest, isChecking, updateCheckDisabled)
         }
 
         // ---- 统计卡片 ----
@@ -325,7 +332,12 @@ fun HomePager(onOpenFeatures: () -> Unit) {
 }
 
 @Composable
-private fun ActivationCard(latestVersion: String?, isLatest: Boolean, isChecking: Boolean) {
+private fun ActivationCard(
+    latestVersion: String?,
+    isLatest: Boolean,
+    isChecking: Boolean,
+    updateCheckDisabled: Boolean,
+) {
     val isDark = isSystemInDarkTheme()
     val context = LocalContext.current
     val accentColor = if (MiuixTheme.isDynamicColor) {
@@ -382,6 +394,7 @@ private fun ActivationCard(latestVersion: String?, isLatest: Boolean, isChecking
                     Text(
                         text = when {
                             isChecking -> "检查中..."
+                            updateCheckDisabled -> "已关闭更新检查"
                             isLatest -> "已是最新版本"
                             latestVersion != null -> "有更新"
                             else -> "检查失败"

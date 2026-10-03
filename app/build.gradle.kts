@@ -12,12 +12,6 @@ plugins {
     alias(libs.plugins.aboutlibraries.android)
 }
 
-fun getCommitCount(): Int {
-    return providers.exec {
-        commandLine("git", "rev-list", "--count", "HEAD")
-    }.standardOutput.asText.get().trim().toInt()
-}
-
 fun getGitHash(): String {
     return providers.exec {
         commandLine("git", "rev-parse", "--short", "HEAD")
@@ -38,7 +32,6 @@ android {
     }
     ndkVersion = libs.versions.ndk.get()
 
-    val commitCount = getCommitCount()
     val gitHash = getGitHash()
 
     // CI 发布时由 Sync Upstream & Build APK 工作流注入本次将发布的 Release tag
@@ -46,16 +39,19 @@ android {
     // 避免重复发布时每次启动都误报新版本。本地构建为空字符串。
     val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
 
-    // v194 基线：commitCount 基于 v148，偏移 +26
-    // 后续每增加一个 commit，versionCode 自动递增
-    val versionBaseOffset = 30  // v210 连号起点（commit 180+30=210，下次 commit 181+30=211）
+    // fork 版本号: 默认 261（高于 dostume 已发布的 260，保证被系统识别为更新而非降级）。
+    // 发版时可覆盖: -Pwcx.versionCode=262 -Pwcx.versionName=v262（CI 同样可传）。
+    val wcxVersionCode =
+        (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 261
+    val wcxVersionName =
+        (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v$wcxVersionCode"
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 258
-        versionName = "v258"
+        versionCode = wcxVersionCode
+        versionName = wcxVersionName
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")

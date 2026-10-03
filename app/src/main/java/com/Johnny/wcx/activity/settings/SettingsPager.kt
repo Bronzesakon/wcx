@@ -748,6 +748,7 @@ private fun checkForUpdate(
         showToastSuspend("正在检查更新...")
         when (val result = AppUpdater.checkForUpdate()) {
             UpdateResult.UpToDate -> showToastSuspend("已是最新版本")
+            UpdateResult.Disabled -> showToastSuspend("本版本已关闭更新检查")
             is UpdateResult.UpdateAvailable -> onAvailable(result)
             is UpdateResult.Error -> {
                 WeLogger.e("AppUpdater", "failed to check for updates", result.cause)
