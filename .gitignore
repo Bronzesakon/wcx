@@ -1,3 +1,6 @@
 /target/
 build/
 .gradle/
+
+# local-only handoff doc
+HANDOFF.md
