@@ -1227,14 +1227,26 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     /** 发送文本消息 */
     fun sendText(toUser: String, text: String): Boolean {
         return try {
-            WeLogger.i(TAG, "sending text message: $text")
             val sendMsgObject = methodGetSendMsgObject.method.invoke(null) ?: return false
             val msgObj = classNetSceneSendMsg.clazz.createInstance(toUser, text, 1, 0, null)
-            methodPostToQueue.method.invoke(sendMsgObject, msgObj) as? Boolean ?: false
+            // 入队后再打日志: logcat 写入在热路径上可达 0.5ms+ 尖峰, 不该算进"提交进队列"的耗时
+            methodPostToQueue.method.invoke(sendMsgObject, msgObj).also {
+                WeLogger.i(TAG, "${WeLogger.FORK_LOG_PREFIX} sending text message: $text")
+            } as? Boolean ?: false
         } catch (e: Exception) {
             WeLogger.e(TAG, "failed to send text message", e)
             false
         }
+    }
+
+    /**
+     * 预热文本发送的反射句柄: dex 委托首次访问才执行描述符解析(线性扫描方法表,
+     * 0.1-2ms 一次性开销), 供定时消息在启用阶段调用, 避免首个到点任务的首燃尖峰。
+     */
+    fun warmUpTextSend() {
+        methodGetSendMsgObject.method
+        classNetSceneSendMsg.clazz
+        methodPostToQueue.method
     }
 
     /** 发送文件消息 */

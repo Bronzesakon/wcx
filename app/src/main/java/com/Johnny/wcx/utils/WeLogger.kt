@@ -19,6 +19,9 @@ object WeLogger {
 
     private const val TAG = BuildConfig.TAG
 
+    /** 本 fork (Bronzesakon/wcx) 自有改动的日志前缀, 新增/修改的日志行统一带上, 便于与上游区分 */
+    const val FORK_LOG_PREFIX = "[bronzesakon-fork]"
+
     // ========== 全局日志开关（设置页"关闭所有日志"） ==========
 
     /** 文件系统上的开关标记：MMKV 尚未就绪的极早期（加载阶段）用得上 */

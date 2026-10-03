@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.result.PickVisualMediaRequest
@@ -98,6 +99,10 @@ object ScheduledMessage : ClickableFeature() {
     private const val SEGMENT_RETRY_DELAY_MS = 2_000L
     /** 单次任务迟到重试的间隔 */
     private const val ONETIME_RETRY_DELAY_MS = 30_000L
+    /** 进程内定时器最后一段进入自旋的提前量: 协程 delay 漂移可达数十 ms, 100ms 足以吸收 */
+    private const val SPIN_LEAD_MS = 100L
+    /** 自旋总时长上限: 墙钟被校时/回拨时放弃自旋直接触发, 避免长时间占住协程 worker */
+    private const val MAX_SPIN_MS = 150L
     /** 单个任务当天最多尝试次数, 超出则等明天, 防止失败时无限重试 */
     private const val MAX_FIRE_ATTEMPTS = 3
 
@@ -263,6 +268,11 @@ object ScheduledMessage : ClickableFeature() {
             WeLogger.e(TAG, "failed to schedule alarms", it)
         }
 
+        // 预热 sendText 反射句柄: dex 委托首次访问才做描述符解析(线性扫描, 0.1-2ms),
+        // 挪到启用阶段, 避免首个到点任务的首燃尖峰
+        runCatching { WeMessageApi.warmUpTextSend() }
+            .onFailure { WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} warm up text send handles failed", it) }
+
         startMonitor()
     }
 
@@ -424,9 +434,16 @@ object ScheduledMessage : ClickableFeature() {
         if (delayMs <= 0) return
         val job = scope.launch {
             try {
-                // 深度休眠期间 delay 依赖的单调时钟不会推进, 醒来时可能已经过点了;
-                // 过点也照常触发, 由 handleScheduleTrigger 内部的时间守卫与去重兜底
-                delay(delayMs)
+                // 两段式唤醒: 先粗睡到剩 SPIN_LEAD_MS, 再有界自旋贴准到点,
+                // 把协程 delay 的漂移(可达数十 ms)压到 ±1-2ms。
+                // 深度休眠期间 delay 依赖的单调时钟不会推进, 醒来时可能已经过点;
+                // 过点跳过自旋照常触发, 由 handleScheduleTrigger 内部的时间守卫与去重兜底
+                val coarseMs = delayMs - SPIN_LEAD_MS
+                if (coarseMs > 0) delay(coarseMs)
+                val spinStartNs = System.nanoTime()
+                while (System.currentTimeMillis() < next) {
+                    if (System.nanoTime() - spinStartNs > MAX_SPIN_MS * 1_000_000L) break
+                }
                 handleScheduleTrigger(schedule.id)
             } catch (e: CancellationException) {
                 // 任务被取消（停用/删除/重设闹钟）
@@ -484,6 +501,7 @@ object ScheduledMessage : ClickableFeature() {
     }
 
     private suspend fun handleScheduleTrigger(scheduleId: String) {
+        val probeEntryNs = SystemClock.elapsedRealtimeNanos()
         val schedule = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
 
         if (!schedule.enabled) return
@@ -494,42 +512,51 @@ object ScheduledMessage : ClickableFeature() {
             WeLogger.i(TAG, "trigger for ${schedule.id} fired too early, skipping (next=${schedule.nextSendTime}, now=$nowMs)")
             return
         }
-        WeLogger.i(TAG, "scheduled trigger fired for ${schedule.id} (next=${schedule.nextSendTime}, now=$nowMs)")
 
         if (!triggering.add(scheduleId)) {
             WeLogger.i(TAG, "trigger for ${schedule.id} already in flight, skipping duplicate")
             return
         }
         try {
+            // 占位成功后必须重读: 上面的快照可能是在上一个触发者落库前读的,
+            // 拿过期 lastFiredDate 判重会放行成重复发送
+            val fresh = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
+            if (!fresh.enabled) return
             // 当天已成功发过: 只推进排期, 不再重复发送
-            if (schedule.lastFiredDate == todayKey()) {
-                WeLogger.i(TAG, "schedule ${schedule.id} already fired today, advancing schedule only")
-                advanceAfterTrigger(schedule, sentOk = true)
+            if (fresh.lastFiredDate == todayKey()) {
+                WeLogger.i(TAG, "schedule ${fresh.id} already fired today, advancing schedule only")
+                advanceAfterTrigger(fresh, sentOk = true)
                 return
             }
 
-            schedule.fireAttempts += 1
+            fresh.fireAttempts += 1
             val sentOk = runCatching {
-                if (schedule.segments.isNotEmpty()) {
-                    sendSegments(schedule)
+                if (fresh.segments.isNotEmpty()) {
+                    sendSegments(fresh)
                 } else {
-                    sendLegacySingle(schedule)
+                    sendLegacySingle(fresh)
                 }
             }.onFailure {
-                WeLogger.e(TAG, "failed to send scheduled message for ${schedule.id}", it)
+                WeLogger.e(TAG, "failed to send scheduled message for ${fresh.id}", it)
             }.getOrDefault(false)
+            val entryToSendUs = (SystemClock.elapsedRealtimeNanos() - probeEntryNs) / 1_000L
 
             if (sentOk) {
-                schedule.lastFiredDate = todayKey()
-                schedule.fireAttempts = 0
-                WeLogger.i(TAG, "scheduled message sent to ${schedule.talker}")
+                fresh.lastFiredDate = todayKey()
+                fresh.fireAttempts = 0
+                WeLogger.i(TAG, "scheduled message sent to ${fresh.talker}")
             } else {
                 WeLogger.w(
                     TAG,
-                    "scheduled message to ${schedule.talker} incomplete (attempt ${schedule.fireAttempts}/$MAX_FIRE_ATTEMPTS)"
+                    "scheduled message to ${fresh.talker} incomplete (attempt ${fresh.fireAttempts}/$MAX_FIRE_ATTEMPTS)"
                 )
             }
-            advanceAfterTrigger(schedule, sentOk)
+            // 延迟探针: 唤醒漂移(正值=晚于到点)与 触发入口→发送返回 耗时, 验收 <=5ms 用
+            WeLogger.i(
+                TAG,
+                "${WeLogger.FORK_LOG_PREFIX} trigger ${fresh.id} probe: wakeDrift=${nowMs - fresh.nextSendTime}ms, entryToSend=${entryToSendUs}us, sent=$sentOk"
+            )
+            advanceAfterTrigger(fresh, sentOk)
         } finally {
             triggering.remove(scheduleId)
         }
