@@ -553,6 +553,21 @@ internal class HomeSidePanelCityIndex(context: Context) {
         }
     }
 
+    /**
+     * 读取"模块自身"的 assets（城市库在模块 APK 里）。
+     * 注意 appContext 是微信的 context，appContext.assets 读的是微信 APK 的 assets ——
+     * 里面没有我们的城市库。必须用模块包名创建 context 才能读到模块 assets
+     * （同 ThemeStore 的 createPackageContext 模式；包名不经 R8 混淆，直接用字符串）。
+     */
+    private fun moduleAssets(): android.content.res.AssetManager {
+        return runCatching {
+            appContext.createPackageContext("com.Johnny.wcx", 0).assets
+        }.getOrElse {
+            WeLogger.w(TAG, "createPackageContext for module assets failed: ${it.message}")
+            appContext.assets
+        }
+    }
+
     private fun copyDatabaseAssetOnce(): File? {
         return try {
             // 注意：模块运行在微信进程（uid=微信），模块自身 data 目录（com.Johnny.wcx）不可写，
@@ -561,7 +576,7 @@ internal class HomeSidePanelCityIndex(context: Context) {
             val directory = File(appContext.filesDir, ASSET_DIRECTORY).apply { mkdirs() }
             val databaseFile = File(directory, ASSET_FILE_NAME)
             if (!databaseFile.exists()) {
-                appContext.assets.open(ASSET_PATH).use { input ->
+                moduleAssets().open(ASSET_PATH).use { input ->
                     databaseFile.outputStream().use(input::copyTo)
                 }
             }
