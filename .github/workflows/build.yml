@@ -39,7 +39,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # build.gradle.kts 的 versionCode 用 git rev-list --count HEAD
+          # 版本号已不再依赖 commit 数（见 app/build.gradle.kts 的 -Pwcx.versionCode），
+          # 保留全历史只为后续可能的合并/追溯，构建本身浅克隆即可
           fetch-depth: 0
 
       - name: Record timestamps (UTC+8)
