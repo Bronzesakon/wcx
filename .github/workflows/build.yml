@@ -88,27 +88,25 @@ jobs:
             echo "::warning title=Debug-signed build::WEKIT_KEYSTORE_BASE64 未配置，APK 将使用 debug 签名，无法覆盖安装正式签名包（需卸载重装）。"
           fi
 
-      - name: Resolve build task
-        # 默认只编 standard × arm64-v8a（日常出包）；手动勾选 full_build 时编全部 4 个。
-        # AGP 的 variant 任务名（arm64-v8a -> Arm64V8a）不硬猜：从 tasks 列表里解析，
-        # 解析失败再回退到最可能的写法，失败会在构建步骤显式报错。
+      - name: Set build task
+        # 默认只编 standard flavor 且只出 arm64-v8a 分包（-Pwcx.abi 过滤，见
+        # app/build.gradle.kts 的 splits 块）；手动勾选 full_build 时编全部 4 个。
+        # 注意：AGP 的 splits.abi 不生成按 ABI 命名的 assemble 任务，
+        # 变体任务就是 assemble<Flavor>Release，分包在打包期完成。
         env:
           FULL_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
         run: |
           set -euo pipefail
           if [ "$FULL_BUILD" = "true" ]; then
             echo "BUILD_TASK=assembleRelease" >> "$GITHUB_ENV"
+            echo "BUILD_PROPS=" >> "$GITHUB_ENV"
             echo "APK_DIR_PATTERN=app/build/outputs/apk/*/release" >> "$GITHUB_ENV"
           else
-            # 注意：grep 无匹配返回 1，在 pipefail + set -e 下会中止脚本，
-            # 管道必须 || true，回退任务名才能生效
-            TASK=$(./gradlew --no-daemon --console=plain :app:tasks --all \
-              | grep -oE 'assembleStandard[A-Za-z0-9]*Release' | grep -iE 'arm64|v8a' | head -1 || true)
-            TASK="${TASK:-assembleStandardArm64V8aRelease}"
-            echo "BUILD_TASK=$TASK" >> "$GITHUB_ENV"
-            echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/arm64-v8a/release" >> "$GITHUB_ENV"
-            echo "build task: $TASK"
+            echo "BUILD_TASK=assembleStandardRelease" >> "$GITHUB_ENV"
+            echo "BUILD_PROPS=-Pwcx.abi=arm64-v8a" >> "$GITHUB_ENV"
+            echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/release" >> "$GITHUB_ENV"
           fi
+          echo "build task: $BUILD_TASK $BUILD_PROPS"
 
       - name: Build release APKs
         env:
@@ -119,7 +117,7 @@ jobs:
           WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
           # 写入 BuildConfig.RELEASE_TAG 供应用内更新判等
           WCX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
-        run: ./gradlew --no-daemon --console=plain "$BUILD_TASK"
+        run: ./gradlew --no-daemon --console=plain $BUILD_PROPS "$BUILD_TASK"
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
