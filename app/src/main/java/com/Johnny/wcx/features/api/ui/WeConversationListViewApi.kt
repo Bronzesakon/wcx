@@ -116,10 +116,11 @@ object WeConversationListViewApi : ApiFeature(), IResolveDex {
     private fun hookBinding(method: DexMethodDelegate) {
         if (method.isPlaceholder) return
         method.hookAfter {
-            val row = result as View
-            val adapter = thisObject as BaseAdapter
-            val position = args[0] as Int
-            val conversation = adapter.getItem(position)!!
+            // 8.0.77 加固: 异步绑定路径上 result/thisObject 可能为 null, 直接放行避免 NPE 刷日志
+            val row = result as? View ?: return@hookAfter
+            val adapter = thisObject as? BaseAdapter ?: return@hookAfter
+            val position = args[0] as? Int ?: return@hookAfter
+            val conversation = adapter.getItem(position) ?: return@hookAfter
             val bindContext = BindContext(
                 position = position,
                 itemCount = adapter.count,
