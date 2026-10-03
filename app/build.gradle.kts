@@ -174,6 +174,12 @@ android {
         compose = true
         buildConfig = true
     }
+
+    lint {
+        // 默认 locale values/ 仅有少量 key，完整字符串位于 values-zh-rCN；
+        // androidResources.localeFilters=zh 打包时只保留中文资源，ExtraTranslation 属误报。
+        disable += "ExtraTranslation"
+    }
 }
 
 tasks.withType<KotlinCompile> {
