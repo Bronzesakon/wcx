@@ -16,6 +16,11 @@ on:
   pull_request:
     branches: [master, main]
   workflow_dispatch:
+    inputs:
+      full_build:
+        description: '构建全部 4 个 variant（默认只出 standard × arm64-v8a）'
+        type: boolean
+        default: false
 
 # 同一 ref 有新提交时取消旧运行
 concurrency:
@@ -83,6 +88,26 @@ jobs:
             echo "::warning title=Debug-signed build::WEKIT_KEYSTORE_BASE64 未配置，APK 将使用 debug 签名，无法覆盖安装正式签名包（需卸载重装）。"
           fi
 
+      - name: Resolve build task
+        # 默认只编 standard × arm64-v8a（日常出包）；手动勾选 full_build 时编全部 4 个。
+        # AGP 的 variant 任务名（arm64-v8a -> Arm64V8a）不硬猜：从 tasks 列表里解析，
+        # 解析失败再回退到最可能的写法，失败会在构建步骤显式报错。
+        env:
+          FULL_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+        run: |
+          set -euo pipefail
+          if [ "$FULL_BUILD" = "true" ]; then
+            echo "BUILD_TASK=assembleRelease" >> "$GITHUB_ENV"
+            echo "APK_DIR_PATTERN=app/build/outputs/apk/*/release" >> "$GITHUB_ENV"
+          else
+            TASK=$(./gradlew --no-daemon --console=plain :app:tasks --all 2>/dev/null \
+              | grep -oE 'assembleStandard[A-Za-z0-9]*Release' | grep -iE 'arm64|v8a' | head -1)
+            TASK="${TASK:-assembleStandardArm64V8aRelease}"
+            echo "BUILD_TASK=$TASK" >> "$GITHUB_ENV"
+            echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/arm64-v8a/release" >> "$GITHUB_ENV"
+            echo "build task: $TASK"
+          fi
+
       - name: Build release APKs
         env:
           # wcx 的 build.gradle.kts 签名解析优先读这 4 个环境变量
@@ -92,13 +117,13 @@ jobs:
           WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
           # 写入 BuildConfig.RELEASE_TAG 供应用内更新判等
           WCX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
-        run: ./gradlew --no-daemon --console=plain assembleRelease
+        run: ./gradlew --no-daemon --console=plain "$BUILD_TASK"
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wcx-apks-${{ github.run_id }}
-          path: app/build/outputs/apk/*/release/*.apk
+          path: ${{ env.APK_DIR_PATTERN }}/*.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -106,7 +131,7 @@ jobs:
         if: env.SIGNING == 'release'
         run: |
           set -euo pipefail
-          for apk in app/build/outputs/apk/*/release/*.apk; do
+          for apk in ${{ env.APK_DIR_PATTERN }}/*.apk; do
             echo "== $apk"
             "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --print-certs "$apk" | head -3
           done
@@ -121,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          apks=(app/build/outputs/apk/*/release/*.apk)
+          apks=(${{ env.APK_DIR_PATTERN }}/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then
             echo "no APK was produced" >&2
             exit 1
