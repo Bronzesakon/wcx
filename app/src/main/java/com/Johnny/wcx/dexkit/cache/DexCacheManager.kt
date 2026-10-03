@@ -67,11 +67,15 @@ object DexCacheManager {
         return try {
             val json = JSONObject(cacheFile.readText())
 
-            val cachedHash = json.optString("methodHash", "")
+            // hash 缺失（生成器漏注册等）时不判定为失效：降级为仅按 key 完整性校验，
+            // 绝不因 hash 异常抛错崩微信，也不进入修复循环。
             val currentHash = calculateMethodHash(item)
-            if (cachedHash != currentHash) {
-                WeLogger.d(TAG, "resolveDex of ${item.displayName} changed: cached=$cachedHash, current=$currentHash")
-                return false
+            if (currentHash != null) {
+                val cachedHash = json.optString("methodHash", "")
+                if (cachedHash != currentHash) {
+                    WeLogger.d(TAG, "resolveDex of ${item.displayName} changed: cached=$cachedHash, current=$currentHash")
+                    return false
+                }
             }
 
             // 每个委托对应一个 key，全部必须存在且非空
@@ -104,7 +108,9 @@ object DexCacheManager {
         val cacheFile = getCacheFile(item.name)
         try {
             val json = JSONObject()
-            json.put("methodHash", calculateMethodHash(item))
+            // hash 缺失时跳过该字段而不是抛错：委托描述符照常持久化，
+            // 下次启动按 key 完整性校验（见 isItemCacheValid），item 可正常启用。
+            calculateMethodHash(item)?.let { json.put("methodHash", it) }
             json.put("timestamp", System.currentTimeMillis())
 
             item.collectDescriptors().forEach { (key, value) ->
@@ -166,12 +172,20 @@ object DexCacheManager {
 
     /**
      * 获取 resolveDex 方法编译时生成的哈希，用于检测实现变化。
+     * 返回 null 表示编译期未注册该 item 的 hash（构建期生成器漏注册）：
+     * 调用方必须降级处理（跳过 hash 比对），绝不允许因此抛异常崩微信。
      */
-    private fun calculateMethodHash(item: IResolveDex): String {
+    private fun calculateMethodHash(item: IResolveDex): String? {
         val className = item.javaClass.name
         val hash = GeneratedMethodHashes.HASHES[className]
-        if (hash.isNullOrBlank())
-            error("failed to retrieve method hash for item $className; this shouldn't happen")
+        if (hash.isNullOrBlank()) {
+            WeLogger.e(
+                TAG,
+                "no method hash registered for item $className; " +
+                        "hash-based invalidation disabled for it, falling back to key-completeness check only"
+            )
+            return null
+        }
         return hash
     }
 }
