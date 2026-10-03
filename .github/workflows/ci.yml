@@ -233,11 +233,11 @@ jobs:
       - name: Generate version info
         id: version
         run: |
-          COMMIT_COUNT=$(git rev-list --count HEAD)
           GIT_HASH=$(git rev-parse --short HEAD)
-          # 版本偏移量，与 build.gradle.kts 中的 versionBaseOffset 保持一致
-          VERSION_OFFSET=92  # 与 build.gradle.kts versionBaseOffset=92 对齐
-          VERSION_CODE=$((COMMIT_COUNT + VERSION_OFFSET))
+          # 版本号单一数据源：直接从 app/build.gradle.kts 读取，
+          # 避免 CI 与 APK 版本号漂移；发版时只改 build.gradle.kts
+          VERSION_CODE=$(grep -oE 'versionCode[[:space:]]*=[[:space:]]*[0-9]+' app/build.gradle.kts | grep -oE '[0-9]+$')
+          VERSION_NAME=$(grep -oE 'versionName[[:space:]]*=[[:space:]]*"[^"]+"' app/build.gradle.kts | grep -oE '"[^"]+"$' | tr -d '"')
           VERSION_TAG="v${VERSION_CODE}"
           echo "tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
           echo "hash=${GIT_HASH}" >> $GITHUB_OUTPUT

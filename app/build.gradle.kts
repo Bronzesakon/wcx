@@ -36,17 +36,14 @@ android {
     val commitCount = getCommitCount()
     val gitHash = getGitHash()
 
-    // 版本偏移量：VERSION_OFFSET = 259 - 全量历史提交数(167) = 92，
-    // 与 .github/workflows/ci.yml 的 VERSION_OFFSET 保持一致，每次提交版本号自动 +1
-    val versionBaseOffset = 92
-    val versionCodeValue = commitCount + versionBaseOffset
-
     defaultConfig {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = versionCodeValue
-        versionName = "v${versionCodeValue}"
+        // 版本号单一数据源：CI（.github/workflows/ci.yml）直接读取此处，
+        // 发版时只需在此递增 versionCode / versionName
+        versionCode = 259
+        versionName = "v259"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
