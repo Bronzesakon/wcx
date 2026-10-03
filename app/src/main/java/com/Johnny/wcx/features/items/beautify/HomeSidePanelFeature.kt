@@ -2601,12 +2601,29 @@ private fun isHomeTabClass(className: String): Boolean {
                                 modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
                             )
                             ListItem(
-                                modifier = Modifier.clickable { localSideMode = if (localSideMode == 1) 2 else 1 },
-                                trailingContent = { Text(if (localSideMode == 1) "方式一 · 原版侧边栏" else "方式二 · WeKit 侧边栏", fontSize = 12.sp) },
-                                headlineContent = { Text("侧边栏实现方式") }
+                                modifier = Modifier.clickable { localSideMode = 1 },
+                                leadingContent = {
+                                    androidx.compose.material3.RadioButton(
+                                        selected = localSideMode == 1,
+                                        onClick = { localSideMode = 1 },
+                                    )
+                                },
+                                headlineContent = { Text("方式一 · 原版侧边栏") },
+                                supportingContent = { Text("头像/签名/天气/每日一言/快捷功能槽") },
+                            )
+                            ListItem(
+                                modifier = Modifier.clickable { localSideMode = 2 },
+                                leadingContent = {
+                                    androidx.compose.material3.RadioButton(
+                                        selected = localSideMode == 2,
+                                        onClick = { localSideMode = 2 },
+                                    )
+                                },
+                                headlineContent = { Text("方式二 · WeKit 侧边栏") },
+                                supportingContent = { Text("负一屏全家桶：拖拽编辑/卡片/农历/一言/天气/钱包等") },
                             )
                             Text(
-                                "方式一：本模块原有侧边栏（头像/签名/天气/每日一言/快捷功能槽）。\n方式二：WeKit 侧边栏全家桶（拖拽编辑/卡片/农历/一言/天气/钱包等，功能更完整）。\n切换后需重启微信生效；本开关已合并原「主页侧滑面板」，将按所选方式启用对应实现。",
+                                "两方式互斥（单选），选择后需重启微信生效；本开关已合并原「主页侧滑面板」，将按所选方式启用对应实现。",
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(vertical = 4.dp)
