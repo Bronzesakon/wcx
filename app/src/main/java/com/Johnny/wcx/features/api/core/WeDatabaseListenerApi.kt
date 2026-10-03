@@ -35,6 +35,14 @@ object WeDatabaseListenerApi : ApiFeature() {
     private val updateListeners = CopyOnWriteArrayList<IUpdateListener>()
     private val queryListeners = CopyOnWriteArrayList<IQueryListener>()
 
+    /**
+     * 最近一次 `insertWithOnConflict` 的数据库实例（insert hook 时捕获）。
+     * 供需要写库的调用方复用（如密友会话行重建时取 wcdb SQLiteDatabase 实例）。
+     */
+    @Volatile
+    var lastInsertDb: SQLiteDatabase? = null
+        private set
+
     fun addListener(listener: Any) {
         if (listener is IInsertListener) {
             insertListeners.add(listener)
@@ -102,6 +110,7 @@ object WeDatabaseListenerApi : ApiFeature() {
                 name = "insertWithOnConflict"
                 parameters(String::class, String::class, ContentValues::class, Int::class)
             }.hookAfter {
+                lastInsertDb = thisObject as? SQLiteDatabase
                 try {
                     if (insertListeners.isEmpty()) return@hookAfter
 
