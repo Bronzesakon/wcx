@@ -116,40 +116,6 @@ object WeSettingsInjector : ApiFeature(), IResolveDex, WeChatInputBarApi.IInputB
             usingEqStrings("MicroMsg.ResourceHelper", "get string, resId %d, but context is null")
         }
     }
-//    private val methodPluginHelperLaunchIntent by dexMethod(allowFailure = true) {
-//        matcher {
-//            usingEqStrings("MicroMsg.PluginHelper", "start activity, need try load plugin[%B], entry:%s", "start activity error, context is null")
-//        }
-//    }
-//    // FIXME: using multipleIndex here, might find the wrong class
-//    private val classIntentAction by dexClass(allowFailure = true, allowMultiple = true, multipleIndex = 1) {
-//        searchPackages("com.tencent.mm.plugin.setting.ui.setting_new.uic")
-//        matcher {
-//            addMethod {
-//                name = "<init>"
-//                usingEqStrings("activity")
-//            }
-//
-//            addMethod {
-//                name = "onCreate"
-//            }
-//
-//            addMethod {
-//                name = "onDestroy"
-//            }
-//
-//            addMethod {
-//                name = "onResume"
-//            }
-//
-//            superClass {
-//                superClass {
-//                    className = "com.tencent.mm.ui.component.UIComponent"
-//                }
-//            }
-//        }
-//    }
-
     private const val TAG = "WeSettingsInjector"
 
     private const val PREFS_KEY = "wekit_settings_entry"
@@ -389,19 +355,6 @@ object WeSettingsInjector : ApiFeature(), IResolveDex, WeChatInputBarApi.IInputB
                 }
             }
         }
-//
-//        val item3 = settingsManager.createItem {
-//            key = "SettingGroup_Main_WeKitTest3"
-//            title = "测试 2 - WeKit 设置 - 详细日志"
-//            level = 1
-//            isSwitch = true
-//            pageClass = SettingGroupMain::class.java
-//            parentClass = item2
-//
-//            switchState = { Preferences.verboseLog }
-//            onSwitchChanged = { Preferences.verboseLog = it }
-//        }
-//
         settingsManager.install()
     }
 
@@ -452,12 +405,4 @@ object WeSettingsInjector : ApiFeature(), IResolveDex, WeChatInputBarApi.IInputB
             WeLogger.e(TAG, "openSettingsDialog 启动失败", e)
         }
     }
-
-//    private class SettingsMenuItemClickListener(val context: Context) :
-//        MenuItem.OnMenuItemClickListener {
-//        override fun onMenuItemClick(p0: MenuItem): Boolean {
-//            openSettingsDialog(context)
-//            return true
-//        }
-//    }
 }
