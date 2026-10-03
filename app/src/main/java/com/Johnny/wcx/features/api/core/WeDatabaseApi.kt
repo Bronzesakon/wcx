@@ -751,4 +751,24 @@ object WeDatabaseApi : ApiFeature(), IResolveDex {
             com.Johnny.wcx.features.api.core.models.ChatroomSyncStateReadResult.Unavailable
         }
     }
+
+    // ── WXPRO 合入兼容层 ─────────────────────────────────────────────────────────
+    // ConversationAggregation(WXPRO 版) 调用了本工程此前不存在的两个 API, 这里补最小兼容:
+    // - transaction: WXPRO 用 SQLite 事务包裹批量写; 本工程 execStatement 单条语句本身原子,
+    //   批量写顺序执行即可(与旧版行为一致), 不引入真实事务。
+    // - addDatabaseSwitchListener/removeDatabaseSwitchListener: WXPRO 监听微信切换账号后
+    //   db 重建以重新对账; 本工程 db 在 onEnable 时初始化, 未接切换触发点, 保留该 API
+    //   使合入代码可编译。切换账号后归拢文件夹按旧版行为处理(下次 onEnable 重新对账)。
+    @Volatile
+    private var databaseSwitchListener: (() -> Unit)? = null
+
+    fun addDatabaseSwitchListener(listener: () -> Unit) {
+        databaseSwitchListener = listener
+    }
+
+    fun removeDatabaseSwitchListener(listener: () -> Unit) {
+        if (databaseSwitchListener == listener) databaseSwitchListener = null
+    }
+
+    inline fun <T> transaction(block: () -> T): T = block()
 }
