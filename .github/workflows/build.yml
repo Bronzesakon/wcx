@@ -37,11 +37,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
+        # 浅克隆即可: 版本号不再依赖 commit 数 (见 app/build.gradle.kts 的 -Pwcx.versionCode),
+        # 时间戳只用 git log -1, 哈希只用 git rev-parse HEAD
         uses: actions/checkout@v4
-        with:
-          # 版本号已不再依赖 commit 数（见 app/build.gradle.kts 的 -Pwcx.versionCode），
-          # 保留全历史只为后续可能的合并/追溯，构建本身浅克隆即可
-          fetch-depth: 0
 
       - name: Record timestamps (UTC+8)
         shell: bash
@@ -171,8 +169,21 @@ jobs:
           fi
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release delete-asset "$tag" "$(gh release view "$tag" --json assets --jq '.assets[].name')" --yes 2>/dev/null || true
+            # 先上传 (--clobber 覆盖同名资产), 再清理本次未产出的旧资产。
+            # 顺序不能反: 先删后传会让 release 在两步之间出现"无资产"空窗期,
+            # 外部工具(例如按 assets[0] 取下载地址)会拿到空值。
+            # 清理这一步仍必要: 从"全量 4 个"切回"精简 1 个"时,
+            # --clobber 只覆盖同名文件, 上次多出来的资产会一直留着。
             gh release upload "$tag" "${apks[@]}" --clobber
+            keep=()
+            for a in "${apks[@]}"; do keep+=("$(basename "$a")"); done
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if ! printf '%s\n' "${keep[@]}" | grep -qxF "$name"; then
+                echo "removing stale asset: $name"
+                gh release delete-asset "$tag" "$name" --yes || true
+              fi
+            done < <(gh release view "$tag" --json assets --jq '.assets[].name')
             if [ "$rolling" = true ]; then
               # 换资产的同时移动 tag 并刷新标题/说明，使页面与本次二进制一致
               git push --force origin "HEAD:refs/tags/$tag"
