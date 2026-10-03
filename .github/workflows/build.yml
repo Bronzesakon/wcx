@@ -100,8 +100,10 @@ jobs:
             echo "BUILD_TASK=assembleRelease" >> "$GITHUB_ENV"
             echo "APK_DIR_PATTERN=app/build/outputs/apk/*/release" >> "$GITHUB_ENV"
           else
-            TASK=$(./gradlew --no-daemon --console=plain :app:tasks --all 2>/dev/null \
-              | grep -oE 'assembleStandard[A-Za-z0-9]*Release' | grep -iE 'arm64|v8a' | head -1)
+            # 注意：grep 无匹配返回 1，在 pipefail + set -e 下会中止脚本，
+            # 管道必须 || true，回退任务名才能生效
+            TASK=$(./gradlew --no-daemon --console=plain :app:tasks --all \
+              | grep -oE 'assembleStandard[A-Za-z0-9]*Release' | grep -iE 'arm64|v8a' | head -1 || true)
             TASK="${TASK:-assembleStandardArm64V8aRelease}"
             echo "BUILD_TASK=$TASK" >> "$GITHUB_ENV"
             echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/arm64-v8a/release" >> "$GITHUB_ENV"
