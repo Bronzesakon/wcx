@@ -3,13 +3,23 @@ package com.Johnny.wcx.features.items.chat
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
+import android.content.res.Configuration
 import android.content.Intent
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.MenuItem
 import android.view.View
+import android.view.ViewGroup
 import android.widget.AdapterView
+import android.widget.TextView
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.text.Spannable
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
+import android.text.TextPaint
+import android.text.TextUtils
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +35,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -32,14 +43,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import de.robv.android.xposed.XC_MethodHook
 import com.tencent.mm.ui.LauncherUI
 import com.tencent.mm.ui.conversation.BaseConversationUI
 import com.tencent.mm.ui.conversation.ConvBoxServiceConversationUI
 import com.tencent.mm.ui.conversation.MainUI
-import de.robv.android.xposed.XC_MethodHook
 import dev.ujhhgtg.reflekt.reflekt
 import dev.ujhhgtg.reflekt.utils.Modifiers
 import dev.ujhhgtg.reflekt.utils.isSubclassOf
@@ -47,13 +59,12 @@ import com.Johnny.wcx.dexkit.abc.IResolveDex
 import com.Johnny.wcx.dexkit.dsl.dexMethod
 import com.Johnny.wcx.features.api.core.WeConversationApi
 import com.Johnny.wcx.features.api.core.WeDatabaseApi
+import com.Johnny.wcx.features.api.core.models.SelfProfileField
 import com.Johnny.wcx.features.api.core.WeDatabaseListenerApi
 import com.Johnny.wcx.features.api.core.models.IWeContact
 import com.Johnny.wcx.features.api.ui.WeStartActivityApi
 import com.Johnny.wcx.features.core.ClickableFeature
 import com.Johnny.wcx.features.core.Feature
-import com.Johnny.wcx.features.items.chat.ConversationAggregation.clearStaleFolderMappings
-import com.Johnny.wcx.features.items.chat.ConversationAggregation.composeFolderFlag
 import com.Johnny.wcx.features.items.chat.ConversationAggregation.syncFoldersToDatabase
 import com.Johnny.wcx.features.items.contacts.CustomLocalFriendAvatars
 import com.Johnny.wcx.ui.content.AlertDialogContent
@@ -64,11 +75,18 @@ import com.Johnny.wcx.ui.content.DefaultColumn
 import com.Johnny.wcx.ui.content.TextButton
 import com.Johnny.wcx.ui.utils.EditIcon
 import com.Johnny.wcx.ui.utils.showComposeDialog
+import com.Johnny.wcx.utils.HookParam
+import com.Johnny.wcx.utils.hookAfterDirectly
+import com.Johnny.wcx.utils.hookBeforeDirectly
+import com.Johnny.wcx.utils.reflection.ClassLoaders
 import com.Johnny.wcx.utils.HostInfo
+import androidx.core.graphics.toColorInt
+import com.Johnny.wcx.preferences.WePrefs
+import com.Johnny.wcx.ui.content.WeColorField
 import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.android.showToast
+import com.Johnny.wcx.utils.captureOriginalMethod
 import com.Johnny.wcx.utils.fs.KnownPaths
-import com.Johnny.wcx.utils.invokeOriginal
 import com.Johnny.wcx.utils.reflection.BString
 import com.Johnny.wcx.utils.serialization.DefaultJson
 import kotlinx.serialization.Serializable
@@ -76,6 +94,8 @@ import java.lang.reflect.Proxy
 import java.text.Collator
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.nio.file.Path
 import kotlin.io.path.div
 import kotlin.io.path.exists
 import kotlin.io.path.readText
@@ -93,6 +113,8 @@ object ConversationAggregation : ClickableFeature(),
     private const val TAG = "AggregateChats"
     const val FOLDER_PREFIX = "wekit_folder_"
     private const val FOLDER_CONFIG_MENU_ID = 0x0721C0DE
+    private const val MOVE_TO_FOLDER_MENU_ID = 777021
+    private const val MOVE_TO_FOLDER_MENU_ORDER = 1001
     private const val REMOVE_FROM_FOLDER_MENU_ID = 777020
 
     // Order pushes our item to the end of the container's context menu (its own items use 0).
@@ -108,7 +130,65 @@ object ConversationAggregation : ClickableFeature(),
     // alongside unReadMuteCount > 0 when unReadCount == 0).
     private const val ATTR_FLAG_MUTE_BIT = 2097152
 
-    private val foldersFile by lazy { KnownPaths.moduleData / "chat_folders.json" }
+    // Truncation + tint used by the FunBox-style "someone @ me" prefix on folder rows.
+    private const val MAX_DIGEST_NAME_LEN = 8
+    private const val MAX_FOLDER_DISPLAY_NAME = 12
+    // 括号内发送者名截断长度（Eatmelons → Eatm...），括号内空间小，比群名更短
+    private const val MAX_SENDER_NAME_LEN = 4
+    // 归拢摘要红绿灯配色：[全体]/[有人@我] 红、[N个聊天]/[N个消息] 黄、[自己] 绿
+    private const val DEFAULT_AT_COLOR = "#FF2E78E6"
+    private const val DEFAULT_COUNT_COLOR = "#FFF2D200"
+    private const val DEFAULT_SELF_COLOR = "#FF222222"
+    private const val DEFAULT_MEMBER_COLOR = "#FFE8E8E8"
+    private const val DEFAULT_TITLE_COLOR = "#FFFF8800"
+    private var mentionAtColor by WePrefs.prefOption("agg_mention_at_color", DEFAULT_AT_COLOR)
+    private var mentionCountColor by WePrefs.prefOption("agg_mention_count_color", DEFAULT_COUNT_COLOR)
+    private var mentionSelfColor by WePrefs.prefOption("agg_mention_self_color", DEFAULT_SELF_COLOR)
+    private var mentionMemberColor by WePrefs.prefOption("agg_mention_member_color", DEFAULT_MEMBER_COLOR)
+    private var folderTitleColor by WePrefs.prefOption("agg_folder_title_color", DEFAULT_TITLE_COLOR)
+    private var folderTitleEnabled by WePrefs.prefOption("agg_folder_title_enabled", true)
+    private var mentionSelfEnabled by WePrefs.prefOption("agg_mention_self_enabled", true)
+    private var mentionMemberEnabled by WePrefs.prefOption("agg_mention_member_enabled", true)
+    private fun parseColor(value: String, fallback: String): Int =
+        runCatching { value.toColorInt() }.getOrElse { fallback.toColorInt() }
+    /** 暗色/亮色模式适配：暗色模式将染色提亮（HSV 明度下限 0.78），保证深底可读（类似微信原生暗色白字）；亮色模式返回原色 */
+    private fun adaptNight(ctx: Context?, color: Int): Int {
+        if (ctx == null) return color
+        val night = ctx.resources.configuration.uiMode and
+            Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
+        if (!night) return color
+        val hsv = FloatArray(3)
+        android.graphics.Color.colorToHSV(color, hsv)
+        hsv[2] = maxOf(hsv[2], 0.78f)
+        return android.graphics.Color.HSVToColor(android.graphics.Color.alpha(color), hsv)
+    }
+
+    private val MENTION_RED: Int get() = parseColor(mentionAtColor, DEFAULT_AT_COLOR)
+    private val MENTION_YELLOW: Int get() = parseColor(mentionCountColor, DEFAULT_COUNT_COLOR)
+    private val MENTION_GREEN: Int get() = parseColor(mentionSelfColor, DEFAULT_SELF_COLOR)
+    /** 归拢文件夹标题蓝色 */
+    private val MENTION_TITLE_BLUE: Int get() = parseColor(folderTitleColor, DEFAULT_TITLE_COLOR)
+    private val MENTION_MEMBER: Int get() = parseColor(mentionMemberColor, DEFAULT_MEMBER_COLOR)
+    private val MEMBER_PAREN_REGEX = Regex("[（(][^（）()]+[）()]")
+    private val CHAT_COUNT_REGEX = Regex("\\[[^\\]]*\\u4e2a(?:\\u804a\\u5929|\\u6d88\\u606f)\\]")
+
+    // 归拢配置按账号隔离：每个账号独立配置文件，避免切换账号后
+    // 显示其他账号的归拢文件夹（成员存的是该账号的联系人/群聊）。
+    private val legacyFoldersFile by lazy { KnownPaths.moduleData / "chat_folders.json" }
+
+    private fun foldersFileFor(wxid: String?) = if (!wxid.isNullOrBlank()) {
+        KnownPaths.moduleData / "chat_folders_$wxid.json"
+    } else {
+        legacyFoldersFile
+    }
+
+    private fun currentAccountWxid(): String? = runCatching {
+        WeDatabaseApi.getSelfProfileField(SelfProfileField.WXID)
+            ?.toString()
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
 
     private const val CONTAINER_UI_NAME = "com.tencent.mm.ui.conversation.ConvBoxServiceConversationUI"
     private val methodSqliteWrapperRawQuery by dexMethod(allowFailure = true) {
@@ -202,7 +282,16 @@ object ConversationAggregation : ClickableFeature(),
     @Volatile
     private var foldersCache: List<ChatFolder>? = null
 
+    @Volatile
+    private var foldersCacheWxid: String? = null
+
     private val folderMembersCache = ConcurrentHashMap<String, List<String>>()
+
+    @Volatile
+    private var membersByFolder: Map<String, List<String>> = emptyMap()
+
+    @Volatile
+    private var folderByMember: Map<String, String> = emptyMap()
 
     private val suppressQueryRewrite = ThreadLocal.withInitial { false }
 
@@ -213,6 +302,11 @@ object ConversationAggregation : ClickableFeature(),
     // row tracks its members in real time.
     private const val REFRESH_DEBOUNCE_MS = 250L
     private val REFRESH_TASK_TOKEN = Any()
+    private val RECONCILE_TASK_TOKEN = Any()
+    private const val SQLITE_BIND_CHUNK_SIZE = 900
+    private val pendingRefreshMembers = ConcurrentHashMap.newKeySet<String>()
+    private val pendingRefreshLock = Any()
+    private val refreshAllFolders = AtomicBoolean(false)
 
     @Volatile
     private var refreshThread: HandlerThread? = null
@@ -221,20 +315,51 @@ object ConversationAggregation : ClickableFeature(),
     private var refreshHandler: Handler? = null
 
     override fun onEnable() {
+        WeLogger.i(TAG, "onEnable: begin")
+        diagFile("onEnable: begin")
         WeDatabaseListenerApi.addListener(this)
         WeStartActivityApi.addListener(this)
+        // 切换微信账号后 storage 重新初始化（新账号数据库），需要把归拢文件夹
+        // 对账写入新账号的库，否则新账号页面看不到归拢。
+        WeDatabaseApi.addDatabaseSwitchListener(::onDatabaseSwitched)
 
         startRefreshThread()
 
         hookMainUiRefresh()
+        WeLogger.i(TAG, "onEnable: after hookMainUiRefresh")
+        diagFile("onEnable: after hookMainUiRefresh")
         hookOpenFolder()
+        WeLogger.i(TAG, "onEnable: after hookOpenFolder")
+        diagFile("onEnable: after hookOpenFolder")
         hookConversationPages()
+        WeLogger.i(TAG, "onEnable: after hookConversationPages")
+        diagFile("onEnable: after hookConversationPages")
         hookFolderContextMenu()
+        WeLogger.i(TAG, "onEnable: after hookFolderContextMenu")
+        diagFile("onEnable: after hookFolderContextMenu")
         hookSelectConversationUi()
+        WeLogger.i(TAG, "onEnable: after hookSelectConversationUi")
+        diagFile("onEnable: after hookSelectConversationUi")
         hookMvvmContactListItemClick()
+        WeLogger.i(TAG, "onEnable: after hookMvvmContactListItemClick")
+        diagFile("onEnable: after hookMvvmContactListItemClick")
         hookSqliteWrapperQuery()
+        hookSqliteExec()
+        WeLogger.i(TAG, "onEnable: after hookSqliteWrapperQuery")
+        diagFile("onEnable: after hookSqliteWrapperQuery")
         hookConversationStorageParentQuery()
+        WeLogger.i(TAG, "onEnable: after hookConversationStorageParentQuery")
+        diagFile("onEnable: after hookConversationStorageParentQuery")
         hookConversationStorageUpdateUnread()
+        WeLogger.i(TAG, "onEnable: after hookConversationStorageUpdateUnread")
+        diagFile("onEnable: after hookConversationStorageUpdateUnread")
+        hookMentionTint()
+        WeLogger.i(TAG, "onEnable: after hookMentionTint")
+        diagFile("onEnable: after hookMentionTint")
+        hookTextViewSetText()
+        hookAllTextViewDraw()
+        WeLogger.i(TAG, "onEnable: done")
+        diagFile("onEnable: done")
 
         CustomLocalFriendAvatars.fallbackUsernameProvider = { folderId ->
             if (isFolderId(folderId) && !CustomLocalFriendAvatars.avatarMap.containsKey(folderId)) {
@@ -250,12 +375,12 @@ object ConversationAggregation : ClickableFeature(),
         if (WeDatabaseApi.isReady) {
             syncFoldersToDatabase()
         }
-        WeConversationApi.reloadConversations()
     }
 
     override fun onDisable() {
         WeDatabaseListenerApi.removeListener(this)
         WeStartActivityApi.removeListener(this)
+        WeDatabaseApi.removeDatabaseSwitchListener(::onDatabaseSwitched)
         CustomLocalFriendAvatars.fallbackUsernameProvider = null
         stopRefreshThread()
 
@@ -270,15 +395,38 @@ object ConversationAggregation : ClickableFeature(),
      * removes all folder rows (rconversation / rcontact / img_flag). Mirrors deleting every folder
      * by hand, but keeps the on-disk config so the folders come back on the next onEnable.
      */
+    /**
+     * 微信切换账号后 WeDatabaseApi 已把 db 引用切到新账号：
+     * 重新对账 folder 行到新库（reconcile 是差异写入，新库无行则全量重建），
+     * 并刷新会话列表让归拢立即显示。
+     */
+    private fun onDatabaseSwitched() {
+        WeLogger.i(TAG, "account/database switched, re-syncing folders to new database")
+        runCatching {
+            // 配置按账号隔离：db 变化说明账号已切换，清缓存按新账号重新加载
+            foldersCache = null
+            foldersCacheWxid = null
+            folderMembersCache.clear()
+            if (WeDatabaseApi.isReady && isFolderSchemaReady()) {
+                syncFoldersToDatabase()
+                WeConversationApi.reloadConversations()
+            }
+        }.onFailure { e ->
+            WeLogger.e(TAG, "failed to re-sync folders after account switch", e)
+        }
+    }
+
     private fun releaseAllFolders() {
         if (!WeDatabaseApi.isReady) return
         runCatching {
             withQueryRewriteSuppressed {
                 if (!isFolderSchemaReady()) return@withQueryRewriteSuppressed
-                // Preserve each folder's pin / move-up bits in memory so a later onEnable in the
-                // same process restores them when composeFolderFlag recreates the rows.
-                snapshotFolderPinFlags(loadFolders())
-                clearStaleFolderMappings()
+                val folders = loadFolders()
+                persistChangedPinFlags(folders, readStoredFolderRows().mapValues { it.value.flag })
+                WeDatabaseApi.transaction { clearStaleFolderMappings() }
+                membersByFolder = emptyMap()
+                folderByMember = emptyMap()
+                folderMembersCache.clear()
             }
             WeConversationApi.reloadConversations()
             WeLogger.i(TAG, "released all folders on disable")
@@ -301,6 +449,10 @@ object ConversationAggregation : ClickableFeature(),
     fun aggregationFolders(): List<FolderChoice> =
         loadFolders().map { FolderChoice(it.id, it.name, it.type != FolderType.MANUAL) }
 
+    /** Public member list of [folderId] (ContactSelectors' "add to folder" picker depends on it). */
+    fun folderMembers(folderId: String): List<String> =
+        loadFolders().firstOrNull { it.id == folderId }?.members ?: emptyList()
+
     /**
      * Adds [talker] to the manual folder [folderId] and opens the existing edit dialog so the
      * user can review and save. Returns false without acting when the folder is missing or in an
@@ -315,11 +467,9 @@ object ConversationAggregation : ClickableFeature(),
             folder = updated,
             onFolderUpdated = {
                 syncFoldersToDatabase()
-                WeConversationApi.reloadConversations()
             },
             onFolderDeleted = {
                 syncFoldersToDatabase()
-                WeConversationApi.reloadConversations()
             }
         )
         return true
@@ -337,7 +487,6 @@ object ConversationAggregation : ClickableFeature(),
             val updated = folder.copy(members = (folder.members + talker).distinct().sorted())
             saveFolders(loadFolders().map { if (it.id == updated.id) updated else it })
             syncFoldersToDatabase()
-            WeConversationApi.reloadConversations()
         }
         return true
     }
@@ -356,8 +505,50 @@ object ConversationAggregation : ClickableFeature(),
         val updated = folder.copy(members = folder.members.filterNot { it == talker })
         saveFolders(loadFolders().map { if (it.id == updated.id) updated else it })
         syncFoldersToDatabase()
-        WeConversationApi.reloadConversations()
         showToast("已移出「${folder.name}」")
+    }
+    /** Long-press menu "move to folder": move talker from its current manual folder to another manual folder. */
+    private fun showMoveToFolderDialog(context: Context, talker: String) {
+        val source = loadFolders().firstOrNull { talker in it.members && it.type == FolderType.MANUAL } ?: run {
+            showToast("该对话不在手动文件夹中!")
+            return
+        }
+        val targets = loadFolders().filter { it.id != source.id && it.type == FolderType.MANUAL }
+        if (targets.isEmpty()) {
+            showToast("没有其他手动文件夹可移入!")
+            return
+        }
+        showComposeDialog(context) {
+            val dismiss = this.onDismiss
+            AlertDialogContent(
+                title = { Text("移到文件夹") },
+                text = {
+                    LazyColumn {
+                        items(targets) { target ->
+                            Text(
+                                target.name,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val current = loadFolders()
+                                        val srcRemoved = current.map {
+                                            if (it.id == source.id) it.copy(members = it.members.filterNot { m -> m == talker }) else it
+                                        }
+                                        val finalList = srcRemoved.map {
+                                            if (it.id == target.id) it.copy(members = (it.members + talker).distinct().sorted()) else it
+                                        }
+                                        saveFolders(finalList)
+                                        syncFoldersToDatabase()
+                                        showToast("已移到「${target.name}」")
+                                        dismiss()
+                                    }
+                                    .padding(12.dp)
+                            )
+                        }
+                    }
+                }
+            )
+        }
     }
 
     // Called by WeDatabaseListenerApi when WeChat inserts a conversation row
@@ -365,7 +556,7 @@ object ConversationAggregation : ClickableFeature(),
         if (table != ConversationTable.NAME) return
         val username = values.getAsString(ConversationTable.USERNAME) ?: return
         if (isFolderId(username)) return  // skip our own folder row writes
-        scheduleRefresh()
+        scheduleRefresh(username)
     }
 
     // Called by WeDatabaseListenerApi when WeChat updates conversation rows
@@ -378,14 +569,22 @@ object ConversationAggregation : ClickableFeature(),
     ) {
         if (table != ConversationTable.NAME) return
         // Skip updates that target only folder rows
-        val targetUsername = whereArgs?.singleOrNull()
+        val targetUsername = values.getAsString(ConversationTable.USERNAME)
+            ?: whereArgs?.singleOrNull()?.takeIf {
+                whereClause?.contains(ConversationTable.USERNAME, ignoreCase = true) == true
+            }
         if (targetUsername != null && isFolderId(targetUsername)) return
-        scheduleRefresh()
+        scheduleRefresh(targetUsername)
     }
 
-    private fun scheduleRefresh() {
+    private fun scheduleRefresh(username: String?) {
         val handler = refreshHandler ?: return
         if (loadFolders().isEmpty()) return
+        if (username == null) {
+            refreshAllFolders.set(true)
+        } else {
+            synchronized(pendingRefreshLock) { pendingRefreshMembers += username }
+        }
         handler.removeCallbacksAndMessages(REFRESH_TASK_TOKEN)
         handler.postAtTime(
             ::doRefreshFolderSummaries,
@@ -398,22 +597,48 @@ object ConversationAggregation : ClickableFeature(),
         if (!WeDatabaseApi.isReady) return
         val folders = loadFolders()
         if (folders.isEmpty()) return
+        val changedMembers = synchronized(pendingRefreshLock) {
+            pendingRefreshMembers.toSet().also { pendingRefreshMembers.clear() }
+        }
+        val refreshAll = refreshAllFolders.getAndSet(false)
+
+        // A custom SQL rule may depend on any rconversation column. Reconcile it before using the
+        // reverse index, because this write may have changed membership rather than just a summary.
+        if (folders.any { it.type == FolderType.SQL } ||
+            changedMembers.any { it !in folderByMember } && folders.any { it.type != FolderType.MANUAL }
+        ) {
+            reconcileFolders(folders)
+            return
+        }
+
+        val affectedFolderIds = if (refreshAll) {
+            membersByFolder.keys
+        } else {
+            changedMembers.mapNotNullTo(linkedSetOf()) { folderByMember[it] }
+        }
+        if (affectedFolderIds.isEmpty()) return
+
         runCatching {
+            val startedAt = SystemClock.elapsedRealtime()
             withQueryRewriteSuppressed {
                 if (!isFolderSchemaReady()) return@withQueryRewriteSuppressed
-                folders.forEach { folder ->
-                    val members = getFolderMembers(folder).filterNot(::isFolderId).distinct()
-                    if (members.isEmpty()) return@forEach
-                    // WeChat's REPLACE INTO on new-message receipt can recreate the member row
-                    // without parentRef (REPLACE = DELETE + INSERT, and WeChat's INSERT omits
-                    // parentRef).  Re-anchor any member whose parentRef was cleared before
-                    // reading the summary so the folder container query still finds them and
-                    // ORDER BY flag DESC, conversationTime DESC puts the new-message member first.
-                    reanchorFolderMembers(folder.id, members)
-                    writeFolderSummaryRow(folder.id, readFolderSummary(members))
+                val affectedMembers = membersByFolder.filterKeys { it in affectedFolderIds }
+                WeDatabaseApi.transaction {
+                    affectedMembers.forEach { (folderId, members) ->
+                        reanchorFolderMembers(folderId, members)
+                    }
+                    val summaries = readFolderSummaries(affectedMembers)
+                    affectedFolderIds.forEach { folderId ->
+                        writeFolderSummaryRow(folderId, summaries[folderId] ?: FolderSummary())
+                    }
                 }
             }
             WeConversationApi.reloadConversations()
+            WeLogger.d(
+                TAG,
+                "refreshed ${affectedFolderIds.size} folders for ${changedMembers.size} members in " +
+                        "${SystemClock.elapsedRealtime() - startedAt}ms"
+            )
         }.onFailure {
             WeLogger.e(TAG, "failed to refresh folder summaries", it)
         }
@@ -427,16 +652,17 @@ object ConversationAggregation : ClickableFeature(),
      */
     private fun reanchorFolderMembers(folderId: String, members: List<String>) {
         if (members.isEmpty()) return
-        val placeholders = members.joinToString(",") { "?" }
-        WeDatabaseApi.execStatement(
-            """
-            UPDATE ${ConversationTable.NAME}
-            SET ${ConversationTable.PARENT_REF}=?
-            WHERE ${ConversationTable.USERNAME} IN ($placeholders)
-              AND (${ConversationTable.PARENT_REF} IS NULL OR ${ConversationTable.PARENT_REF}='')
-            """.trimIndent(),
-            arrayOf(folderId, *members.toTypedArray())
-        )
+        members.chunked(SQLITE_BIND_CHUNK_SIZE - 1).forEach { chunk ->
+            WeDatabaseApi.execStatement(
+                """
+                UPDATE ${ConversationTable.NAME}
+                SET ${ConversationTable.PARENT_REF}=?
+                WHERE ${ConversationTable.USERNAME} IN (${placeholders(chunk.size)})
+                  AND (${ConversationTable.PARENT_REF} IS NULL OR ${ConversationTable.PARENT_REF}='')
+                """.trimIndent(),
+                arrayOf(folderId, *chunk.toTypedArray())
+            )
+        }
     }
 
     private fun startRefreshThread() {
@@ -452,21 +678,15 @@ object ConversationAggregation : ClickableFeature(),
         refreshHandler = null
         refreshThread?.quitSafely()
         refreshThread = null
+        synchronized(pendingRefreshLock) { pendingRefreshMembers.clear() }
+        refreshAllFolders.set(false)
     }
 
     override fun onQuery(sql: String): String? {
         if (suppressQueryRewrite.get()!!) return null
 
-        val folderId = activeFolderId
-        if (folderId != null) {
-            val containerSql = rewriteContainerSql(sql, folderId)
-            if (containerSql != sql) return containerSql
-        }
-
-        if (!sql.contains(ConversationTable.NAME, ignoreCase = true)) return null
-        if (sql.contains(FOLDER_PREFIX, ignoreCase = true)) return null
-        if (!looksLikeConversationListQuery(sql)) return null
-        return appendParentRefFilter(sql)
+        val folderId = activeFolderId ?: return null
+        return rewriteContainerSql(sql, folderId).takeIf { it != sql }
     }
 
     override fun onStartActivity(param: XC_MethodHook.MethodHookParam, intent: Intent) {
@@ -482,71 +702,19 @@ object ConversationAggregation : ClickableFeature(),
     private fun hookMainUiRefresh() {
         MainUI::class.reflekt().firstMethod("onResume").hookAfter {
             syncFoldersToDatabase()
-            preloadFolderAvatars()
-        }
-    }
-
-    /**
-     * Pre-reads all folder avatar resources to warm up the content resolver cache.
-     *
-     * After a system reboot, the media store cache is reset and content URIs for custom
-     * avatars may not resolve until the owning content provider is first queried. WeChat's
-     * homepage conversation list rendering flow does not actively read group avatar files
-     * — only entering the album/avatar picker page triggers image resource loading and
-     * re-populates the media cache. By opening an input stream on each folder's avatar URI
-     * during MainUI.onResume, we force the content resolver to resolve the URI early so
-     * the folder avatars render immediately without requiring the user to visit the album
-     * page first.
-     */
-    private fun preloadFolderAvatars() {
-        val folders = loadFolders()
-        if (folders.isEmpty()) return
-        val avatarMap = CustomLocalFriendAvatars.avatarMap
-        var loaded = 0
-        var failed = 0
-        for (folder in folders) {
-            val uri = avatarMap[folder.id]?.takeIf { it.isNotBlank() } ?: continue
-            runCatching {
-                HostInfo.application.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { it.read() }
-                loaded++
-            }.onFailure {
-                failed++
-                WeLogger.d(TAG, "preload avatar failed for folder ${folder.id}: $uri")
-            }
-        }
-        if (loaded > 0 || failed > 0) {
-            WeLogger.i(TAG, "preloaded folder avatars: $loaded ok, $failed failed")
         }
     }
 
     private fun hookOpenFolder() {
         LauncherUI::class.reflekt().firstMethod("startChatting").hookBefore {
             interceptFolderChatOpen(args.firstOrNull() as? String, thisObject) {
-                try {
-                    if (method is java.lang.reflect.Method) {
-                        val returnType = (method as java.lang.reflect.Method).returnType
-                        if (returnType == Void.TYPE) {
-                            result = null
-                        }
-                    }
-                } catch (e: Throwable) {
-                    // 兜底异常捕获
-                }
+                result = null
             }
         }
 
         BaseConversationUI::class.reflekt().firstMethod("startChatting").hookBefore {
             interceptFolderChatOpen(args.firstOrNull() as? String, thisObject) {
-                try {
-                    if (method is java.lang.reflect.Method) {
-                        val returnType = (method as java.lang.reflect.Method).returnType
-                        if (returnType == Void.TYPE) {
-                            result = null
-                        }
-                    }
-                } catch (e: Throwable) {
-                    // 兜底异常捕获
-                }
+                result = null
             }
         }
     }
@@ -595,6 +763,7 @@ object ConversationAggregation : ClickableFeature(),
 
         methodShowPopupMenu.hookBefore {
             val folderId = activeFolderId ?: return@hookBefore
+            val menuContext = (args[0] as? android.view.View)?.context ?: return@hookBefore
             val folder = folderById(folderId) ?: return@hookBefore
             if (folder.type != FolderType.MANUAL) return@hookBefore
 
@@ -613,6 +782,7 @@ object ConversationAggregation : ClickableFeature(),
                 createListener.onCreateContextMenu(menu, view, menuInfo)
                 runCatching {
                     menu.add(0, REMOVE_FROM_FOLDER_MENU_ID, REMOVE_FROM_FOLDER_MENU_ORDER, "移出文件夹")
+                    menu.add(0, MOVE_TO_FOLDER_MENU_ID, MOVE_TO_FOLDER_MENU_ORDER, "移到文件夹")
                 }.onFailure { WeLogger.e(TAG, "failed to add folder menu item", it) }
             }
 
@@ -626,6 +796,11 @@ object ConversationAggregation : ClickableFeature(),
                     if (menuItem?.itemId == REMOVE_FROM_FOLDER_MENU_ID) {
                         runCatching { removeMemberFromFolder(folderId, talker) }
                             .onFailure { WeLogger.e(TAG, "failed to remove from folder", it) }
+                        return@newProxyInstance null
+                    }
+                    if (menuItem?.itemId == MOVE_TO_FOLDER_MENU_ID) {
+                        runCatching { showMoveToFolderDialog(menuContext, talker) }
+                            .onFailure { WeLogger.e(TAG, "failed to move to folder", it) }
                         return@newProxyInstance null
                     }
                 }
@@ -647,25 +822,14 @@ object ConversationAggregation : ClickableFeature(),
 
             val folder = folderById(username) ?: return@hookBefore
             val context = thisObject as? Context ?: return@hookBefore
+            val originalMethod = captureOriginalMethod()
 
             // Cancel forwarding to the folder row itself — it has no real chat thread.
-            try {
-                if (method is java.lang.reflect.Method) {
-                    val returnType = (method as java.lang.reflect.Method).returnType
-                    if (returnType == Void.TYPE) {
-                        result = null
-                    }
-                }
-            } catch (e: Throwable) {
-                // 兜底异常捕获
-            }
+            result = null
 
-            // Capture the hook param so the dialog callback can re-run the ORIGINAL doClickUser
-            // (bypassing this hook, so no recursion) with the chosen member's username.
-            val param = this
             showFolderMemberPicker(context, folder) { selectedWxId ->
                 runCatching {
-                    param.invokeOriginal(args = arrayOf(selectedWxId))
+                    originalMethod(arrayOf(selectedWxId))
                 }.onFailure {
                     WeLogger.e(TAG, "failed to forward share to member $selectedWxId", it)
                 }
@@ -692,7 +856,7 @@ object ConversationAggregation : ClickableFeature(),
 
     private fun handleMvvmFolderTap(param: XC_MethodHook.MethodHookParam) {
         val itemView = param.args[0] as View
-        val data = param.args[1]
+        val data = param.args[1]!!
 
         val folderField = data.reflekt().fields {
             type = BString
@@ -701,26 +865,21 @@ object ConversationAggregation : ClickableFeature(),
         val folderId = folderField.get()!! as String
 
         val folder = folderById(folderId) ?: return
+        val originalMethod = param.captureOriginalMethod()
 
         // Cancel the tap on the folder row itself — it has no real chat thread.
-        try {
-            if (param.method is java.lang.reflect.Method) {
-                val returnType = (param.method as java.lang.reflect.Method).returnType
-                if (returnType == Void.TYPE) {
-                    param.result = null
-                }
-            }
-        } catch (e: Throwable) {
-            // 兜底异常捕获
-        }
+        param.result = null
 
         showFolderMemberPicker(itemView.context, folder) { selectedWxId ->
             runCatching {
                 folderField.set(selectedWxId)
-                // Re-run the ORIGINAL listener (bypasses this hook → no recursion) so WeChat
-                // forwards to the real member exactly as if that row had been tapped.
-                param.invokeOriginal()
-                folderField.set(folderId)
+                try {
+                    // Re-run the ORIGINAL listener (bypasses this hook → no recursion) so WeChat
+                    // forwards to the real member exactly as if that row had been tapped.
+                    originalMethod()
+                } finally {
+                    folderField.set(folderId)
+                }
             }.onFailure {
                 WeLogger.e(TAG, "failed to forward folder tap to member $selectedWxId", it)
             }
@@ -831,6 +990,10 @@ object ConversationAggregation : ClickableFeature(),
         methodSqliteWrapperRawQuery.hookBefore {
             if (suppressQueryRewrite.get()!!) return@hookBefore
             val sql = args.firstOrNull() as? String ?: return@hookBefore
+            if (sql.contains("rconversation") && (sql.contains("update", true) || sql.contains("unread", true))) {
+                WeLogger.i(TAG, "rawQuery: $sql")
+                diagFile("rawQuery: $sql")
+            }
             onQuery(sql)?.let { args[0] = it }
         }
     }
@@ -851,22 +1014,665 @@ object ConversationAggregation : ClickableFeature(),
     // See methodConversationStorageUpdateUnreadByTalker: cancel the "mark box read on leave" that
     // WeChat's folder container fires against our folder id, so exiting a folder without opening any
     // member never clears the aggregate row's unread badge.
+    private val methodMvvmConversationAdapterGetView by dexMethod(allowFailure = true) {
+        matcher {
+            declaredClass {
+                usingEqStrings("MicroMsg.ConversationAdapter.MvvmConversationAdapter", "Get Item duplicated: positionMaps: %s username [%s, %d] Map: %s datas: %d")
+            }
+            name = "getView"
+        }
+    }
+
+    private val methodConversationWithCacheAdapterGetView by dexMethod(allowFailure = true, allowMultiple = true) {
+        searchPackages("com.tencent.mm.ui.conversation")
+        matcher {
+            name = "getView"
+            paramTypes("int", "android.view.View", "android.view.ViewGroup")
+            returnType("android.view.View")
+        }
+    }
+
+    /** tint the injected "someone @ me" prefix blue (matches FunBox) on both conversation adapters */
+    private fun hookMentionTint() {
+        WeLogger.i(TAG, "tint hooks: mvvmGetView placeholder=${methodMvvmConversationAdapterGetView.isPlaceholder}, cacheGetView placeholder=${methodConversationWithCacheAdapterGetView.isPlaceholder}, textViewSetText placeholder=${methodTextViewSetText.isPlaceholder}")
+        diagFile("tint hooks: mvvm=${methodMvvmConversationAdapterGetView.isPlaceholder} cache=${methodConversationWithCacheAdapterGetView.isPlaceholder} setText=${methodTextViewSetText.isPlaceholder}")
+        if (!methodMvvmConversationAdapterGetView.isPlaceholder) {
+            methodMvvmConversationAdapterGetView.hookAfter {
+                val root = result as? ViewGroup ?: return@hookAfter
+                tintMentionLabels(root, "getView")
+                markVirtualRow(root)
+                tintFolderTitleByText(root)
+                root.post {
+                    tintMentionLabels(root, "getView-post")
+                    markVirtualRow(root)
+                    tintFolderTitleByText(root)
+                }
+            }
+        }
+        if (!methodConversationWithCacheAdapterGetView.isPlaceholder) {
+            methodConversationWithCacheAdapterGetView.hookAfter {
+                val root = result as? ViewGroup ?: return@hookAfter
+                tintMentionLabels(root, "getView")
+                markVirtualRow(root)
+                tintFolderTitleByText(root)
+                root.post {
+                    tintMentionLabels(root, "getView-post")
+                    markVirtualRow(root)
+                    tintFolderTitleByText(root)
+                }
+            }
+        }
+        hookConversationListDraw()
+        // FunBox 同款：hook RecyclerView.Adapter.bindViewHolder（framework 基类方法，微信 adapter 不 override，
+        // 一定触发，覆盖微信主列表与归拢内部列表的 RecyclerView 行渲染）
+        runCatching {
+            val holderCls = Class.forName(
+                "androidx.recyclerview.widget.RecyclerView\$ViewHolder",
+                false, ClassLoaders.HOST
+            )
+            val adapterCls = Class.forName(
+                "androidx.recyclerview.widget.RecyclerView\$Adapter",
+                false, ClassLoaders.HOST
+            )
+            adapterCls.getMethod(
+                "bindViewHolder", holderCls, Int::class.javaPrimitiveType, java.util.List::class.java
+            ).hookAfterDirectly { tintHolder() }
+            runCatching {
+                adapterCls.getMethod(
+                    "bindViewHolder", holderCls, Int::class.javaPrimitiveType
+                ).hookAfterDirectly { tintHolder() }
+                WeLogger.i(TAG, "bindViewHolder(vh,int) androidx hook registered")
+                diagFile("bindViewHolder(vh,int) androidx registered")
+            }.onFailure { WeLogger.w(TAG, "hook androidx bindViewHolder(2-arg) failed", it) }
+            WeLogger.i(TAG, "bindViewHolder androidx hook registered")
+            diagFile("bindViewHolder androidx registered")
+        }.onFailure { WeLogger.w(TAG, "hook androidx bindViewHolder failed", it); diagFile("bindViewHolder androidx FAILED: $it") }
+        runCatching {
+            val holderCls = Class.forName(
+                "android.support.v7.widget.RecyclerView\$ViewHolder",
+                false, ClassLoaders.HOST
+            )
+            val adapterCls = Class.forName(
+                "android.support.v7.widget.RecyclerView\$Adapter",
+                false, ClassLoaders.HOST
+            )
+            adapterCls.getMethod(
+                "bindViewHolder", holderCls, Int::class.javaPrimitiveType, java.util.List::class.java
+            ).hookAfterDirectly { tintHolder() }
+            WeLogger.i(TAG, "bindViewHolder support hook registered")
+            diagFile("bindViewHolder support registered")
+        }.onFailure { WeLogger.w(TAG, "hook support bindViewHolder failed", it); diagFile("bindViewHolder support FAILED: $it") }
+    }
+
+
+    private val hookedTextClasses = java.util.Collections.synchronizedSet(java.util.HashSet<Class<*>>())
+
+    /** hook 微信具体 TextView 类的 setText(CharSequence) —— 微信 digest 是 override setText 的自定义类，
+     *  不走基类；绑定到 Item 行内每个 TextView 的具体类，一次注册全部生效 */
+    private fun hookTextViewClass(v: TextView) {
+        val cls = v.javaClass
+        if (!hookedTextClasses.add(cls)) return
+        runCatching {
+            cls.getMethod("setText", java.lang.CharSequence::class.java).hookAfterDirectly {
+                val tv = thisObject as? TextView ?: return@hookAfterDirectly
+                val s = tv.text?.toString().orEmpty()
+                val tinted = tintMention(s, tv.context)
+                if (tinted != null) setTextSpanDirect(tv, tinted)
+            }
+        }.onFailure { diagFile("clsSetText FAILED ${cls.name}: $it") }
+        runCatching {
+            val bufType = Class.forName("android.widget.TextView\$BufferType", false, ClassLoaders.HOST)
+            cls.getMethod("setText", java.lang.CharSequence::class.java, bufType).hookAfterDirectly {
+                val tv = thisObject as? TextView ?: return@hookAfterDirectly
+                val s = tv.text?.toString().orEmpty()
+                val tinted = tintMention(s, tv.context)
+                if (tinted != null) {
+                    setTextSpanDirect(tv, tinted)
+                }
+            }
+            diagFile("clsSetText(CS,BT) hooked: ${cls.name}")
+        }.onFailure { diagFile("clsSetText(CS,BT) FAILED ${cls.name}: $it") }
+    }
+
+    /** 反射直写 TextView 私有 mText/mTransformedText，绕过所有 setText 重载（方案 B） */
+    private fun setTextSpanDirect(tv: TextView, spannable: CharSequence) {
+        runCatching {
+            val f = android.widget.TextView::class.java.getDeclaredField("mText")
+            f.isAccessible = true
+            f.set(tv, spannable)
+            val tf = android.widget.TextView::class.java.getDeclaredField("mTransformedText")
+            tf.isAccessible = true
+            tf.set(tv, spannable)
+            tv.invalidate()
+            tv.requestLayout()
+            diagFile("setTextSpanDirect applied: ${tv.javaClass.name}")
+        }.onFailure { diagFile("setTextSpanDirect FAILED: $it") }
+    }
+
+    /**
+     * 归拢摘要彩色（FunBox 叠加模式）：hook NoMeasuredTextView.onDraw **after**，
+     * 不拦截原生绘制（灰色原文照常输出），在原绘制完成后用同一 Canvas 叠加彩色标签
+     * （蓝 [有人@我]/[全体]、黄 [N个聊天]），彩色文字盖在灰色文字上方。
+     * 优点：不依赖 Item 根类 / adapter 渲染路径 / Tag 向上遍历，摘要文本出现即染色。
+     */
+    /**
+     * 归拢摘要彩色（FunBox 叠加模式）：全局 hook TextView.onDraw **after**。
+     * 已证实微信主列表摘要不经过 NoMeasuredTextView（其 onDraw 从不触发），改为捕获所有
+     * TextView 子类绘制：文本含归拢标记（[有人@我]/[全体]/[N个聊天]）即用控件本地坐标
+     * 画布叠加彩色标签（原生灰色保留）。同时全量输出绘制诊断以定位真实摘要控件类名。
+     */
+    private fun hookAllTextViewDraw() {
+        // 归拢摘要染色（微信主列表）：摘要控件 = NoMeasuredTextView（extends X2CView，非 TextView，
+        // getText() 为空）。归拢摘要经 setText(CharSequence) 注入；hookBefore 直接替换为 Spannable
+        // 上色（蓝 [有人@我]/[全体]、黄 [N个聊天]），微信自绘渲染 span 颜色即上色。
+        // 已实测：系统 Framework 类 hook（View.draw/onAttachedToWindow）对微信无效，不再使用。
+        runCatching {
+            val nmtCls = Class.forName("com.tencent.mm.ui.base.NoMeasuredTextView")
+            nmtCls.declaredMethods.filter { it.name == "setText" }.forEach { m ->
+                m.apply { isAccessible = true }.hookBeforeDirectly {
+                    val text = args.getOrNull(0)?.toString() ?: return@hookBeforeDirectly
+                    if (folderTitleNames().contains(text.trim())) {
+                        if (folderTitleEnabled) {
+                        args[0] = android.text.SpannableString(text).apply {
+                            setSpan(android.text.style.ForegroundColorSpan(MENTION_TITLE_BLUE), 0, text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                        }
+                        }
+                        return@hookBeforeDirectly
+                    }
+                    if (isAggSummary(text)) {
+                        args[0] = tintAggSummary(text, (thisObject as? View)?.context)
+                    }
+                    if (CHAT_COUNT_REGEX.containsMatchIn(text)) {
+                        tintFolderTitle(thisObject as? View, text)
+                    }
+                    if (CHAT_COUNT_REGEX.containsMatchIn(text)) {
+                        tintFolderTitle(thisObject as? View, text)
+                    }
+                }
+            }
+            diagFile("NMTV tint hook installed")
+            WeLogger.i(TAG, "NoMeasuredTextView.setText tint hook installed")
+        }.onFailure {
+            diagFile("NMTV tint hook FAILED: $it")
+            WeLogger.e(TAG, "NoMeasuredTextView.setText tint hook failed", it)
+        }
+    }
+
+    private fun tintFolderTitleByText(root: ViewGroup) {
+        runCatching {
+            if (!folderTitleEnabled) {
+                val orig = root.getTag(TAG_KEY_TITLE_ORIG) as? Int
+                val title = root.getTag(TAG_KEY_TITLE_TV) as? TextView
+                if (orig != null && title != null && title.currentTextColor != orig) title.setTextColor(orig)
+                return
+            }
+            val queue = java.util.ArrayDeque<View>()
+            queue.add(root)
+            var guard = 0
+            while (queue.isNotEmpty() && guard++ < 200) {
+                val v = queue.removeFirst()
+                if (v is TextView) {
+                    val t = v.text?.toString()?.trim().orEmpty()
+                    if (t.isNotEmpty() && folderTitleNames().contains(t) && v.currentTextColor != adaptNight(root.context, MENTION_TITLE_BLUE)) {
+                        v.setTextColor(adaptNight(root.context, MENTION_TITLE_BLUE))
+                    }
+                }
+                if (v is ViewGroup) for (i in 0 until v.childCount) queue.addLast(v.getChildAt(i))
+            }
+            diagFile("ConversationList dispatchDraw hooked")
+            WeLogger.i(TAG, "ConversationList dispatchDraw hooked")
+        }.onFailure {
+            diagFile("ConversationList dispatchDraw FAILED: $it")
+            WeLogger.w(TAG, "ConversationList dispatchDraw hook fail", it)
+        }
+    }
+    /** Hook WeChat conversation list dispatchDraw: tint folder-title rows every frame (idempotent) */
+    private fun hookConversationListDraw() {
+        runCatching {
+            val cls = Class.forName("com.tencent.mm.ui.conversation.ConversationListView")
+            cls.getMethod("dispatchDraw", android.graphics.Canvas::class.java).hookAfterDirectly {
+                val list = thisObject as? ViewGroup ?: return@hookAfterDirectly
+                runCatching {
+                    for (i in 0 until list.childCount) {
+                        val row = list.getChildAt(i)
+                        if (row is ViewGroup) tintFolderTitleByText(row)
+                    }
+                }
+            }
+            diagFile("ConversationList dispatchDraw hooked")
+            WeLogger.i(TAG, "ConversationList dispatchDraw hooked")
+        }.onFailure {
+            diagFile("ConversationList dispatchDraw FAILED: $it")
+            WeLogger.w(TAG, "ConversationList dispatchDraw hook fail", it)
+        }
+    }
+
+    /** Find title TextView in a row (largest textSize, not aggregate summary, contains letters) */
+    private fun findTitleTextView(root: ViewGroup): TextView? {
+        var title: TextView? = null
+        val queue = java.util.ArrayDeque<View>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val v = queue.removeFirst()
+            if (v is TextView) {
+                val t = v.text?.toString().orEmpty()
+                if (!isAggSummary(t) && t.any { it.isLetter() } && (title == null || v.textSize > title.textSize)) {
+                    title = v
+                }
+            }
+            if (v is ViewGroup) for (i in 0 until v.childCount) queue.addLast(v.getChildAt(i))
+        }
+        return title
+    }
+
+    /** Fallback for cache-adapter rows: tint the row title with folder-title color */
+    private fun tintFolderTitle(summaryView: View?, text: String) {
+        if (summaryView == null) { diagFile("tintFolderTitle: summaryView null"); return }
+        if (!CHAT_COUNT_REGEX.containsMatchIn(text)) return
+        diagFile("tintFolderTitle: start sv=" + summaryView.javaClass.simpleName)
+        runCatching {
+            var v: View? = summaryView
+            var guard = 0
+            var firstGroup: ViewGroup? = null
+            while (v != null && guard++ < 8) {
+                v = v.parent as? View ?: break
+                diagFile("tintFolderTitle: parent#" + guard + " " + v.javaClass.simpleName + " vg=" + (v is ViewGroup))
+                if (v is ViewGroup) {
+                    if (firstGroup == null) firstGroup = v
+                    val title = findTitleTextView(v)
+                    diagFile("tintFolderTitle: title=" + (title?.text?.toString()?.take(15) ?: "NULL"))
+                    if (title == null) continue
+                    val t = title.text?.toString() ?: continue
+                    if (!folderTitleNames().contains(t)) { diagFile("tintFolderTitle: skip not-whitelist: " + t.take(15)); continue }
+                    title.setTextColor(MENTION_TITLE_BLUE)
+                    if (folderTitleEnabled) title.setTextColor(adaptNight(summaryView.context, MENTION_TITLE_BLUE))
+                    diagFile("tintFolderTitle: tinted " + t.take(20) + " color=" + Integer.toHexString(MENTION_TITLE_BLUE))
+                    return@runCatching
+                }
+            }
+        }
+    }
+    @Volatile
+    private var folderNameCache: Set<String>? = null
+    @Volatile
+    private var lastFolderNameLoad = 0L
+
+    /** Folder-name whitelist (cached 5s) so native WeChat fold rows like "fold top chats" are never tinted */
+    private fun folderTitleNames(): Set<String> {
+        val now = System.currentTimeMillis()
+        val cached = folderNameCache
+        if (cached != null && now - lastFolderNameLoad < 5000) return cached
+        val names = runCatching { loadFolders().map { it.name }.toSet() }.getOrDefault(emptySet())
+        diagFile("folderNames: " + names.sorted().joinToString(","))
+        folderNameCache = names
+        lastFolderNameLoad = now
+        return names
+    }
+
+    /** 归拢摘要标记判断 */
+    private fun isAggSummary(text: String): Boolean =
+        text.contains("[有人@我]") || text.contains("[全体]") || text.contains("[@全体]") || text.contains("[自己]") || CHAT_COUNT_REGEX.containsMatchIn(text)
+
+    /** 归拢摘要 Spannable 上色：蓝 [有人@我]/[全体]、黄 [N个聊天]（其余保持微信原生颜色） */
+    private fun tintAggSummary(text: String, ctx: Context?): CharSequence {
+        val sp = SpannableString(text)
+        val atIdx = text.indexOf("[有人@我]")
+        if (atIdx >= 0) sp.setSpan(ForegroundColorSpan(adaptNight(ctx, MENTION_RED)), atIdx, atIdx + "[有人@我]".length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val allIdx = text.indexOf("[@全体]").let { if (it >= 0) it else text.indexOf("[全体]") }
+        if (allIdx >= 0) sp.setSpan(ForegroundColorSpan(adaptNight(ctx, MENTION_RED)), allIdx, text.indexOf(']', allIdx) + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val selfIdx = text.indexOf("[自己]")
+        if (selfIdx >= 0 && mentionSelfEnabled) sp.setSpan(ForegroundColorSpan(adaptNight(ctx, MENTION_GREEN)), selfIdx, selfIdx + "[自己]".length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val m = CHAT_COUNT_REGEX.find(text)
+        if (m != null) sp.setSpan(ForegroundColorSpan(adaptNight(ctx, MENTION_YELLOW)), m.range.first, m.range.last + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val member = MEMBER_PAREN_REGEX.find(text)
+        if (member != null && mentionMemberEnabled) sp.setSpan(ForegroundColorSpan(adaptNight(ctx, MENTION_MEMBER)), member.range.first, member.range.last + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return sp
+    }
+
+    /** 反射 dump 实例字段（含父类 4 层），定位 paint/baseline 字段 */
+    private fun dumpFields(obj: Any) {
+        runCatching {
+            val sb = StringBuilder()
+            var cls: Class<*>? = obj.javaClass
+            var guard = 0
+            while (cls != null && guard++ < 4) {
+                cls.declaredFields.forEach { f ->
+                    runCatching {
+                        f.isAccessible = true
+                        val v = f.get(obj)
+                        val vs = v?.toString()?.take(40) ?: "null"
+                        sb.append(f.name).append(':').append(f.type.simpleName).append('=').append(vs).append("; ")
+                    }
+                }
+                cls = cls.superclass
+            }
+            diagFile("NMTV_FIELDS[${obj.javaClass.simpleName}] $sb")
+        }
+    }
+
+
+    /** 归拢摘要分段着色：[@] 蓝、[N个聊天] 黄、其余恢复微信原生颜色，尾部超宽省略 */
+    private fun drawTintedSummary(tv: TextView, canvas: Canvas, text: String) {
+        runCatching {
+            val paint = TextPaint(tv.paint)
+            val originalColor = tv.currentTextColor
+            val baseX = tv.paddingLeft.toFloat()
+            val baseY = tv.baseline.toFloat()
+            val maxWidth = tv.width - tv.paddingLeft - tv.paddingRight
+            val red = adaptNight(tv.context, MENTION_RED)
+            val yellow = adaptNight(tv.context, MENTION_YELLOW)
+            val green = adaptNight(tv.context, MENTION_GREEN)
+            val memberColor = adaptNight(tv.context, MENTION_MEMBER)
+
+            data class Seg(val start: Int, val end: Int, val color: Int)
+            val segs = mutableListOf<Seg>()
+            val atIdx = text.indexOf("[有人@我]")
+            if (atIdx >= 0) segs.add(Seg(atIdx, atIdx + "[有人@我]".length, red))
+            val allIdx = text.indexOf("[@全体]").let { if (it >= 0) it else text.indexOf("[全体]") }
+            if (allIdx >= 0) segs.add(Seg(allIdx, text.indexOf(']', allIdx) + 1, red))
+            val selfIdx = text.indexOf("[自己]")
+            if (selfIdx >= 0 && mentionSelfEnabled) segs.add(Seg(selfIdx, selfIdx + "[自己]".length, green))
+            val m = Regex("""\[[^\]]*个(?:聊天|消息)\]""").find(text)
+            if (m != null) segs.add(Seg(m.range.first, m.range.last + 1, yellow))
+            segs.sortBy { it.start }
+            val member = MEMBER_PAREN_REGEX.find(text)
+            if (member != null && mentionMemberEnabled) segs.add(Seg(member.range.first, member.range.last + 1, memberColor))
+
+            var x = baseX
+            var cur = 0
+            for (seg in segs) {
+                if (seg.start > cur) {
+                    // 段间未着色文本：原色
+                    paint.color = originalColor
+                    val s = text.substring(cur, seg.start)
+                    canvas.drawText(s, x, baseY, paint)
+                    x += paint.measureText(s)
+                }
+                paint.color = seg.color
+                val s = text.substring(seg.start, seg.end)
+                canvas.drawText(s, x, baseY, paint)
+                x += paint.measureText(s)
+                cur = seg.end
+            }
+            if (cur < text.length) {
+                val rest = text.substring(cur)
+                val remain = maxWidth - (x - baseX)
+                val shown = if (remain > 0) {
+                    TextUtils.ellipsize(rest, paint, remain, TextUtils.TruncateAt.END).toString()
+                } else ""
+                if (shown.isNotEmpty()) {
+                    paint.color = originalColor
+                    canvas.drawText(shown, x, baseY, paint)
+                }
+            }
+        }
+    }
+
+    private fun diagFile(msg: String) {
+        runCatching {
+            val f = java.io.File("/sdcard/Android/data/com.tencent.mm/WCX/diag.log")
+            f.parentFile?.mkdirs()
+            f.appendText(System.currentTimeMillis().toString() + " " + msg + "\n")
+        }
+    }
+
+    // ==================== FunBox 同款：归拢摘要叠加染色（Item 根 View dispatchDraw after） ====================
+    // 方案：不拦截 NoMeasuredTextView 原生绘制（灰色原文照常输出），
+    // 在 Item 根 View dispatchDraw 之后用 Canvas 叠加彩色标签（蓝 [有人@我]/[全体]、黄 [N个聊天]），
+    // 彩色文字盖在灰色文字上方。bind 阶段（getView）给 Item 根 setTag，无需向上遍历父布局。
+
+    /** Item 根 View 的 Tag key：标记归拢虚拟行 */
+    private const val TAG_KEY_VIRTUAL = 0x5A110001
+    /** Item 根 View 的 Tag key：归拢摘要着色状态 */
+    private const val TAG_KEY_STATE = 0x5A110002
+    /** Item 根 View 的 Tag key：内部摘要 NoMeasuredTextView 引用 */
+    private const val TAG_KEY_SUMMARY_TV = 0x5A110003
+    /** Item 根 View 的 Tag key：内部标题 TextView 引用（文件夹标题染蓝） */
+    private const val TAG_KEY_TITLE_TV = 0x5A110004
+    private const val TAG_KEY_TITLE_ORIG = 0x5A110005
+
+    /** 归拢摘要着色状态（bind 阶段解析，onDraw 阶段直接读取） */
+    private class MergeUiState(
+        val atAll: Boolean,
+        val atMe: Boolean,
+        val self: Boolean,
+        val chatCount: Int,
+        val memberName: String?,
+        val fullText: String
+    )
+
+    /** 已 hook dispatchDraw 的 Item 根类（去重） */
+    private val hookedItemDrawClasses = java.util.Collections.synchronizedSet(java.util.HashSet<Class<*>>())
+
+    /**
+     * bind 阶段（getView 后）识别归拢虚拟行：找内部 NoMeasuredTextView 摘要控件，
+     * 文本含 [有人@我]/[全体]/[N个聊天] 归拢标记即标记该行为虚拟行并记录着色状态。
+     * RecyclerView 复用旧 item 时先清 tag（未命中即普通会话）。
+     */
+    private fun markVirtualRow(root: ViewGroup) {
+        runCatching {
+            val queue = java.util.ArrayDeque<View>()
+            queue.add(root)
+            var summaryTv: TextView? = null
+            var titleTv: TextView? = null
+            var fullText = ""
+            while (queue.isNotEmpty()) {
+                val v = queue.removeFirst()
+                if (v is TextView) {
+                    val t = v.text?.toString().orEmpty()
+                    // 标题：非摘要、含文字（排除未读数角标等纯数字/时间控件）、字号最大的 TextView
+                    if (!isAggSummary(t) && t.any { it.isLetter() } && (titleTv == null || v.textSize > titleTv.textSize)) {
+                        titleTv = v
+                        WeLogger.i(TAG, "titleTv candidate: class=${v.javaClass.simpleName} textSize=${v.textSize} text=${t.take(20)}")
+                    }
+                    // 归拢摘要标记命中即识别（摘要控件不限于 NoMeasuredTextView）
+                    if (isAggSummary(t) && summaryTv == null) {
+                        summaryTv = v
+                        fullText = t
+                    }
+                }
+                if (v is ViewGroup) for (i in 0 until v.childCount) queue.addLast(v.getChildAt(i))
+            }
+            if (summaryTv == null && fullText.isEmpty()) {
+                root.setTag(TAG_KEY_VIRTUAL, null)
+                root.setTag(TAG_KEY_STATE, null)
+                root.setTag(TAG_KEY_SUMMARY_TV, null)
+                root.setTag(TAG_KEY_TITLE_TV, null)
+                return
+            }
+            val atAll = fullText.contains("[全体]") || fullText.contains("[@全体]")
+            val atMe = fullText.contains("[有人@我]")
+            val chatCount = runCatching {
+                CHAT_COUNT_REGEX.find(fullText)?.value
+                    ?.trim('[', ']')?.replace("个聊天", "")?.replace("个消息", "")?.toIntOrNull() ?: 0
+            }.getOrDefault(0)
+            root.setTag(TAG_KEY_VIRTUAL, true)
+            root.setTag(TAG_KEY_STATE, MergeUiState(atAll, atMe, fullText.contains("[自己]"), chatCount, MEMBER_PAREN_REGEX.find(fullText)?.value, fullText))
+            root.setTag(TAG_KEY_SUMMARY_TV, summaryTv)
+            root.setTag(TAG_KEY_TITLE_TV, titleTv)
+            root.setTag(TAG_KEY_TITLE_ORIG, titleTv?.currentTextColor)
+            ensureItemDispatchDrawHook(root.javaClass)
+        }
+    }
+
+    /** 首次遇到某 Item 根类时 hook 其 dispatchDraw(after)：子 View（含灰色摘要）画完后叠加彩色 */
+    private fun ensureItemDispatchDrawHook(cls: Class<*>) {
+        if (!hookedItemDrawClasses.add(cls)) return
+        runCatching {
+            cls.getMethod("dispatchDraw", android.graphics.Canvas::class.java).hookAfterDirectly {
+                val list = thisObject as? ViewGroup ?: return@hookAfterDirectly
+                runCatching {
+                    for (i in 0 until list.childCount) {
+                        val row = list.getChildAt(i)
+                        if (row is ViewGroup) tintFolderTitleByText(row)
+                    }
+                }
+            }
+            diagFile("ItemDispatchDraw hook: ${cls.name}")
+            WeLogger.i(TAG, "ItemDispatchDraw hook: ${cls.name}")
+        }.onFailure {
+            diagFile("ItemDispatchDraw hook FAIL ${cls.name}: $it")
+            WeLogger.w(TAG, "ItemDispatchDraw hook fail", it)
+        }
+    }
+
+
+
+    private fun XC_MethodHook.MethodHookParam.tintHolder() {
+        val holder = args?.getOrNull(0) ?: return
+        val itemView = runCatching {
+            holder.javaClass.getMethod("getItemView").invoke(holder) as? View
+        }.getOrNull() ?: return
+        val root = itemView as? ViewGroup ?: return
+        WeLogger.i(TAG, "bindViewHolder fired: root=${root.javaClass.simpleName} children=${root.childCount}")
+        diagFile("bindViewHolder fired: ${root.javaClass.simpleName} children=${root.childCount}")
+        tintMentionLabels(root, "bind")
+        markVirtualRow(root)
+        root.post {
+            WeLogger.i(TAG, "bindViewHolder post fired: root=${root.javaClass.simpleName}")
+        diagFile("bindViewHolder post fired: ${root.javaClass.simpleName}")
+            tintMentionLabels(root, "post")
+            markVirtualRow(root)
+        }
+    }
+
+    private fun tintMention(text: String, ctx: Context?): CharSequence? {
+        val atIdx = text.indexOf("[\u6709\u4eba@\u6211]")
+        val selfIdx = text.indexOf("[自己]")
+        val chatMatch = CHAT_COUNT_REGEX.find(text)
+        if (atIdx < 0 && chatMatch == null && selfIdx < 0) return null
+        val spannable = SpannableString(text)
+        if (atIdx >= 0) {
+            spannable.setSpan(
+                ForegroundColorSpan(MENTION_RED),
+                atIdx,
+                (atIdx + 6).coerceAtMost(text.length),
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        if (selfIdx >= 0 && mentionSelfEnabled) {
+            spannable.setSpan(
+                ForegroundColorSpan(MENTION_GREEN),
+                selfIdx,
+                selfIdx + "[自己]".length,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        if (chatMatch != null) {
+            spannable.setSpan(
+                ForegroundColorSpan(MENTION_YELLOW),
+                chatMatch.range.first,
+                chatMatch.range.last + 1,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        return spannable
+    }
+
+    private fun tintMentionLabels(root: ViewGroup, tag: String) {
+        var tvCount = 0
+        var hit = 0
+        val queue = java.util.ArrayDeque<View>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val v = queue.removeFirst()
+            if (v is TextView) {
+                tvCount++
+                hookTextViewClass(v)
+                val text = v.text?.toString().orEmpty()
+                val tinted = tintMention(text, root.context)
+                if (tinted != null) {
+                    hit++
+                    v.setText(tinted)
+                }
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) queue.addLast(v.getChildAt(i))
+            }
+        }
+        if (hit > 0) WeLogger.i(TAG, "tint[$tag] done tv=$tvCount hit=$hit")
+    }
+
+    private fun hookSqliteExec() {
+        runCatching {
+            android.database.sqlite.SQLiteDatabase::class.java
+                .getMethod("execSQL", String::class.java)
+                .hookBeforeDirectly {
+                    val sql = args?.getOrNull(0) as? String ?: return@hookBeforeDirectly
+                    val low = sql.lowercase()
+                    if (low.contains("rconversation") && (low.contains("update") || low.contains("unread"))) {
+                        WeLogger.i(TAG, "execSQL: $sql")
+                        diagFile("execSQL: $sql")
+                    }
+                }
+            WeLogger.i(TAG, "execSQL hook registered")
+            diagFile("execSQL hook registered")
+        }.onFailure { WeLogger.w(TAG, "hook execSQL failed", it) }
+    }
+
+    private val methodRecyclerOnBind by dexMethod(allowFailure = true, allowMultiple = true) {
+        matcher {
+            name = "onBindViewHolder"
+            paramTypes("androidx.recyclerview.widget.RecyclerView\$ViewHolder", "int")
+        }
+    }
+
+    private val methodSupportRecyclerOnBind by dexMethod(allowFailure = true, allowMultiple = true) {
+        matcher {
+            name = "onBindViewHolder"
+            paramTypes("android.support.v7.widget.RecyclerView\$ViewHolder", "int")
+        }
+    }
+
+    private val methodTextViewSetText by dexMethod(allowFailure = true, allowMultiple = true) {
+        matcher {
+            name = "setText"
+            paramTypes("java.lang.CharSequence")
+        }
+    }
+
+    /** Global fallback: tint injected mention/chat-count text wherever a TextView renders it. */
+    private fun hookTextViewSetText() {
+        if (methodTextViewSetText.isPlaceholder) return
+        methodTextViewSetText.hookBefore {
+            val a = args ?: return@hookBefore
+            val text = a.getOrNull(0) as? CharSequence ?: return@hookBefore
+            val s0 = text.toString()
+            if (folderTitleNames().contains(s0)) {
+                if (folderTitleEnabled) {
+                a[0] = android.text.SpannableString(s0).apply { setSpan(android.text.style.ForegroundColorSpan(MENTION_TITLE_BLUE), 0, s0.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE) }
+                }
+                return@hookBefore
+            }
+            val tinted = tintMention(s0, (thisObject as? View)?.context)
+            if (tinted != null) {
+                a[0] = tinted
+            }
+        }
+
+        // 兜底：hook 基类 TextView.setText，覆盖不 override 的 TextView 子类
+        runCatching {
+            val baseSetText = android.widget.TextView::class.java
+                .getMethod("setText", java.lang.CharSequence::class.java)
+            baseSetText.hookBeforeDirectly {
+                val a = args ?: return@hookBeforeDirectly
+                val text = a.getOrNull(0) as? CharSequence ?: return@hookBeforeDirectly
+                val tinted = tintMention(text.toString(), (thisObject as? View)?.context)
+                if (tinted != null) {
+                    a[0] = tinted
+                }
+            }
+        }.onFailure { WeLogger.w(TAG, "hook TextView.setText failed", it) }
+
+    }
+
     private fun hookConversationStorageUpdateUnread() {
         if (methodConversationStorageUpdateUnreadByTalker.isPlaceholder) return
         methodConversationStorageUpdateUnreadByTalker.hookBefore {
             val username = args.firstOrNull() as? String ?: return@hookBefore
-            if (isFolderId(username)) {
-            try {
-                if (method is java.lang.reflect.Method) {
-                    val returnType = (method as java.lang.reflect.Method).returnType
-                    if (returnType == Boolean::class.javaPrimitiveType || returnType == java.lang.Boolean::class.java) {
-                        result = true
-                    }
-                }
-            } catch (e: Throwable) {
-                // 兜底异常捕获
-            }
-        }
+            WeLogger.i(TAG, "updateUnreadByTalker: $username folder=${isFolderId(username)}")
+            diagFile("updateUnreadByTalker: $username folder=${isFolderId(username)}")
+            if (isFolderId(username)) result = true
         }
     }
 
@@ -914,41 +1720,212 @@ object ConversationAggregation : ClickableFeature(),
     }
 
     private fun syncFoldersToDatabase() {
-        foldersCache = null
-        folderMembersCache.clear()
-        val folders = loadFolders()
+        val handler = refreshHandler ?: return
+        handler.removeCallbacksAndMessages(RECONCILE_TASK_TOKEN)
+        handler.postAtTime(
+            { reconcileFolders(loadFolders()) },
+            RECONCILE_TASK_TOKEN,
+            SystemClock.uptimeMillis()
+        )
+    }
+
+    private fun reconcileFolders(folders: List<ChatFolder>) {
+        if (!WeDatabaseApi.isReady) return
+        val startedAt = SystemClock.elapsedRealtime()
+        var databaseChanged = false
         runCatching {
             withQueryRewriteSuppressed {
                 if (!isFolderSchemaReady()) return@withQueryRewriteSuppressed
-                // clearStaleFolderMappings() deletes the folder rows, which would drop the
-                // pin / move-up bits WeChat stored on them. Snapshot those bits first so
-                // composeFolderFlag() can restore them when the rows are recreated below.
-                snapshotFolderPinFlags(folders)
-                clearStaleFolderMappings()
-                folders.forEach { syncFolder(it) }
+                folderMembersCache.clear()
+                val desiredMembers = resolveOwnedMembers(folders)
+                val desiredOwners = reverseMemberIndex(desiredMembers)
+                val currentOwners = readCurrentMemberOwners()
+                val storedRows = readStoredFolderRows()
+                val liveFlags = storedRows.mapValues { it.value.flag }
+                persistChangedPinFlags(folders, liveFlags)
+
+                val desiredFolderIds = folders.mapTo(linkedSetOf()) { it.id }
+                val storedFolderIds = readStoredFolderIds()
+                val removedFolderIds = storedFolderIds - desiredFolderIds
+                val changedOwnerMembers = currentOwners.filter { (member, owner) ->
+                    desiredOwners[member] != owner
+                }.keys
+                val removedMembers = changedOwnerMembers.filterTo(linkedSetOf()) { it !in desiredOwners }
+                val changedBindings = desiredOwners.filter { (member, owner) ->
+                    currentOwners[member] != owner
+                }
+                val existingContacts = readFolderContactNames(desiredFolderIds)
+                val existingAvatarRows = readExistingAvatarRows(desiredFolderIds)
+                val summaries = readFolderSummaries(desiredMembers, storedRows)
+                val changedSummaries = folders.mapNotNull { folder ->
+                    val summary = summaries[folder.id] ?: FolderSummary()
+                    val stored = storedRows[folder.id]
+                    if (stored == null ||
+                        stored.summary != summary ||
+                        stored.attrFlag != summary.attrFlag ||
+                        stored.flag and FLAG_TIME_MASK != summary.conversationTime and FLAG_TIME_MASK
+                    ) {
+                        folder.id to summary
+                    } else {
+                        null
+                    }
+                }
+                databaseChanged = changedBindings.isNotEmpty() || changedSummaries.isNotEmpty() ||
+                        removedMembers.isNotEmpty() || removedFolderIds.isNotEmpty() ||
+                        folders.any { it.id !in storedRows || existingContacts[it.id] != it.name } ||
+                        desiredFolderIds.any { it !in existingAvatarRows }
+
+                if (databaseChanged) {
+                    WeDatabaseApi.transaction {
+                        deleteEmptyPlaceholderRows(removedMembers)
+                        unbindMembers(removedMembers)
+                        ensureManualMemberRows(folders, changedBindings.keys)
+                        bindMembers(changedBindings)
+                        deleteStoredFolders(removedFolderIds)
+
+                        folders.forEach { folder ->
+                            if (folder.id !in storedRows) {
+                                ensureFolderConversationRow(folder)
+                            }
+                            if (existingContacts[folder.id] != folder.name) {
+                                writeFolderContact(folder)
+                            }
+                            if (folder.id !in existingAvatarRows) {
+                                writeFolderAvatar(folder.id)
+                            }
+                        }
+
+                        changedSummaries.forEach { (folderId, summary) ->
+                            writeFolderSummaryRow(folderId, summary)
+                        }
+                    }
+                }
+
+                membersByFolder = desiredMembers
+                folderByMember = desiredOwners
+                desiredMembers.forEach { (folderId, members) ->
+                    folderMembersCache[folderId] = members
+                }
+
+                WeLogger.i(
+                    TAG,
+                    "reconciled ${folders.size} folders: bindings=${changedBindings.size}, " +
+                    "unbound=${removedMembers.size}, removed=${removedFolderIds.size}, " +
+                            "elapsed=${SystemClock.elapsedRealtime() - startedAt}ms"
+                )
             }
-            WeLogger.i(TAG, "synced ${folders.size} folders")
+            if (databaseChanged) WeConversationApi.reloadConversations()
         }.onFailure {
             WeLogger.e(TAG, "failed to sync folders", it)
         }
     }
 
-    /**
-     * Captures each folder row's live pin / move-up bits into [ChatFolder.pinFlag] and persists the
-     * folder list, just before [clearStaleFolderMappings] deletes the rows. Since the pin flag is
-     * stored in chat_folders.json, it survives a process restart between onDisable (which deletes
-     * every row) and the next onEnable — [composeFolderFlag] restores it when recreating the rows.
-     *
-     * Only folders whose row actually exists update the snapshot — the live row is WeChat's current
-     * truth (pin set/cleared via setPlacedTop). When no row exists (e.g. the first sync after
-     * re-enabling in a fresh process, where onDisable already deleted every row), the previously
-     * persisted [ChatFolder.pinFlag] is left intact rather than overwritten with 0, so the user's
-     * pin choice isn't silently lost.
-     */
-    private fun snapshotFolderPinFlags(folders: List<ChatFolder>) {
+    private fun resolveOwnedMembers(folders: List<ChatFolder>): Map<String, List<String>> {
+        val candidates = linkedMapOf<String, List<String>>()
+        val ownerByMember = linkedMapOf<String, String>()
+        folders.forEach { folder ->
+            val members = resolveFolderMembers(folder).filterNot(::isFolderId).distinct()
+            candidates[folder.id] = members
+            members.forEach { ownerByMember[it] = folder.id }
+        }
+        return candidates.mapValues { (folderId, members) ->
+            members.filter { ownerByMember[it] == folderId }
+        }
+    }
+
+    private fun reverseMemberIndex(byFolder: Map<String, List<String>>): Map<String, String> =
+        buildMap { byFolder.forEach { (folderId, members) -> members.forEach { put(it, folderId) } } }
+
+    private fun readCurrentMemberOwners(): Map<String, String> {
+        val result = linkedMapOf<String, String>()
+        WeDatabaseApi.rawQuery(
+            "SELECT ${ConversationTable.USERNAME}, ${ConversationTable.PARENT_REF} " +
+                    "FROM ${ConversationTable.NAME} WHERE ${ConversationTable.PARENT_REF} LIKE ?",
+            arrayOf("$FOLDER_PREFIX%")
+        ).use { cursor ->
+            while (cursor.moveToNext()) result[cursor.getString(0)] = cursor.getString(1)
+        }
+        return result
+    }
+
+    private fun readStoredFolderRows(): Map<String, StoredFolderRow> {
+        val result = linkedMapOf<String, StoredFolderRow>()
+        WeDatabaseApi.rawQuery(
+            """
+            SELECT ${ConversationTable.USERNAME}, ${ConversationTable.FLAG}, ${ConversationTable.DIGEST},
+                   ${ConversationTable.DIGEST_USER}, ${ConversationTable.IS_SEND}, ${ConversationTable.STATUS},
+                   ${ConversationTable.CONVERSATION_TIME}, ${ConversationTable.UNREAD_COUNT},
+                   ${ConversationTable.UNREAD_MUTE_COUNT}, ${ConversationTable.CONTENT},
+                   ${ConversationTable.MSG_TYPE}, ${ConversationTable.CHAT_MODE}, ${ConversationTable.ATTR_FLAG}, ${ConversationTable.AT_COUNT}
+            """.trimIndent() + " " +
+                    "FROM ${ConversationTable.NAME} WHERE ${ConversationTable.USERNAME} LIKE ?",
+            arrayOf("$FOLDER_PREFIX%")
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result[cursor.getString(0)] = StoredFolderRow(
+                    flag = cursor.getLongOrZero(ConversationTable.FLAG),
+                    attrFlag = cursor.getIntOrZero(ConversationTable.ATTR_FLAG),
+                    summary = FolderSummary(
+                        digest = cursor.getStringOrEmpty(ConversationTable.DIGEST),
+                        digestUser = cursor.getStringOrEmpty(ConversationTable.DIGEST_USER),
+                        isSend = cursor.getIntOrZero(ConversationTable.IS_SEND),
+                        status = cursor.getIntOrZero(ConversationTable.STATUS),
+                        conversationTime = cursor.getLongOrZero(ConversationTable.CONVERSATION_TIME),
+                        unreadCount = cursor.getIntOrZero(ConversationTable.UNREAD_COUNT),
+                        unreadMuteCount = cursor.getIntOrZero(ConversationTable.UNREAD_MUTE_COUNT),
+                        content = cursor.getStringOrEmpty(ConversationTable.CONTENT),
+                        msgType = cursor.getStringOrEmpty(ConversationTable.MSG_TYPE),
+                        chatMode = cursor.getIntOrZero(ConversationTable.CHAT_MODE),
+                        atMeCount = cursor.getIntOrZero(ConversationTable.AT_COUNT)
+                    )
+                )
+            }
+        }
+        return result
+    }
+
+    private fun readStoredFolderIds(): Set<String> {
+        val result = linkedSetOf<String>()
+        listOf(ConversationTable.NAME, ContactTable.NAME, "img_flag").forEach { table ->
+            WeDatabaseApi.rawQuery(
+                "SELECT username FROM $table WHERE username LIKE ?",
+                arrayOf("$FOLDER_PREFIX%")
+            ).use { cursor -> while (cursor.moveToNext()) result += cursor.getString(0) }
+        }
+        return result
+    }
+
+    private fun readFolderContactNames(folderIds: Set<String>): Map<String, String> {
+        if (folderIds.isEmpty()) return emptyMap()
+        val result = linkedMapOf<String, String>()
+        folderIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { ids ->
+            WeDatabaseApi.rawQuery(
+                "SELECT ${ContactTable.USERNAME}, ${ContactTable.NICKNAME} FROM ${ContactTable.NAME} " +
+                        "WHERE ${ContactTable.USERNAME} IN (${placeholders(ids.size)})",
+                ids.toTypedArray()
+            ).use { cursor ->
+                while (cursor.moveToNext()) result[cursor.getString(0)] = cursor.getString(1) ?: ""
+            }
+        }
+        return result
+    }
+
+    private fun readExistingAvatarRows(folderIds: Set<String>): Set<String> {
+        if (folderIds.isEmpty()) return emptySet()
+        val result = linkedSetOf<String>()
+        folderIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { ids ->
+            WeDatabaseApi.rawQuery(
+                "SELECT username FROM img_flag WHERE username IN (${placeholders(ids.size)})",
+                ids.toTypedArray()
+            ).use { cursor -> while (cursor.moveToNext()) result += cursor.getString(0) }
+        }
+        return result
+    }
+
+    private fun persistChangedPinFlags(folders: List<ChatFolder>, liveFlags: Map<String, Long>) {
         var changed = false
         val updated = folders.map { folder ->
-            val liveHigh = existingFolderFlag(folder.id)?.and(FLAG_HIGH_MASK) ?: return@map folder
+            val liveHigh = liveFlags[folder.id]?.and(FLAG_HIGH_MASK) ?: return@map folder
             if (liveHigh == folder.pinFlag) return@map folder
             changed = true
             folder.copy(pinFlag = liveHigh)
@@ -992,214 +1969,397 @@ object ConversationAggregation : ClickableFeature(),
         }
     }
 
-    private fun syncFolder(folder: ChatFolder) {
-        val members = getFolderMembers(folder).filterNot(::isFolderId).distinct()
-        if (members.isNotEmpty()) {
-            if (folder.type == FolderType.MANUAL) {
-                ensureMemberConversationRows(folder.id, members)
-            }
-            val placeholders = members.joinToString(",") { "?" }
+    private fun placeholders(count: Int): String = List(count) { "?" }.joinToString(",")
+
+    private fun deleteEmptyPlaceholderRows(members: Collection<String>) {
+        members.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
             WeDatabaseApi.execStatement(
-                "UPDATE ${ConversationTable.NAME} SET ${ConversationTable.PARENT_REF}=? WHERE ${ConversationTable.USERNAME} IN ($placeholders)",
-                arrayOf(folder.id, *members.toTypedArray())
+                """
+                DELETE FROM ${ConversationTable.NAME}
+                WHERE ${ConversationTable.USERNAME} IN (${placeholders(chunk.size)})
+                  AND ${ConversationTable.PARENT_REF} LIKE ?
+                  AND ${ConversationTable.DIGEST}='' AND ${ConversationTable.CONTENT}=''
+                  AND ${ConversationTable.UNREAD_COUNT}=0 AND ${ConversationTable.CONVERSATION_TIME}=0
+                  AND ${ConversationTable.FLAG}=0 AND ${ConversationTable.MSG_TYPE}=''
+                  AND ${ConversationTable.STATUS}=0 AND ${ConversationTable.IS_SEND}=0
+                """.trimIndent(),
+                arrayOf(*chunk.toTypedArray(), "$FOLDER_PREFIX%")
             )
         }
-
-        WeDatabaseApi.execStatement(
-            """
-            REPLACE INTO ${ContactTable.NAME} (${ContactTable.USERNAME}, ${ContactTable.NICKNAME}, ${ContactTable.TYPE}, ${ContactTable.VERIFY_FLAG})
-            VALUES (?, ?, 3, 0)
-            """.trimIndent(),
-            arrayOf(folder.id, folder.name)
-        )
-
-        WeDatabaseApi.execStatement(
-            """
-            REPLACE INTO img_flag (username, imgflag, lastupdatetime, reserved1, reserved2)
-            VALUES (?, 3, ?, 0, ?)
-            """.trimIndent(),
-            arrayOf(folder.id, System.currentTimeMillis() / 1000, "http://wekit.local/avatar/${folder.id}")
-        )
-
-        val summary = readFolderSummary(members)
-        writeFolderSummaryRow(folder.id, summary)
     }
 
-    /** Writes (REPLACEs) a folder's aggregate row in rconversation from its computed summary. */
+    private fun unbindMembers(members: Collection<String>) {
+        members.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+            WeDatabaseApi.execStatement(
+                "UPDATE ${ConversationTable.NAME} SET ${ConversationTable.PARENT_REF}='' " +
+                        "WHERE ${ConversationTable.USERNAME} IN (${placeholders(chunk.size)}) " +
+                        "AND ${ConversationTable.PARENT_REF} LIKE ?",
+                arrayOf(*chunk.toTypedArray(), "$FOLDER_PREFIX%")
+            )
+        }
+    }
+
+    private fun ensureManualMemberRows(folders: List<ChatFolder>, changedMembers: Collection<String>) {
+        val changed = changedMembers.toHashSet()
+        folders.filter { it.type == FolderType.MANUAL }.forEach { folder ->
+            folder.members.asSequence()
+                .filter { it in changed && !isFolderId(it) }
+                .distinct()
+                .chunked(SQLITE_BIND_CHUNK_SIZE / 2)
+                .forEach { chunk ->
+                    val values = chunk.joinToString(",") { "(?, ?, '', '', 0, 0, 0, 0, 0, 0, '', '', 0)" }
+                    val args: Array<Any> = chunk.flatMap { listOf<Any>(it, folder.id) }.toTypedArray()
+                    WeDatabaseApi.execStatement(
+                        """
+                        INSERT OR IGNORE INTO ${ConversationTable.NAME} (
+                            ${ConversationTable.USERNAME}, ${ConversationTable.PARENT_REF}, ${ConversationTable.DIGEST},
+                            ${ConversationTable.DIGEST_USER}, ${ConversationTable.IS_SEND}, ${ConversationTable.STATUS},
+                            ${ConversationTable.CONVERSATION_TIME}, ${ConversationTable.FLAG}, ${ConversationTable.UNREAD_COUNT},
+                            ${ConversationTable.UNREAD_MUTE_COUNT}, ${ConversationTable.CONTENT},
+                            ${ConversationTable.MSG_TYPE}, ${ConversationTable.CHAT_MODE}
+                        ) VALUES $values
+                        """.trimIndent(),
+                        args
+                    )
+                }
+        }
+    }
+
+    private fun bindMembers(bindings: Map<String, String>) {
+        bindings.entries.groupBy({ it.value }, { it.key }).forEach { (folderId, members) ->
+            members.chunked(SQLITE_BIND_CHUNK_SIZE - 1).forEach { chunk ->
+                WeDatabaseApi.execStatement(
+                    "UPDATE ${ConversationTable.NAME} SET ${ConversationTable.PARENT_REF}=? " +
+                            "WHERE ${ConversationTable.USERNAME} IN (${placeholders(chunk.size)})",
+                    arrayOf(folderId, *chunk.toTypedArray())
+                )
+            }
+        }
+    }
+
+    private fun deleteStoredFolders(folderIds: Set<String>) {
+        folderIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+            val where = "username IN (${placeholders(chunk.size)})"
+            listOf(ConversationTable.NAME, ContactTable.NAME, "img_flag").forEach { table ->
+                WeDatabaseApi.execStatement("DELETE FROM $table WHERE $where", chunk.toTypedArray())
+            }
+        }
+    }
+
+    private fun ensureFolderConversationRow(folder: ChatFolder) {
+        WeDatabaseApi.execStatement(
+            """
+            INSERT OR IGNORE INTO ${ConversationTable.NAME} (
+                ${ConversationTable.USERNAME}, ${ConversationTable.PARENT_REF}, ${ConversationTable.FLAG},
+                ${ConversationTable.CONVERSATION_TIME}, ${ConversationTable.DIGEST}, ${ConversationTable.CONTENT}
+            ) VALUES (?, '', ?, 0, '', '')
+            """.trimIndent(),
+            arrayOf(folder.id, folder.pinFlag and FLAG_HIGH_MASK)
+        )
+    }
+
+    private fun writeFolderContact(folder: ChatFolder) {
+        WeDatabaseApi.execStatement(
+            """
+            REPLACE INTO ${ContactTable.NAME} (
+                ${ContactTable.USERNAME}, ${ContactTable.NICKNAME}, ${ContactTable.TYPE}, ${ContactTable.VERIFY_FLAG}
+            ) VALUES (?, ?, 3, 0)
+            """.trimIndent(),
+            arrayOf(
+                folder.id,
+                folder.name.take(MAX_FOLDER_DISPLAY_NAME) +
+                    if (folder.name.length > MAX_FOLDER_DISPLAY_NAME) "\u2026" else ""
+            )
+        )
+    }
+
+    private fun writeFolderAvatar(folderId: String) {
+        WeDatabaseApi.execStatement(
+            """
+            INSERT OR IGNORE INTO img_flag (username, imgflag, lastupdatetime, reserved1, reserved2)
+            VALUES (?, 3, ?, 0, ?)
+            """.trimIndent(),
+            arrayOf(folderId, System.currentTimeMillis() / 1000, "http://wekit.local/avatar/$folderId")
+        )
+    }
+
+    /** Updates a materialized folder row while preserving WeChat's live pin bits. */
     private fun writeFolderSummaryRow(folderId: String, summary: FolderSummary) {
         WeDatabaseApi.execStatement(
             """
-            REPLACE INTO ${ConversationTable.NAME} (
-                ${ConversationTable.USERNAME}, ${ConversationTable.DIGEST}, ${ConversationTable.DIGEST_USER}, ${ConversationTable.IS_SEND}, ${ConversationTable.STATUS},
-                ${ConversationTable.CONVERSATION_TIME}, ${ConversationTable.FLAG}, ${ConversationTable.UNREAD_COUNT}, ${ConversationTable.UNREAD_MUTE_COUNT}, ${ConversationTable.CONTENT}, ${ConversationTable.MSG_TYPE}, ${ConversationTable.CHAT_MODE}, ${ConversationTable.ATTR_FLAG}
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE ${ConversationTable.NAME} SET
+                ${ConversationTable.DIGEST}=?, ${ConversationTable.DIGEST_USER}=?,
+                ${ConversationTable.IS_SEND}=?, ${ConversationTable.STATUS}=?,
+                ${ConversationTable.CONVERSATION_TIME}=?,
+                ${ConversationTable.FLAG}=(${ConversationTable.FLAG} & ?) | ?,
+                ${ConversationTable.UNREAD_COUNT}=?, ${ConversationTable.UNREAD_MUTE_COUNT}=?,
+                ${ConversationTable.CONTENT}=?, ${ConversationTable.MSG_TYPE}=?,
+                ${ConversationTable.CHAT_MODE}=?, ${ConversationTable.ATTR_FLAG}=?,
+                ${ConversationTable.AT_COUNT}=?
+            WHERE ${ConversationTable.USERNAME}=?
             """.trimIndent(),
             arrayOf(
-                folderId,
                 summary.digest,
                 summary.digestUser,
                 summary.isSend,
                 summary.status,
                 summary.conversationTime,
-                composeFolderFlag(folderId, summary.conversationTime),
+                FLAG_HIGH_MASK,
+                summary.conversationTime and FLAG_TIME_MASK,
                 summary.unreadCount,
                 summary.unreadMuteCount,
                 summary.content,
                 summary.msgType,
                 summary.chatMode,
-                summary.attrFlag
+                summary.attrFlag,
+                summary.atMeCount,
+                folderId
             )
         )
     }
 
-    private fun ensureMemberConversationRows(folderId: String, members: List<String>) {
-        members.forEach { member ->
-            WeDatabaseApi.execStatement(
+    private fun readFolderSummaries(
+        byFolder: Map<String, List<String>>,
+        storedRows: Map<String, StoredFolderRow> = emptyMap()
+    ): Map<String, FolderSummary> {
+        val ownerByMember = reverseMemberIndex(byFolder)
+        val states = byFolder.mapValuesTo(linkedMapOf()) { SummaryAccumulator() }
+        val members = ownerByMember.keys.toList()
+
+        members.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+            WeDatabaseApi.rawQuery(
                 """
-                INSERT OR IGNORE INTO ${ConversationTable.NAME} (
-                    ${ConversationTable.USERNAME}, ${ConversationTable.PARENT_REF}, ${ConversationTable.DIGEST}, ${ConversationTable.DIGEST_USER}, ${ConversationTable.IS_SEND},
-                    ${ConversationTable.STATUS}, ${ConversationTable.CONVERSATION_TIME}, ${ConversationTable.FLAG}, ${ConversationTable.UNREAD_COUNT}, ${ConversationTable.UNREAD_MUTE_COUNT}, ${ConversationTable.CONTENT},
-                    ${ConversationTable.MSG_TYPE}, ${ConversationTable.CHAT_MODE}
-                ) VALUES (?, ?, '', '', 0, 0, 0, 0, 0, 0, '', '', 0)
+                SELECT r.${ConversationTable.USERNAME}, r.${ConversationTable.DIGEST},
+                       r.${ConversationTable.DIGEST_USER}, r.${ConversationTable.IS_SEND},
+                       r.${ConversationTable.STATUS}, r.${ConversationTable.CONVERSATION_TIME},
+                       r.${ConversationTable.UNREAD_COUNT}, r.${ConversationTable.UNREAD_MUTE_COUNT},
+                       r.${ConversationTable.CONTENT},
+                       r.${ConversationTable.MSG_TYPE}, r.${ConversationTable.CHAT_MODE},
+                       r.${ConversationTable.AT_COUNT},
+                       c.${ContactTable.TYPE}, c.${ContactTable.LV_BUFF},
+                       c.${ContactTable.CON_REMARK}, c.${ContactTable.NICKNAME}
+                FROM ${ConversationTable.NAME} r
+                LEFT JOIN ${ContactTable.NAME} c
+                  ON c.${ContactTable.USERNAME}=r.${ConversationTable.USERNAME}
+                WHERE r.${ConversationTable.USERNAME} IN (${placeholders(chunk.size)})
                 """.trimIndent(),
-                arrayOf(member, folderId)
-            )
+                chunk.toTypedArray()
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val username = cursor.getStringOrEmpty(ConversationTable.USERNAME)
+                    val folderId = ownerByMember[username] ?: continue
+                    val state = states.getValue(folderId)
+                    val unread = cursor.getIntOrZero(ConversationTable.UNREAD_COUNT).coerceAtLeast(0)
+                    // 微信权威免打扰未读数：lvbuff 解析失败/缺失时兜底判定免打扰，避免免打扰群聊错误显示角标
+                    val muteUnread = cursor.getIntOrZero(ConversationTable.UNREAD_MUTE_COUNT).coerceAtLeast(0)
+                    if (unread > 0) {
+                        val muted = if (muteUnread > 0) true else if (username.endsWith("@chatroom")) {
+                            val index = cursor.getColumnIndex(ContactTable.LV_BUFF)
+                            val lvBuff = if (index >= 0 && !cursor.isNull(index)) cursor.getBlob(index) else null
+                            WeConversationApi.parseChatRoomNotify(lvBuff) == 0
+                        } else {
+                            cursor.getIntOrZero(ContactTable.TYPE) and 512 != 0
+                        }
+                        if (muted) {
+                            state.mutedUnread += unread
+                        } else {
+                            state.normalUnread += unread
+                        }
+                        // [N个聊天] = 归拢文件夹里有未读的聊天数（FunBox 语义，不限免打扰）
+                        state.unreadChatCount++
+                    }
+                    state.atMeCount += cursor.getIntOrZero(ConversationTable.AT_COUNT).coerceAtLeast(0)
+
+                    val time = cursor.getLongOrZero(ConversationTable.CONVERSATION_TIME)
+                    if (state.latest == null || time > state.latest!!.conversationTime) {
+                        val nickname = cursor.getStringOrEmpty(ContactTable.NICKNAME)
+                        val remark = cursor.getStringOrEmpty(ContactTable.CON_REMARK)
+                        val displayName = if (username.endsWith("@chatroom")) nickname else remark.ifBlank { nickname }
+                        state.latest = MemberSummaryRow(
+                            digest = prefixWithConversationName(
+                                displayName.takeIf { it.isNotBlank() && it != username },
+                                stripWxidPrefix(cursor.getStringOrEmpty(ConversationTable.DIGEST)),
+                                username.endsWith("@chatroom"),
+                                cursor.getStringOrEmpty(ConversationTable.DIGEST_USER).ifBlank { null },
+                                username
+                            ),
+                            digestUser = cursor.getStringOrEmpty(ConversationTable.DIGEST_USER),
+                            isSend = cursor.getIntOrZero(ConversationTable.IS_SEND),
+                            status = cursor.getIntOrZero(ConversationTable.STATUS),
+                            conversationTime = time,
+                            content = cursor.getStringOrEmpty(ConversationTable.CONTENT),
+                            msgType = cursor.getStringOrEmpty(ConversationTable.MSG_TYPE),
+                            chatMode = cursor.getIntOrZero(ConversationTable.CHAT_MODE)
+                        )
+                    }
+                }
+            }
+        }
+
+        return states.mapValues { (folderId, state) ->
+            val latest = state.latest
+            if (latest == null) {
+                FolderSummary(
+                    conversationTime = storedRows[folderId]?.summary?.conversationTime
+                        ?: System.currentTimeMillis()
+                )
+            } else {
+                FolderSummary(
+                    digest = (
+                        if (isEveryoneMention(latest.digest, latest.content) && (state.atMeCount > 0 || state.unreadChatCount > 0)) "[@全体]"
+                        else if (state.atMeCount > 0) "[有人@我]"
+                        else ""
+                    ) + (
+                        if (state.unreadChatCount > 0)
+                            "[${state.unreadChatCount}个聊天]" else ""
+                    ) + (
+                        if (latest.isSend == 1) "[自己]" else ""
+                    ) + latest.digest,
+                    digestUser = latest.digestUser,
+                    isSend = latest.isSend,
+                    status = latest.status,
+                    conversationTime = latest.conversationTime.takeIf { it > 0L }
+                        ?: storedRows[folderId]?.summary?.conversationTime
+                        ?: System.currentTimeMillis(),
+                    unreadCount = state.normalUnread,
+                    unreadMuteCount = state.mutedUnread,
+                    content = latest.content,
+                    msgType = latest.msgType,
+                    chatMode = latest.chatMode
+                )
+            }
         }
     }
 
-    private fun readFolderSummary(members: List<String>): FolderSummary {
-        if (members.isEmpty()) return FolderSummary()
-        val placeholders = members.joinToString(",") { "?" }
-        val cursor = WeDatabaseApi.rawQuery(
-            """
-            SELECT ${ConversationTable.USERNAME}, ${ConversationTable.DIGEST}, ${ConversationTable.DIGEST_USER}, ${ConversationTable.IS_SEND}, ${ConversationTable.STATUS}, ${ConversationTable.CONVERSATION_TIME},
-                   ${ConversationTable.FLAG}, ${ConversationTable.UNREAD_COUNT}, ${ConversationTable.UNREAD_MUTE_COUNT}, ${ConversationTable.CONTENT}, ${ConversationTable.MSG_TYPE}, ${ConversationTable.CHAT_MODE}
-            FROM ${ConversationTable.NAME}
-            WHERE ${ConversationTable.USERNAME} IN ($placeholders)
-            ORDER BY ${ConversationTable.CONVERSATION_TIME} DESC
-            LIMIT 1
-            """.trimIndent(),
-            arrayOf(*members.toTypedArray())
-        )
-        val fallbackTime = System.currentTimeMillis()
-        // Split unread once (a single pass over the member rows) and reuse for both buckets.
-        val (normalUnread, mutedUnread) = unreadSplitForMembers(members)
-        // NOTE: flag is intentionally NOT derived from member rows. The folder row's high
-        // 8 bits hold the pin / move-up state that WeChat writes directly via setPlacedTop.
-        // Deriving it from members would clobber the user's pin choice on every sync. The
-        // write sites compose the final flag via composeFolderFlag(), preserving those bits.
-        val latest = cursor.use { cursor ->
-            if (!cursor.moveToFirst()) null else FolderSummary(
-                digest = prefixWithConversationName(
-                    cursor.getStringOrEmpty(ConversationTable.USERNAME),
-                    cursor.getStringOrEmpty(ConversationTable.DIGEST)
-                ),
-                digestUser = cursor.getStringOrEmpty(ConversationTable.DIGEST_USER),
-                isSend = cursor.getIntOrZero(ConversationTable.IS_SEND),
-                status = cursor.getIntOrZero(ConversationTable.STATUS),
-                conversationTime = cursor.getLongOrZero(ConversationTable.CONVERSATION_TIME).takeIf { it > 0L }
-                    ?: fallbackTime,
-                unreadCount = normalUnread,
-                unreadMuteCount = mutedUnread,
-                content = cursor.getStringOrEmpty(ConversationTable.CONTENT),
-                msgType = cursor.getStringOrEmpty(ConversationTable.MSG_TYPE),
-                chatMode = cursor.getIntOrZero(ConversationTable.CHAT_MODE)
-            )
-        }
-        return latest ?: FolderSummary(
-            conversationTime = fallbackTime,
-            unreadCount = normalUnread,
-            unreadMuteCount = mutedUnread
-        )
-    }
+    /** 判断最新摘要/消息是否为「@所有人」群发提及，用于把 [有人@我] 换成 [全体]。
+     *  微信摘要的 @所有人 形式多样（"@所有人"、"所有人:"、"全体成员" 等），
+     *  因此按「所有人/全体」关键词匹配而非要求带 @ 符号。 */
+    private fun isEveryoneMention(digest: String, content: String): Boolean =
+        containsEveryone(digest) || containsEveryone(content)
 
+    private fun containsEveryone(s: String): Boolean {
+        val t = s.lowercase()
+        return t.contains("所有人") || t.contains("全体") || t.contains("全部人") ||
+            t.contains("全员") || t.contains("@all") ||
+            t.contains("@everyone") || t.contains("all members")
+    }
     /**
      * Prefixes the folder digest with the originating conversation's display name, so the
      * homepage folder row reads like "群聊名: 最新一条消息" instead of a bare message whose
      * source is ambiguous once several chats are aggregated. Returns the digest untouched
      * when it is blank or the name can't be resolved, to avoid a dangling "name: " prefix.
      */
-    private fun prefixWithConversationName(username: String, digest: String): String {
-        if (digest.isBlank() || username.isBlank()) return digest
-        val name = runCatching { WeDatabaseApi.getDisplayName(username) }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() && it != username }
-            ?: return digest
+    private val SENDER_PREFIX_REGEX = Regex("^(?:\uFF08([^\uFF09]+)\uFF09\uFF1A|([^:\uFF1A]+)[:\uFF1A])")
+
+    private val WXID_PREFIX_REGEX = Regex("^wxid_[A-Za-z0-9_]+:\\s*")
+
+    private fun stripWxidPrefix(digest: String): String {
+        if (digest.isBlank()) return digest
+        val m = WXID_PREFIX_REGEX.find(digest) ?: return digest
+        return digest.substring(m.value.length)
+    }
+
+    private fun chineseNumber(n: Int): String = when (n) {
+        in 1..9 -> arrayOf("\u4e00", "\u4e8c", "\u4e09", "\u56db", "\u4e94", "\u516d", "\u4e03", "\u516b", "\u4e5d")[n - 1]
+        in 10..99 -> {
+            val tens = arrayOf("", "\u5341", "\u4e8c\u5341", "\u4e09\u5341", "\u56db\u5341", "\u4e94\u5341", "\u516d\u5341", "\u4e03\u5341", "\u516b\u5341", "\u4e5d\u5341")[n / 10]
+            val ones = n % 10
+            if (ones == 0) tens else "$tens${arrayOf("\u4e00", "\u4e8c", "\u4e09", "\u56db", "\u4e94", "\u516d", "\u4e03", "\u516b", "\u4e5d")[ones - 1]}"
+        }
+        else -> n.toString()
+    }
+
+    private fun prefixWithConversationName(
+        displayName: String?,
+        digest: String,
+        isChatroom: Boolean,
+        senderWxid: String? = null,
+        groupId: String? = null
+    ): String {
+        if (digest.isBlank() || displayName.isNullOrBlank()) return digest
+        val name = displayName.take(MAX_DIGEST_NAME_LEN) +
+            if (displayName.length > MAX_DIGEST_NAME_LEN) "\u2026" else ""
+        if (isChatroom) {
+            val m = SENDER_PREFIX_REGEX.find(digest)
+            if (m != null) {
+                val sender = m.groupValues[1].ifEmpty { m.groupValues[2] }
+                val rawSender = resolveSenderDisplayName(sender, senderWxid, groupId)
+                val senderName = rawSender.take(MAX_SENDER_NAME_LEN) +
+                    if (rawSender.length > MAX_SENDER_NAME_LEN) "\u2026" else ""
+                val rest = digest.substring(m.value.length)
+                // 发送者名无法解析（无备注、无群名片）时不显示空括号
+                return if (senderName.isBlank()) "$name: $rest" else "$name($senderName):$rest"
+            }
+        }
         return "$name: $digest"
     }
 
-    /**
-     * Builds the folder row's `flag` so its pin / move-up state (high 8 bits, owned by
-     * WeChat's setPlacedTop / unSetPlacedTop) survives our REPLACE, while the low 56 bits
-     * track the latest member's conversationTime. Mirrors WeChat's xg3.b.c() packing.
-     *
-     * Prefers the live folder row's high bits (WeChat's current truth); when the row was just
-     * deleted by clearStaleFolderMappings — or was never created because the process restarted
-     * while disabled — falls back to the pin flag persisted on the folder in chat_folders.json.
-     */
-    private fun composeFolderFlag(folderId: String, conversationTime: Long): Long {
-        val liveHigh = existingFolderFlag(folderId)?.and(FLAG_HIGH_MASK)
-        val highBits = liveHigh ?: (folderById(folderId)?.pinFlag ?: 0L)
-        return highBits or (conversationTime and FLAG_TIME_MASK)
-    }
+    private val senderNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    /** Returns the folder row's raw flag, or null when no such row exists. */
-    private fun existingFolderFlag(folderId: String): Long? {
-        val cursor = WeDatabaseApi.rawQuery(
-            "SELECT ${ConversationTable.FLAG} FROM ${ConversationTable.NAME} WHERE ${ConversationTable.USERNAME}=? LIMIT 1",
-            arrayOf(folderId)
-        )
-        return cursor.use { c ->
-            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
-        }
-    }
-
-    /**
-     * Splits the members' unread into (nonMutedUnread, mutedUnread).
-     *
-     * WeChat stores every child's unread in unReadCount regardless of mute (member rows never
-     * populate unReadMuteCount themselves); the homepage badge classifier then re-decides
-     * dot-vs-number per row with a LIVE mute check. Our synthetic folder row can't trigger that
-     * live check, so we pre-split the members' unread into a number bucket (non-muted) and a dot
-     * bucket (muted) ourselves — the folder's attrflag mute bit then renders a dot when the whole
-     * folder only has muted unread.
-     *
-     * Mute is NOT a single column: friends/biz use rcontact.type & 512 (c01.e2.P), but a group's
-     * mute lives in the ChatRoomNotify flag (z3.T) packed inside the rcontact.lvbuff blob with no
-     * column of its own (WeChat's w3.b tests `R4(username) && z3.T == 0`). So we read the members'
-     * rows once, join their contact type + lvbuff, and classify each in Kotlin.
-     */
-    private fun unreadSplitForMembers(members: List<String>): Pair<Int, Int> {
-        if (members.isEmpty()) return 0 to 0
-        val placeholders = members.joinToString(",") { "?" }
-        val cursor = WeDatabaseApi.rawQuery(
-            """
-            SELECT r.${ConversationTable.USERNAME}, r.${ConversationTable.UNREAD_COUNT}
-            FROM ${ConversationTable.NAME} r
-            LEFT JOIN ${ContactTable.NAME} c ON c.${ContactTable.USERNAME} = r.${ConversationTable.USERNAME}
-            WHERE r.${ConversationTable.USERNAME} IN ($placeholders)
-            """.trimIndent(),
-            arrayOf(*members.toTypedArray())
-        )
-        var normal = 0
-        var muted = 0
-        cursor.use { c ->
-            val userIdx = c.getColumnIndex(ConversationTable.USERNAME)
-            val unreadIdx = c.getColumnIndex(ConversationTable.UNREAD_COUNT)
-            while (c.moveToNext()) {
-                val unread = if (unreadIdx >= 0 && !c.isNull(unreadIdx)) c.getInt(unreadIdx) else 0
-                if (unread <= 0) continue
-                val username = if (userIdx >= 0) c.getString(userIdx) ?: "" else ""
-                if (WeConversationApi.isDnd(username)) muted += unread else normal += unread
+    /** Resolve the digest's raw sender handle to the display name shown in the folder digest.
+     *  与微信群聊一致：备注 → 群名片（该群内，chatroom.roomdata displayName）→ 微信昵称。
+     *  不直接显示微信号/用户 ID（wxid_、带 @ 的账号标识）。
+     *  [senderWxid] 来自微信 digestUser（发送者账号，最精确）；[groupId] 为所在群（@chatroom），
+     *  用于取群名片（如无群名片时微信摘要可能显示昵称，但群名片才是用户在该群的名字）。 */
+    private fun resolveSenderDisplayName(sender: String, senderWxid: String? = null, groupId: String? = null): String {
+        if (sender.isBlank() && senderWxid.isNullOrBlank()) return ""
+        val cacheKey = "$senderWxid|$sender|$groupId"
+        senderNameCache[cacheKey]?.let { return it }
+        val final = runCatching {
+            val wxid = senderWxid?.takeIf { it.isNotBlank() } ?: sender
+            val isAccount = wxid.startsWith("wxid_") || wxid.contains("@")
+            // 1) 备注（个人备注优先，与微信一致）
+            val remark = queryContactField(wxid, ContactTable.CON_REMARK)
+            if (remark.isNotBlank()) return@runCatching remark
+            // 2) 群名片：发送者是该群成员时的群内显示名（优先于昵称）
+            if (groupId != null && wxid.startsWith("wxid_")) {
+                val card = WeDatabaseApi.getGroupMemberDisplayName(groupId, wxid)
+                if (card.isNotBlank()) return@runCatching card
             }
-        }
-        return normal to muted
+            // 3) 微信昵称
+            val nickname = queryContactField(wxid, ContactTable.NICKNAME)
+            if (nickname.isNotBlank()) return@runCatching nickname
+            // 4) 账号标识：查不到名字则不显示（避免暴露用户 ID）
+            if (isAccount) return@runCatching ""
+            // 5) sender 是显示名文本（微信摘要里的群名片/昵称）——反查昵称得账号后取群名片
+            val nicknameWxid = runCatching {
+                WeDatabaseApi.rawQuery(
+                    "SELECT ${ContactTable.USERNAME} FROM ${ContactTable.NAME} WHERE ${ContactTable.NICKNAME}=? LIMIT 1",
+                    arrayOf(sender)
+                ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            }.getOrNull()
+            if (nicknameWxid != null && groupId != null) {
+                val card = WeDatabaseApi.getGroupMemberDisplayName(groupId, nicknameWxid)
+                if (card.isNotBlank()) return@runCatching card
+            }
+            sender
+        }.getOrDefault("")
+        senderNameCache[cacheKey] = final
+        return final
     }
+
+    /** 查询联系人单字段（备注或昵称），无值返回空串。 */
+    private fun queryContactField(username: String, column: String): String = runCatching {
+        WeDatabaseApi.rawQuery(
+            "SELECT $column FROM ${ContactTable.NAME} WHERE ${ContactTable.USERNAME}=?",
+            arrayOf(username)
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getStringOrEmpty(column) else ""
+        }
+    }.getOrDefault("")
 
     private fun isFolderSchemaReady(): Boolean {
         folderSchemaReady?.let { return it }
         val result = runCatching {
             val conversationColumns = tableColumns(ConversationTable.NAME)
+            WeLogger.i(TAG, "rconversation columns: $conversationColumns")
+            runCatching {
+                WeDatabaseApi.rawQuery("SELECT name FROM sqlite_master WHERE type='table'").use { tc ->
+                    val tns = mutableListOf<String>()
+                    while (tc.moveToNext()) tns += tc.getString(0)
+                    WeLogger.i(TAG, "sqlite tables: ${tns.joinToString()}")
+                }
+            }.onFailure { WeLogger.w(TAG, "list tables failed", it) }
             val contactColumns = tableColumns(ContactTable.NAME)
             val missingConversationColumns = ConversationTable.REQUIRED_COLUMNS - conversationColumns
             val missingContactColumns = ContactTable.REQUIRED_COLUMNS - contactColumns
@@ -1216,9 +2376,15 @@ object ConversationAggregation : ClickableFeature(),
             }
         }.onFailure {
             WeLogger.w(TAG, "skip folders sync, failed to inspect WeChat database schema", it)
-        }.getOrDefault(false)
-        folderSchemaReady = result
-        return result
+        }.getOrNull()
+        // Only latch the outcome when the check actually completed. A transient failure (the
+        // database being briefly locked or closing right after WeDatabaseApi.isReady flips)
+        // must not permanently disable folder sync for the rest of the process — leave the
+        // cached value unset so the next call retries.
+        if (result != null) {
+            folderSchemaReady = result
+        }
+        return result == true
     }
 
     private fun tableColumns(table: String): Set<String> {
@@ -1231,28 +2397,6 @@ object ConversationAggregation : ClickableFeature(),
             }
         }
         return columns
-    }
-
-    private fun looksLikeConversationListQuery(sql: String): Boolean {
-        val lower = sql.lowercase()
-        if (!lower.contains("select")) return false
-        if (!lower.contains("from ${ConversationTable.NAME}")) return false
-        return lower.contains(ConversationTable.PARENT_REF.lowercase()) ||
-                lower.contains(ConversationTable.CONVERSATION_TIME.lowercase()) ||
-                lower.contains(ConversationTable.UNREAD_COUNT.lowercase())
-    }
-
-    private fun appendParentRefFilter(sql: String): String {
-        val insertionPoint = listOf(" order by ", " group by ", " limit ")
-            .map { sql.indexOf(it, ignoreCase = true) }
-            .filter { it >= 0 }
-            .minOrNull() ?: sql.length
-        val head = sql.substring(0, insertionPoint)
-        val tail = sql.substring(insertionPoint)
-        val condition = listOf(FOLDER_PREFIX)
-            .joinToString(" AND ") { "ifnull(${ConversationTable.PARENT_REF},'') NOT LIKE '$it%'" }
-        val connector = if (head.contains(" where ", ignoreCase = true)) " AND " else " WHERE "
-        return "$head$connector$condition$tail"
     }
 
     private fun rewriteContainerSql(sql: String, folderId: String): String {
@@ -1290,6 +2434,14 @@ object ConversationAggregation : ClickableFeature(),
     private fun showManagerDialog(context: Context) {
         showComposeDialog(context) {
             var folders by remember { mutableStateOf(loadFolders()) }
+            var atColor by remember { mutableStateOf(mentionAtColor) }
+            var countColor by remember { mutableStateOf(mentionCountColor) }
+            var selfColor by remember { mutableStateOf(mentionSelfColor) }
+            var memberColor by remember { mutableStateOf(mentionMemberColor) }
+            var titleColor by remember { mutableStateOf(folderTitleColor) }
+            var titleEnabled by remember { mutableStateOf(folderTitleEnabled) }
+            var selfEnabled by remember { mutableStateOf(mentionSelfEnabled) }
+            var memberEnabled by remember { mutableStateOf(mentionMemberEnabled) }
 
             AlertDialogContent(
                 modifier = Modifier
@@ -1302,6 +2454,34 @@ object ConversationAggregation : ClickableFeature(),
                             modifier = Modifier.heightIn(max = 420.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
+                            item {
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("摘要颜色")
+                                    WeColorField(label = "[全体]/[有人@我]", value = atColor, onValueChange = { atColor = it })
+                                    WeColorField(label = "[N个聊天]/[N个消息]", value = countColor, onValueChange = { countColor = it })
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("[自己]", modifier = Modifier.weight(1f))
+                                        Switch(checked = selfEnabled, onCheckedChange = { selfEnabled = it })
+                                    }
+                                    if (selfEnabled) {
+                                    WeColorField(label = "[自己]", value = selfColor, onValueChange = { selfColor = it })
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("(群成员)", modifier = Modifier.weight(1f))
+                                        Switch(checked = memberEnabled, onCheckedChange = { memberEnabled = it })
+                                    }
+                                    if (memberEnabled) {
+                                    WeColorField(label = "(群成员)", value = memberColor, onValueChange = { memberColor = it })
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("文件夹标题染色", modifier = Modifier.weight(1f))
+                                        Switch(checked = titleEnabled, onCheckedChange = { titleEnabled = it })
+                                    }
+                                    if (titleEnabled) {
+                                        WeColorField(label = "文件夹标题", value = titleColor, onValueChange = { titleColor = it })
+                                    }
+                                }
+                            }
                             if (folders.isEmpty()) {
                                 item {
                                     Text("暂无文件夹, 点击「新建」来创建一个")
@@ -1334,6 +2514,14 @@ object ConversationAggregation : ClickableFeature(),
                 },
                 confirmButton = {
                     Button(onClick = {
+                        mentionAtColor = atColor
+                        mentionCountColor = countColor
+                        mentionSelfColor = selfColor
+                        mentionMemberColor = memberColor
+                        folderTitleColor = titleColor
+                        folderTitleEnabled = titleEnabled
+                        mentionSelfEnabled = selfEnabled
+                        mentionMemberEnabled = memberEnabled
                         saveFolders(folders)
                         syncFoldersToDatabase()
                         showToast(context, "已保存, 重启微信生效")
@@ -1432,7 +2620,10 @@ object ConversationAggregation : ClickableFeature(),
                 selectFields = selectFields,
                 whereClause = whereClause
             )
-            getFolderMembers(tempFolder).size
+            // Resolve directly instead of going through getFolderMembers: that cache is keyed
+            // by folder id, and this preview folder reuses the id of the folder being edited,
+            // so the cached (stale) member list would freeze the count at the first result.
+            resolveFolderMembers(tempFolder).size
         }
 
         var hasAvatar by remember(folderId) {
@@ -1553,6 +2744,64 @@ object ConversationAggregation : ClickableFeature(),
                                 }) {
                                     Text(if (hasAvatar) "更换头像" else "设置头像")
                                 }
+                            }
+                            val context = LocalContext.current
+                            Button(
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    if (members.isEmpty()) {
+                                        showToast("文件夹暂无成员可移出")
+                                        return@Button
+                                    }
+                                    val others = loadFolders().filter { it.id != folderId && it.type == FolderType.MANUAL }
+                                    if (others.isEmpty()) {
+                                        showToast("没有其他手动文件夹可移出")
+                                        return@Button
+                                    }
+                                    showComposeDialog(context) {
+                                        val dismiss = this.onDismiss
+                                        ContactsSelector(
+                                            title = "选择要移出的对话",
+                                            contacts = remember { WeDatabaseApi.getContacts().filter { it.wxId in members } },
+
+                                            initialSelectedWxIds = emptySet(),
+                                            onDismiss = dismiss,
+                                            onConfirm = { toMove ->
+                                                dismiss()
+                                                showComposeDialog(context) {
+                                                    val innerDismiss = this.onDismiss
+                                                    AlertDialogContent(
+                                                        title = { Text("移出到其他文件夹") },
+                                                        text = {
+                                                            LazyColumn {
+                                                                items(others) { target ->
+                                                                    Text(
+                                                                        target.name,
+                                                                        modifier = Modifier
+                                                                            .fillMaxWidth()
+                                                                            .clickable {
+                                                                                val current = loadFolders()
+                                                                                val curList = current.map { if (it.id == folderId) it.copy(members = it.members - toMove) else it }
+                                                                                val finalList = curList.map { if (it.id == target.id) it.copy(members = (it.members + toMove).distinct().sorted()) else it }
+                                                                                saveFolders(finalList)
+                                                                                members = members - toMove
+                                                                                innerDismiss()
+                                                                                dismiss()
+                                                                                onSave(folder!!.copy(members = (members - toMove).sorted()))
+                                                                            }
+                                                                            .padding(12.dp)
+                                                                    )
+                                                                }
+                                                            }
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
+                            ) {
+                                Text("移出到其他文件夹")
                             }
                         }
 
@@ -1731,13 +2980,7 @@ object ConversationAggregation : ClickableFeature(),
         }
     }
 
-    /** WeKit 连带 ContactSelectors 需要: 按文件夹 id 取成员列表。 */
-fun folderMembers(folderId: String): List<String> {
-    val folder = folderById(folderId) ?: return emptyList()
-    return getFolderMembers(folder)
-}
-
-private fun getFolderMembers(folder: ChatFolder): List<String> {
+    private fun getFolderMembers(folder: ChatFolder): List<String> {
         if (folder.type == FolderType.MANUAL) {
             return folder.members
         }
@@ -1769,8 +3012,7 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
     private fun latestActiveMember(members: List<String>): String? {
         if (members.isEmpty() || !WeDatabaseApi.isReady) return null
         return runCatching {
-            // Suppress query rewrite: these members' parentRef is the folder id, which
-            // appendParentRefFilter would otherwise filter out, hiding every row.
+            // Suppress the container SQL fallback while querying aggregate members directly.
             withQueryRewriteSuppressed {
                 val placeholders = members.joinToString(",") { "?" }
                 val cursor = WeDatabaseApi.rawQuery(
@@ -1793,33 +3035,56 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
     }
 
     private fun loadFolders(): List<ChatFolder> {
-        foldersCache?.let { return it }
+        val wxid = currentAccountWxid()
+        if (foldersCache != null && foldersCacheWxid == wxid) return foldersCache!!
+        val file = foldersFileFor(wxid)
         val folders = runCatching {
-            val file = foldersFile
-            if (!file.exists()) return emptyList()
-            val raw = file.readText()
-            DefaultJson.decodeFromString<List<ChatFolder>>(raw)
-                .map { folder ->
-                    folder.copy(members = folder.members.filter { it.isNotBlank() })
-                }
-                .filter { isFolderId(it.id) && it.name.isNotBlank() }
+            if (file.exists()) {
+                decodeFoldersFrom(file)
+            } else if (!wxid.isNullOrBlank() && legacyFoldersFile.exists()) {
+                // 账号首次使用：继承旧的共享配置（一次性迁移），之后各账号独立
+                decodeFoldersFrom(legacyFoldersFile)
+            } else {
+                emptyList()
+            }
         }.onFailure {
-            WeLogger.w(TAG, "failed to decode folders config from $foldersFile", it)
+            WeLogger.w(TAG, "failed to decode folders config from $file", it)
         }.getOrDefault(emptyList())
+        // 账号文件不存在但继承到了旧配置 -> 落盘到账号文件（一次性迁移）
+        if (folders.isNotEmpty() && !file.exists()) {
+            saveFoldersTo(file, folders)
+        }
         foldersCache = folders
+        foldersCacheWxid = wxid
         return folders
     }
 
-    private fun saveFolders(folders: List<ChatFolder>) {
-        foldersCache = folders
-        folderMembersCache.clear()
+    private fun decodeFoldersFrom(file: Path): List<ChatFolder> {
+        if (!file.exists()) return emptyList()
+        return DefaultJson.decodeFromString<List<ChatFolder>>(file.readText())
+            .map { folder ->
+                folder.copy(members = folder.members.filter { it.isNotBlank() })
+            }
+            .filter { isFolderId(it.id) && it.name.isNotBlank() }
+    }
+
+    private fun saveFoldersTo(file: Path, folders: List<ChatFolder>) {
         runCatching {
             val raw = DefaultJson.encodeToString(folders)
-            foldersFile.writeText(raw)
+            file.writeText(raw)
         }.onFailure {
-            WeLogger.w(TAG, "failed to save folders to $foldersFile", it)
+            WeLogger.w(TAG, "failed to save folders to $file", it)
         }
     }
+
+
+    private fun saveFolders(folders: List<ChatFolder>) {
+        foldersCache = folders
+        foldersCacheWxid = currentAccountWxid()
+        folderMembersCache.clear()
+        saveFoldersTo(foldersFileFor(foldersCacheWxid), folders)
+    }
+
 
     private fun folderById(folderId: String): ChatFolder? {
         return loadFolders().firstOrNull { it.id == folderId }
@@ -1847,9 +3112,34 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
         val whereClause: String = "",
         // High 8 bits (pin / move-up state, owned by WeChat's setPlacedTop / unSetPlacedTop) of this
         // folder's rconversation row, mirrored here so it survives onDisable deleting the row. Kept
-        // in sync from the live row by snapshotFolderPinFlags and restored by composeFolderFlag.
+        // in sync from the live row before a folder row is removed.
         val pinFlag: Long = 0L
     )
+
+    private data class StoredFolderRow(
+        val flag: Long,
+        val attrFlag: Int,
+        val summary: FolderSummary
+    )
+
+    private data class MemberSummaryRow(
+        val digest: String,
+        val digestUser: String,
+        val isSend: Int,
+        val status: Int,
+        val conversationTime: Long,
+        val content: String,
+        val msgType: String,
+        val chatMode: Int
+    )
+
+    private class SummaryAccumulator {
+        var latest: MemberSummaryRow? = null
+        var normalUnread: Int = 0
+        var mutedUnread: Int = 0
+        var unreadChatCount: Int = 0
+        var atMeCount: Int = 0
+    }
 
     private data class FolderSummary(
         val digest: String = "",
@@ -1859,6 +3149,7 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
         val conversationTime: Long = System.currentTimeMillis(),
         val unreadCount: Int = 0,
         val unreadMuteCount: Int = 0,
+        val atMeCount: Int = 0,
         val content: String = "",
         val msgType: String = "",
         val chatMode: Int = 0
@@ -1889,6 +3180,7 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
         const val MSG_TYPE = "msgType"
         const val CHAT_MODE = "chatmode"
         const val ATTR_FLAG = "attrflag"
+        const val AT_COUNT = "atCount"
 
         val REQUIRED_COLUMNS = setOf(
             USERNAME,
@@ -1912,6 +3204,8 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
         const val NAME = "rcontact"
         const val USERNAME = "username"
         const val NICKNAME = "nickname"
+        const val CON_REMARK = "conRemark"
+        const val LV_BUFF = "lvbuff"
         const val TYPE = "type"
         const val VERIFY_FLAG = "verifyFlag"
 
@@ -1919,6 +3213,8 @@ private fun getFolderMembers(folder: ChatFolder): List<String> {
             USERNAME,
             NICKNAME,
             TYPE,
+            CON_REMARK,
+            LV_BUFF,
             VERIFY_FLAG
         )
     }

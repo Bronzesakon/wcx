@@ -128,6 +128,12 @@ object AutoAcceptFriendRequests : ClickableFeature(), IResolveDex,
         }
     }
 
+    // 8.0.77 修复：DexConstructorDelegate 对构造器解析不友好（解析失败时访问
+    // .constructor 会抛 NoSuchMethodException → 自动同意失效）。
+    // 改用 DexKit 按字符串直接解析接受入口构造器 <init>（混淆类 p3 的接受入口）。
+    // 存为 Executable（兼容 Method / Constructor 两种返回）。
+    private var ctorVerifyUserAcceptExecutable: java.lang.reflect.Executable? = null
+
     // 本地 DSL 的 DexConstructorDelegate 未提供 isPlaceholder，用「.constructor 可解析」等价判定
     // （与 fork 的 !isPlaceholder 语义一致：占位符或未解析时访问 .constructor 会抛异常）
     private val ctorVerifyUserAcceptReady: Boolean
@@ -145,6 +151,22 @@ object AutoAcceptFriendRequests : ClickableFeature(), IResolveDex,
     }
 
     override fun resolveDex(dexKit: DexKitBridge) {
+        // 8.0.77 首选：接受入口改构造器（混淆类 p3.<init>）。
+        // DexConstructorDelegate 解析构造器会失败（NoSuchMethodException），
+        // 这里直接用 DexKit 按字符串匹配 <init> 方法（构造器也是 Executable，可 hook）。
+        ctorVerifyUserAcceptExecutable = runCatching {
+            val results = dexKit.findMethod {
+                matcher {
+                    name = "<init>"
+                    usingEqStrings(
+                        "This NetSceneVerifyUser init MUST use opcode == MM_VERIFYUSER_VERIFYOK"
+                    )
+                }
+            }
+            results.firstOrNull()?.getMethodInstance(com.Johnny.wcx.utils.reflection.ClassLoaders.HOST)
+        }.getOrNull()
+        WeLogger.i(TAG, "ctorVerifyUserAcceptExecutable resolved: ${ctorVerifyUserAcceptExecutable != null}")
+
         // 8.0.76+：NetSceneVerifyUser 混淆为 m3，<init> 含 MM_VERIFYUSER_VERIFYOK 断言日志
         methodVerifyAccept.find(dexKit, allowFailure = true) {
             matcher {
@@ -207,6 +229,40 @@ object AutoAcceptFriendRequests : ClickableFeature(), IResolveDex,
         }
 
         // 钩住好友验证接受方法，在微信内部接受好友请求时触发后续逻辑
+        // 8.0.77 首选：DexKit 直接解析的接受入口构造器（p3.<init>）
+        ctorVerifyUserAcceptExecutable?.let { ctor ->
+            runCatching {
+                ctor.hookAfter {
+                    if (args.size < 3) return@hookAfter
+                    if (!masterEnabled) return@hookAfter
+                    val opcode = args[0] as? Int ?: return@hookAfter
+                    if (opcode != OPCODE_VERIFY_ACCEPT && opcode != 2) return@hookAfter
+                    val arg1 = (args[1] as? String)?.takeIf { it.isNotBlank() } ?: return@hookAfter
+                    WeLogger.i(TAG, "friend request accepted via ctor(8.0.77): arg1=$arg1")
+                    if (sendWelcome && welcomeText.isNotBlank()) {
+                        val targetWxId = if (arg1.startsWith("v2_")) {
+                            extractWxIdFromVerifyContent(arg1)
+                        } else {
+                            findNewFriendWxId(arg1)
+                        }
+                        if (targetWxId.isNotEmpty()) {
+                            CoroutineScope(Dispatchers.IO).launch {
+                                delay(1500) // 等待好友关系建立
+                                runCatching {
+                                    WeMessageApi.sendText(targetWxId, welcomeText)
+                                    WeLogger.i(TAG, "welcome text sent to $targetWxId")
+                                }.onFailure { e ->
+                                    WeLogger.e(TAG, "failed to send welcome text", e)
+                                }
+                            }
+                        }
+                    }
+                }
+            }.onFailure { e ->
+                WeLogger.e(TAG, "failed to hook ctorVerifyUserAcceptExecutable", e)
+            }
+        }
+
         runCatching {
             if (ctorVerifyUserAcceptReady) {
                 // 8.0.77: NetSceneVerifyUser 混淆为 p3, 接受入口在 <init>(opcode=VERIFYOK), 用构造器 hook
@@ -371,6 +427,28 @@ object AutoAcceptFriendRequests : ClickableFeature(), IResolveDex,
     }
 
     private fun acceptFriendRequest(encryptUsername: String, ticket: String, scene: String) {
+        // 8.0.77 首选：DexKit 直接解析的接受入口构造器（混淆类 p3.<init>）
+        ctorVerifyUserAcceptExecutable?.let { ctor ->
+            runCatching {
+                if (ctor is java.lang.reflect.Constructor<*>) {
+                    val netScene = ctor.newInstance(
+                        OPCODE_VERIFY_ACCEPT,
+                        encryptUsername,
+                        ticket,
+                        scene.toIntOrNull() ?: 0,
+                        "",
+                        0,
+                        null,
+                        null,
+                    )
+                    WeNetSceneApi.sendNetScene(netScene)
+                    WeLogger.i(TAG, "8.0.77: verify accept via ctor(p3) sent: encryptUsername=$encryptUsername")
+                    return
+                }
+            }.onFailure { e ->
+                WeLogger.w(TAG, "8.0.77 ctor accept failed, trying legacy path", e)
+            }
+        }
         // 8.0.76+：构造 NetSceneVerifyUser(<init>) opcode=MM_VERIFYUSER_VERIFYOK，走 NetSceneManager 发送
         runCatching {
             if (ctorVerifyUserAcceptReady) {

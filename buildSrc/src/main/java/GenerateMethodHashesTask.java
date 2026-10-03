@@ -59,7 +59,10 @@ public abstract class GenerateMethodHashesTask extends DefaultTask {
                             declarations.add(new String[]{classMatcher.group(1), String.valueOf(classMatcher.start())});
                         }
 
-                        String className = null;
+                        // Register EVERY class in this file that implements IResolveDex.
+                        // Files may contain multiple such feature objects (e.g. one Kotlin file
+                        // declaring several related features); only hashing the first one left
+                        // the rest without a HASHES entry, which crashed DexCacheManager at runtime.
                         for (int i = 0; i < declarations.size(); i++) {
                             String[] decl = declarations.get(i);
                             int matchStart = Integer.parseInt(decl[1]);
@@ -73,67 +76,15 @@ public abstract class GenerateMethodHashesTask extends DefaultTask {
                             }
 
                             String signature = cleanContent.substring(matchStart, braceIndex);
-                            if (signature.contains(":") && Pattern.compile("\\bIResolveDex\\b").matcher(signature).find()) {
-                                className = decl[0];
-                                break;
+                            if (!signature.contains(":") || !Pattern.compile("\\bIResolveDex\\b").matcher(signature).find()) {
+                                continue;
                             }
+
+                            String className = decl[0];
+                            String fullClassName = packageName != null ? packageName + "." + className : className;
+                            String combinedBody = extractDexBlocks(cleanContent, braceIndex);
+                            hashMap.put(fullClassName, md5Hex(combinedBody));
                         }
-
-                        if (className == null) return;
-
-                        String fullClassName = packageName != null ? packageName + "." + className : className;
-                        List<String> blocks = new ArrayList<>();
-
-                        Matcher resolveDexMatch = Pattern.compile("override\\s+fun\\s+resolveDex\\s*\\(").matcher(cleanContent);
-                        if (resolveDexMatch.find()) {
-                            int start = cleanContent.indexOf('{', resolveDexMatch.end() - 1);
-                            if (start != -1) {
-                                int count = 0;
-                                for (int j = start; j < cleanContent.length(); j++) {
-                                    if (cleanContent.charAt(j) == '{') count++;
-                                    else if (cleanContent.charAt(j) == '}') count--;
-                                    if (count == 0) {
-                                        blocks.add(cleanContent.substring(start, j + 1));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        Pattern inlinePattern = Pattern.compile("\\bby\\s+dex(?:Class|Method|Constructor)\\b");
-                        Pattern separatorPattern = Pattern.compile("\\b(val|fun|private|public|internal|class|object|override)\\b");
-                        Matcher inlineMatcher = inlinePattern.matcher(cleanContent);
-                        while (inlineMatcher.find()) {
-                            int startScan = inlineMatcher.end();
-                            int nextOpenBrace = cleanContent.indexOf('{', startScan);
-                            if (nextOpenBrace != -1) {
-                                String intermediate = cleanContent.substring(startScan, nextOpenBrace);
-                                if (!separatorPattern.matcher(intermediate).find()) {
-                                    int count = 0;
-                                    for (int j = nextOpenBrace; j < cleanContent.length(); j++) {
-                                        if (cleanContent.charAt(j) == '{') count++;
-                                        else if (cleanContent.charAt(j) == '}') count--;
-                                        if (count == 0) {
-                                            blocks.add(cleanContent.substring(nextOpenBrace, j + 1));
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (blocks.isEmpty()) {
-                            throw new RuntimeException("Class " + fullClassName + " implements IResolveDex but has neither a resolveDex() body nor any inline dex blocks.");
-                        }
-
-                        String combinedBody = String.join("\n", blocks);
-                        MessageDigest md = MessageDigest.getInstance("MD5");
-                        byte[] digest = md.digest(combinedBody.getBytes());
-                        StringBuilder hex = new StringBuilder();
-                        for (byte b : digest) {
-                            hex.append(String.format("%02x", b));
-                        }
-                        hashMap.put(fullClassName, hex.toString());
                     } catch (IOException | NoSuchAlgorithmException e) {
                         throw new RuntimeException(e);
                     }
@@ -152,5 +103,73 @@ public abstract class GenerateMethodHashesTask extends DefaultTask {
                 "}\n";
 
         Files.writeString(outputFile.toPath(), content);
+    }
+
+    /**
+     * Extracts the hash-relevant body of a single class: its {@code resolveDex()} body
+     * plus every inline {@code by dexClass/dexMethod/dexConstructor} block, all scoped
+     * to the class body starting at {@code classBodyStart} (the class's opening brace).
+     * Scoped extraction keeps multi-class files from attributing one class's blocks to another.
+     */
+    private String extractDexBlocks(String content, int classBodyStart)
+            throws NoSuchAlgorithmException {
+        int bodyEnd = findBalancedBraceEnd(content, classBodyStart);
+        String classBody = content.substring(classBodyStart, bodyEnd);
+
+        List<String> blocks = new ArrayList<>();
+
+        Matcher resolveDexMatch = Pattern.compile("override\\s+fun\\s+resolveDex\\s*\\(").matcher(classBody);
+        if (resolveDexMatch.find()) {
+            int start = classBody.indexOf('{', resolveDexMatch.end());
+            if (start != -1) {
+                int end = findBalancedBraceEnd(classBody, start);
+                blocks.add(classBody.substring(start, end + 1));
+            }
+        }
+
+        Pattern inlinePattern = Pattern.compile("\\bby\\s+dex(?:Class|Method|Constructor)\\b");
+        Pattern separatorPattern = Pattern.compile("\\b(val|fun|private|public|internal|class|object|override)\\b");
+        Matcher inlineMatcher = inlinePattern.matcher(classBody);
+        while (inlineMatcher.find()) {
+            int startScan = inlineMatcher.end();
+            int nextOpenBrace = classBody.indexOf('{', startScan);
+            if (nextOpenBrace != -1) {
+                String intermediate = classBody.substring(startScan, nextOpenBrace);
+                if (!separatorPattern.matcher(intermediate).find()) {
+                    int end = findBalancedBraceEnd(classBody, nextOpenBrace);
+                    blocks.add(classBody.substring(nextOpenBrace, end + 1));
+                }
+            }
+        }
+
+        // A class may legitimately implement IResolveDex without any dex blocks (e.g. a
+        // pure DB-query feature). Register the deterministic md5("") for it so it always
+        // has a HASHES entry; if it later gains delegates, its hash changes and the cache
+        // invalidates as expected.
+        return String.join("\n", blocks);
+    }
+
+    /** Returns the index of the {@code '}'} matching the {@code '{'} at {@code openIndex}. */
+    private int findBalancedBraceEnd(String content, int openIndex) {
+        int count = 0;
+        for (int j = openIndex; j < content.length(); j++) {
+            char c = content.charAt(j);
+            if (c == '{') count++;
+            else if (c == '}') {
+                count--;
+                if (count == 0) return j;
+            }
+        }
+        return content.length() - 1;
+    }
+
+    private String md5Hex(String body) throws NoSuchAlgorithmException {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] digest = md.digest(body.getBytes());
+        StringBuilder hex = new StringBuilder();
+        for (byte b : digest) {
+            hex.append(String.format("%02x", b));
+        }
+        return hex.toString();
     }
 }

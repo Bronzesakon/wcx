@@ -69,9 +69,11 @@ object CustomChatInputBarPlaceholderText : ClickableFeature(), IResolveDex, WeDa
         }
     }
 
-    override fun onEnable() {
-        WeDatabaseListenerApi.addListener(this)
-
+    /**
+     * 惰性每日重置：跨天（进程未重启）时，在每次写入占位符前自动把当天统计清零，
+     * 保证「第二天自动刷新」而无需重启微信。onEnable 与 canSend hook 都会调用。
+     */
+    private fun ensureDailyResetIfNeeded() {
         val curDay = LocalDate.now().dayOfMonth
         if (lastDayOfMonth != curDay) {
             totC = 0
@@ -83,8 +85,15 @@ object CustomChatInputBarPlaceholderText : ClickableFeature(), IResolveDex, WeDa
             fileC = 0
             lastDayOfMonth = curDay
         }
+    }
+
+    override fun onEnable() {
+        WeDatabaseListenerApi.addListener(this)
+        ensureDailyResetIfNeeded()
 
         methodChatFooterCanSend.hookAfter {
+            // 每次触发先做跨天检查：跨天后清空输入框即用新一天的统计刷新占位符（无需重启微信）
+            ensureDailyResetIfNeeded()
             val canSend = args[0] as Boolean
             if (canSend) return@hookAfter
 

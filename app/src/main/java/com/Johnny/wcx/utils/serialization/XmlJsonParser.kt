@@ -333,28 +333,6 @@ private class JsonAccumulator {
     }
 
     fun toJsonElement(forceList: Set<String>): JsonElement {
-//        if (values.size == 1) {
-//            val (key, list) = values.entries.first()
-//            return if (key in forceList) {
-//                JsonArray(list.toList())
-//            } else if (list.size == 1) {
-//                list[0]
-//            } else {
-//                JsonArray(list.toList())
-//            }
-//        }
-//
-//        val map = linkedMapOf<String, JsonElement>()
-//        for ((key, list) in values) {
-//            map[key] = if (key in forceList) {
-//                JsonArray(list.toList())
-//            } else if (list.size == 1) {
-//                list[0]
-//            } else {
-//                JsonArray(list.toList())
-//            }
-//        }
-//        return JsonObject(map)
         return toJsonObject(forceList)
     }
 

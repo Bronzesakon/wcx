@@ -2,7 +2,6 @@ package com.Johnny.wcx.features.items.contacts.hidecontacts
 
 import dev.ujhhgtg.reflekt.reflekt
 import dev.ujhhgtg.reflekt.utils.makeAccessible
-import com.Johnny.wcx.dexkit.dsl.DexMethodDelegate
 import com.Johnny.wcx.features.items.contacts.HideContacts
 import com.Johnny.wcx.utils.WeLogger
 import java.lang.reflect.Field

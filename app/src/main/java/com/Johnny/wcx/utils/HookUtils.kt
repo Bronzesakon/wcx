@@ -77,3 +77,24 @@ inline fun Executable.hookDirectly(
 @Suppress("NOTHING_TO_INLINE")
 fun XC_MethodHook.MethodHookParam.invokeOriginal(thisObject: Any? = null, args: Array<Any?>? = null): Any? =
     XposedBridge.invokeOriginalMethod(method, thisObject ?: this.thisObject, args ?: this.args)
+
+// ---- WXPRO-compat: capture an invocation to re-run the ORIGINAL method later (used by
+// ConversationAggregation's share-forward interception). XC receiver flavor.
+class XcOriginalMethodInvoker internal constructor(
+    private val method: java.lang.reflect.Method?,
+    private val thisObject: Any?,
+    private val originalArgs: Array<Any?>?,
+) {
+    operator fun invoke(args: Array<Any?>? = null): Any? =
+        XposedBridge.invokeOriginalMethod(method, thisObject, args ?: originalArgs)
+}
+
+fun XC_MethodHook.MethodHookParam.captureOriginalMethod(): XcOriginalMethodInvoker =
+    XcOriginalMethodInvoker(method as? java.lang.reflect.Method, thisObject, args)
+
+// ---- WXPRO-compat: IHookBridge flavor (shared by features merged from the WXPRO fork) ----
+fun HookParam.captureOriginalMethod(): com.Johnny.wcx.utils.XcOriginalMethodInvoker {
+    val m = member as? java.lang.reflect.Method
+        ?: throw IllegalStateException("invokeOriginalMethod is only supported for methods: $member")
+    return com.Johnny.wcx.utils.XcOriginalMethodInvoker(m, thisObject, args)
+}

@@ -120,6 +120,10 @@ object ScheduledMessage : ClickableFeature() {
     private var schedules by prefOption("scheduled_messages", emptyList<ScheduleConfig>())
     private val activeAlarms = ConcurrentHashMap<String, PendingIntent>()
     private val timerJobs = ConcurrentHashMap<String, Job>()
+
+    /** 同一触发时刻只处理一次：进程内定时器与 AlarmManager 双源同刻触发时去重。 */
+    private val firedSlots = ConcurrentHashMap<String, Boolean>()
+
     private lateinit var alarmReceiver: BroadcastReceiver
 
     override fun onEnable() {
@@ -166,7 +170,7 @@ object ScheduledMessage : ClickableFeature() {
         }
     }
 
-    private fun scheduleAlarm(schedule: ScheduleConfig) {
+    private fun scheduleAlarm(schedule: ScheduleConfig, allowCatchUp: Boolean = true) {
         val context = HostInfo.application
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(ALARM_ACTION).apply {
@@ -180,7 +184,8 @@ object ScheduledMessage : ClickableFeature() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val triggerTime = calculateNextTriggerTime(schedule)
+        val triggerTime =
+            if (allowCatchUp) calculateNextTriggerTime(schedule) else calculateNextOccurrence(schedule)
         if (triggerTime <= 0) return
         schedule.nextSendTime = triggerTime
         updateSchedule(schedule)
@@ -245,23 +250,38 @@ object ScheduledMessage : ClickableFeature() {
         timerJobs[schedule.id] = job
     }
 
+    private const val CATCH_UP_WINDOW_MS = 15 * 60 * 1000L
+    private const val DAY_MS = 24 * 60 * 60 * 1000L
+
+    private fun todayTargetMillis(schedule: ScheduleConfig): Long =
+        java.time.LocalDateTime.now()
+            .with(LocalTime.of(schedule.hour, schedule.minute))
+            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+    /**
+     * 下一次触发时刻（仅用于启用/注册任务时，允许 15 分钟错过补发）：
+     * 今天目标已过且在补发窗口内 → 立即补发；否则取 [calculateNextOccurrence]。
+     */
     private fun calculateNextTriggerTime(schedule: ScheduleConfig): Long {
         val now = System.currentTimeMillis()
-        val targetTime = LocalTime.of(schedule.hour, schedule.minute)
-        val todayTarget = java.time.LocalDateTime.now().with(targetTime).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val todayTarget = todayTargetMillis(schedule)
+        if (todayTarget > now) return todayTarget
+        if (!schedule.repeatDaily) return -1L
+        // 错过不久（15分钟内）视为“上次未发”，立即补发一次
+        return if (now - todayTarget < CATCH_UP_WINDOW_MS) now + 2000L
+        else calculateNextOccurrence(schedule)
+    }
 
-        return if (todayTarget > now) {
-            todayTarget
-        } else if (schedule.repeatDaily) {
-            // Bug Fix: 如果今天的目标时间刚过不久（15分钟内），立即触发而不等到明天
-            if (now - todayTarget < 15 * 60 * 1000L) {
-                now + 2000L
-            } else {
-                todayTarget + 24 * 60 * 60 * 1000L
-            }
-        } else {
-            -1L
-        }
+    /**
+     * 严格取下一次自然触发时刻：今天目标已过则取明天同一时间。
+     * 发送完成后的重排必须走这里，绝不能再进补发窗口，
+     * 否则每次发送后 2 秒又触发一次，形成无限重发循环。
+     */
+    private fun calculateNextOccurrence(schedule: ScheduleConfig): Long {
+        if (!schedule.repeatDaily) return -1L
+        val todayTarget = todayTargetMillis(schedule)
+        return if (todayTarget > System.currentTimeMillis()) todayTarget
+        else todayTarget + DAY_MS
     }
 
     private suspend fun handleScheduleTrigger(scheduleId: String) {
@@ -275,7 +295,21 @@ object ScheduledMessage : ClickableFeature() {
             WeLogger.i(TAG, "trigger for ${schedule.id} fired too early, skipping (next=${schedule.nextSendTime}, now=$nowMs)")
             return
         }
+
+        // 同刻占位去重：同一触发时刻（闹钟+进程内定时器双源）只处理一次
+        val slot = schedule.nextSendTime
+        if (firedSlots.putIfAbsent("${schedule.id}#$slot", true) != null) {
+            WeLogger.i(TAG, "duplicate trigger for ${schedule.id} at slot $slot, skipping")
+            return
+        }
         WeLogger.i(TAG, "scheduled trigger fired for ${schedule.id} (next=${schedule.nextSendTime}, now=$nowMs)")
+
+        // 发送前先把每日任务的 nextSendTime 推进到下一个自然日并落库：
+        // 迟到/重复的同刻触发会被上面的时间守卫直接拦截，确保同一时间窗内只发送一次
+        if (!schedule.oneTimeOnly && schedule.repeatDaily) {
+            schedule.nextSendTime = calculateNextOccurrence(schedule)
+            updateSchedule(schedule)
+        }
 
         runCatching {
             if (schedule.segments.isNotEmpty()) {
@@ -299,7 +333,8 @@ object ScheduledMessage : ClickableFeature() {
             updateSchedule(schedule)
             cancelAlarm(schedule)
         } else if (schedule.repeatDaily) {
-            scheduleAlarm(schedule)
+            // 发送完成后的重排严格取下一个自然日，不进补发窗口（补发仅限启用/注册时的错过场景）
+            scheduleAlarm(schedule, allowCatchUp = false)
         }
     }
 

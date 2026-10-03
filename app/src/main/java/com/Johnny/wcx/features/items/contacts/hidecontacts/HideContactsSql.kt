@@ -1,4 +1,4 @@
-package com.Johnny.wcx.features.items.contacts.hidecontacts
+﻿package com.Johnny.wcx.features.items.contacts.hidecontacts
 
 import com.tencent.wcdb.database.SQLiteDatabase
 import dev.ujhhgtg.reflekt.reflekt
@@ -168,16 +168,15 @@ private fun HideContacts.installWrapperHook() {
         return
     }
     methodSqliteWrapperRawQuery.hookBefore {
+        if (isTemporarilyShown) return@hookBefore
         val sql = args.firstOrNull() as? String ?: return@hookBefore
-        val rewritten = rewriteWrapperSql(sql) ?: return@hookBefore
+        val rewritten = rewriteWrapperSql(sql, HideContacts.hiddenContacts) ?: return@hookBefore
         args[0] = rewritten
     }
 }
 
 /** Returns the rewritten SQL, or null to leave the query untouched. */
-private fun rewriteWrapperSql(sql: String): String? {
-    if (HideContacts.isTemporarilyShown) return null
-    val hidden = HideContacts.hiddenContacts
+internal fun rewriteWrapperSql(sql: String, hidden: Set<String>): String? {
     if (hidden.isEmpty()) return null
 
     val lower = sql.lowercase()
@@ -327,7 +326,7 @@ private fun HideContacts.installFtsHook() {
 }
 
 /** Returns the rewritten FTS query, or null to leave it untouched. */
-private fun rewriteFtsSql(sql: String, hidden: Set<String>): String? {
+internal fun rewriteFtsSql(sql: String, hidden: Set<String>): String? {
     // Checked first: its SQL also carries `aux_index = 'notifymessage'`, which the pinned-aux_index
     // bail below would otherwise (wrongly) treat as a chat-scoped search.
     if (sql.startsWith(SQL_SELECT_SERVICE_NOTIFY)) return wrapWithNotIn(sql, "talker", hidden)
@@ -386,10 +385,7 @@ private const val FEED_MARKER_RAW = "(sourceType & 2 != 0 )"
 private const val FEED_MARKER_ENHANCED = "(1=1)"
 
 /** Called from `HideContacts.onQuery`; returns null to leave the query untouched. */
-internal fun rewriteMomentsFeedSql(sql: String): String? {
-    if (HideContacts.isTemporarilyShown) return null
-
-    val hidden = HideContacts.hiddenContacts
+internal fun rewriteMomentsFeedSql(sql: String, hidden: Set<String>): String? {
     if (hidden.isEmpty()) return null
 
     // 只处理主信息流查询: 排除个人主页 (userName=) 与已注入的查询
