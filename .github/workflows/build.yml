@@ -101,12 +101,13 @@ jobs:
             echo "BUILD_TASK=assembleRelease" >> "$GITHUB_ENV"
             echo "BUILD_PROPS=" >> "$GITHUB_ENV"
             echo "APK_DIR_PATTERN=app/build/outputs/apk/*/release" >> "$GITHUB_ENV"
+            echo "build task: assembleRelease (all variants)"
           else
             echo "BUILD_TASK=assembleStandardRelease" >> "$GITHUB_ENV"
             echo "BUILD_PROPS=-Pwcx.abi=arm64-v8a" >> "$GITHUB_ENV"
             echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/release" >> "$GITHUB_ENV"
+            echo "build task: assembleStandardRelease -Pwcx.abi=arm64-v8a"
           fi
-          echo "build task: $BUILD_TASK $BUILD_PROPS"
 
       - name: Build release APKs
         env:
