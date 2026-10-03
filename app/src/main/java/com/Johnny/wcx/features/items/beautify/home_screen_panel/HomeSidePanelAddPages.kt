@@ -389,7 +389,7 @@ private fun Modifier.homeSidePanelCandidateLongPress(
         .semantics { contentDescription = description }
         .pointerInput(onLongPress) {
             awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
+                val down = awaitFirstDown(requireUnconsumed = true)
                 val longPress = awaitLongPressOrCancellation(down.id) ?: return@awaitEachGesture
                 val bounds = coordinates?.homeSidePanelUnclippedBoundsInRoot() ?: return@awaitEachGesture
                 onLongPress(longPress.toCandidatePointer(bounds.topLeft, bounds.left, bounds.top, bounds.right, bounds.bottom))
