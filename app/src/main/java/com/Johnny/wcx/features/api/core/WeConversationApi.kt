@@ -22,11 +22,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
 
     private const val TAG = "WeConversationApi"
 
-    // Clears 4096, 1048576, 16777216 and 33554432, which drive 8071/8072 red prefixes
-//    private const val ATTR_FLAG_COMMON_RED_BITS = 51384320
-//    private const val ATTR_FLAG_8071_8072_RED_PACKET_BITS = 33280
-//    private const val TABLE_RCONVERSATION = "rconversation"
-//    private const val TABLE_ECS_CONVERSATION_RECORD = "EcsConversationRecord"
     internal val classConversationStorage by dexClass {
         searchPackages("com.tencent.mm.storage")
         matcher {
@@ -53,30 +48,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
         }
     }
 
-    //    private val methodClearConvRedHintsOnMarkRead by dexMethod(allowFailure = true) {
-//        matcher {
-//            modifiers = Modifier.PUBLIC or Modifier.STATIC or Modifier.FINAL
-//            returnType(Void.TYPE)
-//            paramCount = 1
-//            paramTypes(String::class.java)
-//            usingStrings(
-//                "MicroMsg.ConvRedHintStorage",
-//                "markReadRemoveRedHint remove red hints"
-//            )
-//        }
-//    }
-//    private val methodClearEcsGiftRedLabel by dexMethod(allowFailure = true) {
-//        matcher {
-//            returnType(Void.TYPE)
-//            paramCount = 1
-//            paramTypes(String::class.java)
-//            usingEqStrings(
-//                "MicroMsg.EcsGiftMsgService",
-//                "clearEcsGiftRedLabel, talker is empty",
-//                "clearEcsGiftRedLabel error"
-//            )
-//        }
-//    }
     private val methodHiddenConvParent by dexMethod {
         matcher {
             declaredClass(classConversationStorage.clazz)
@@ -84,19 +55,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
         }
     }
 
-    //    private val methodGetConvByName by dexMethod {
-//        matcher {
-//            declaredClass(classConversationStorage.clazz)
-//            usingEqStrings("MicroMsg.ConversationStorage", "get null with username:")
-//        }
-//    }
-//    private val methodUpdateConversationByObject by dexMethod {
-//        matcher {
-//            declaredClass(classConversationStorage.clazz)
-//            returnType(Int::class.java)
-//            paramTypes(methodGetConvByName.method.returnType, String::class.java)
-//        }
-//    }
     private val methodChatroomStorageGetMemberCount by dexMethod {
         searchPackages("com.tencent.mm.storage")
         matcher {
@@ -242,42 +200,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
         cursor.close()
     }
 
-//    fun markAllAsRead() {
-//        val talkers = LinkedHashSet<String>()
-//        val cursor = WeDatabaseApi.rawQuery("SELECT username, parentRef FROM rconversation")
-//        cursor.use { cursor ->
-//            while (cursor.moveToNext()) {
-//                val talker = cursor.getString(0)
-//                if (!talker.isNullOrEmpty()) {
-//                    talkers += talker
-//                }
-//                val parentRef = cursor.getString(1)
-//                if (!parentRef.isNullOrEmpty()) {
-//                    talkers += parentRef
-//                }
-//            }
-//        }
-//
-//        for (talker in talkers) {
-//            try {
-//                clearConversationUnreadState(talker)
-//            } catch (ex: Exception) {
-//                WeLogger.w(TAG, "exception while updating unread count for $talker", ex)
-//            }
-//        }
-//
-//        clearAllConversationRedPacketMarkFields()
-//        reloadConversations()
-//    }
-
-    //    fun markAsRead(talker: String) {
-//        try {
-//            clearConversationUnreadState(talker)
-//        } catch (ex: Exception) {
-//            WeLogger.w(TAG, "exception while updating unread count for $talker", ex)
-//        }
-//    }
-
     fun markAsRead(talker: String) {
         try {
             methodUpdateUnreadByTalker.method.invoke(conversationStorage, talker)
@@ -354,84 +276,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
         }
     }
 
-//    private fun clearConversationUnreadState(talker: String) {
-//        try {
-//            methodUpdateUnreadByTalker.method.invoke(conversationStorage, talker)
-//        } catch (ex: Exception) {
-//            WeLogger.w(TAG, "exception while invoking native mark read for $talker", ex)
-//        }
-//        clearEcsGiftRedLabelViaOfficialService(talker)
-//        clearExternalConversationRedHints(talker)
-//        notifyConversationChanged(talker)
-//        WeLogger.d(TAG, "marked $talker as read")
-//    }
-
-//    private fun clearEcsGiftRedLabelViaOfficialService(talker: String): Boolean {
-//        return try {
-//            val method = resolvedClearEcsGiftRedLabelMethod() ?: return false
-//            val service = getEcsGiftMsgService(method) ?: return false
-//            method.invoke(service, talker)
-//            true
-//        } catch (ex: Exception) {
-//            WeLogger.w(TAG, "exception while invoking official ecs gift red-label clear for $talker", ex)
-//            false
-//        }
-//    }
-//
-//    private fun clearExternalConversationRedHints(talker: String) {
-//        try {
-//            WeDatabaseApi.execStatement(
-//                "UPDATE $TABLE_ECS_CONVERSATION_RECORD SET ecsUnhandledGiftCount=0, ecsGiftRedLabelType=0 WHERE talker=?",
-//                arrayOf<Any>(talker)
-//            )
-//        } catch (ex: Exception) {
-//            WeLogger.w(TAG, "exception while clearing external red hints for $talker", ex)
-//        }
-//    }
-//
-//    private fun clearAllConversationRedPacketMarkFields() {
-//        try {
-//            WeDatabaseApi.execStatement(
-//                "UPDATE $TABLE_RCONVERSATION SET hbMarkRed=0, remitMarkRed=0, attrflag=(attrflag & ${unreadClearAttrFlagMask()}) WHERE hbMarkRed<>0 OR remitMarkRed<>0"
-//            )
-//        } catch (ex: Exception) {
-//            WeLogger.w(TAG, "exception while clearing all red-packet mark fields", ex)
-//        }
-//    }
-//
-//    private fun unreadClearAttrFlagMask(): Int {
-//        return (ATTR_FLAG_COMMON_RED_BITS or ATTR_FLAG_8071_8072_RED_PACKET_BITS).inv()
-//    }
-//
-//    private fun resolvedClearEcsGiftRedLabelMethod(): Method? {
-//        if (methodClearEcsGiftRedLabel.isPlaceholder) return null
-//        val method = methodClearEcsGiftRedLabel.method
-//        if (method.run {
-//                returnType == Void.TYPE &&
-//                        parameterCount == 1 &&
-//                        parameterTypes[0] == String::class.java
-//            }) return method
-//        WeLogger.w(
-//            TAG,
-//            "ignore invalid official ecs gift red-label clear method: ${method.declaringClass.name}.${method.name}, params=${method.parameterCount}"
-//        )
-//        return null
-//    }
-//
-//    private fun getEcsGiftMsgService(method: Method): Any? {
-//        ecsGiftMsgService?.let { return it }
-//        val concreteClass = method.declaringClass
-//        for (serviceInterface in concreteClass.interfaces) {
-//            val service = runCatching {
-//                WeServiceApi.getServiceImplByClass(serviceInterface)
-//            }.getOrNull()
-//            if (service != null && concreteClass.isInstance(service)) {
-//                return service.also { ecsGiftMsgService = it }
-//            }
-//        }
-//        return null
-//    }
-
     fun reloadConversations() {
         // notifyConversationChanged dispatches to WeChat's conversation-list UI observers.
         // WeChat's MStorage dispatcher (s85.v0.e) iterates and invokes some listeners
@@ -482,21 +326,6 @@ object WeConversationApi : ApiFeature(), IResolveDex {
         cursor.close()
         setConversationsVisibility(visible, talkers.toTypedArray())
     }
-
-//    fun onlyShowFilteredConversations(queryFilter: String, selectedColumns: String = "username") {
-//        setAllConversationVisibility(false)
-//        setFilteredConversationsVisibility(true, queryFilter, selectedColumns)
-//    }
-
-//    fun setFilteredConversationsVisibility(visible: Boolean, queryFilter: String, selectedColumns: String = "username") {
-//        val cursor = WeDatabaseApi.rawQuery("SELECT $selectedColumns FROM rconversation $queryFilter")
-//        val talkers = mutableListOf<String>()
-//        while (cursor.moveToNext()) {
-//            talkers += cursor.getString(0)
-//        }
-//        cursor.close()
-//        setConversationsVisibility(visible, talkers.toTypedArray())
-//    }
 
     /** ContactStorageLogic (`e2`), the class that owns the DND setters and the modContact builder. */
     private val contactStorageLogic: Class<*> by lazy {

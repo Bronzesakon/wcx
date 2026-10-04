@@ -143,6 +143,8 @@ class SettingsActivity : ComponentActivity() {
 //  Feature categories (name -> icon)
 // ---------------------------------------------------------------------------
 
+// 「密友功能」分类刻意放在列表**最后**（隐蔽入口，不显眼）。
+// 设置页搜索会显式排除该分类（见 FeaturesPager），避免随便搜一个词就把密友功能暴露出来。
 val FEATURE_CATEGORIES = listOf(
     "聊天" to MaterialSymbols.Outlined.Chat,
     "联系人与群组" to MaterialSymbols.Outlined.Contacts,
@@ -163,6 +165,7 @@ val FEATURE_CATEGORIES = listOf(
     "批量操作" to MaterialSymbols.Outlined.Checklist,
     "首页右上角菜单" to MaterialSymbols.Outlined.Add_circle,
     "联系人详情页面" to MaterialSymbols.Outlined.Contact_page,
+    "密友功能" to MaterialSymbols.Outlined.Contacts,
 )
 
 // ---------------------------------------------------------------------------

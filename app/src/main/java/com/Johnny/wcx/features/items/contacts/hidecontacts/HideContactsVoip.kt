@@ -5,7 +5,6 @@ import android.content.Intent
 import com.tencent.mm.plugin.voip.widget.VoipForegroundService
 import dev.ujhhgtg.reflekt.reflekt
 import com.Johnny.wcx.features.items.contacts.HideContacts
-import com.Johnny.wcx.utils.HookParam
 import com.Johnny.wcx.utils.RuntimeConfig
 import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.reflection.BString

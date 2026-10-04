@@ -894,16 +894,6 @@ object WeMomentsApi : ApiFeature(), IResolveDex {
         }
     }
 
-//    val classMediaObj: Class<*> by lazy {
-//        classUploadPackHelper.clazz.declaredMethods.first {
-//            it.parameterTypes.size == 3 &&
-//            it.parameterTypes[0] == String::class.java &&
-//            it.parameterTypes[1] == Int::class.javaPrimitiveType &&
-//            it.parameterTypes[2] == String::class.java &&
-//            it.returnType != Void.TYPE
-//        }.returnType
-//    }
-
     fun isLiked(context: WeMomentsContextMenuApi.MomentsContext): Boolean =
         isLiked(context.snsInfo)
 

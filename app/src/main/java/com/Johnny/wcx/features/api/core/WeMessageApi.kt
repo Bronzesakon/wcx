@@ -373,13 +373,6 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             )
         }
     }
-//    private val methodSendVoice by dexMethod(allowMultiple = true) {
-//        matcher {
-//            declaredClass(classVoiceServiceImpl.clazz)
-//            paramCount = 1
-//            returnType = "void"
-//        }
-//    }
 
     // -------------------------------------------------------------------------------------
     // 运行时缓存
@@ -1280,52 +1273,6 @@ object WeMessageApi : ApiFeature(), IResolveDex {
 
     fun sendVoice(toUser: String, path: String, durationMs: Int): Boolean {
         var succeeded = runCatching {
-//             // 尝试通过 ServiceManager 获取
-//             var finalServiceObj: Any? = null
-//             if (getServiceMethod != null) {
-//                 try {
-//                     finalServiceObj = getServiceMethod!!.invoke(null, classVoiceServiceInterface.clazz)
-//                 } catch (e: Exception) {
-//                     WeLogger.e(TAG, "failed to retrieve ServiceManager, trying singleton fallback", e)
-//                 }
-//             }
-//
-//             // 尝试单例 Fallback
-//             if (finalServiceObj == null) {
-//                 val implClass = classVoiceServiceImpl.clazz
-//                 val instanceField = implClass.declaredFields.find {
-//                     it.name == "INSTANCE" || it.type == implClass
-//                 }
-//                 if (instanceField != null) {
-//                     instanceField.makeAccessible()
-//                     finalServiceObj = instanceField.get(null)
-//                 }
-//             }
-//
-//             if (finalServiceObj == null) error("failed to retrieve VoiceService instance")
-//
-//             // 准备文件
-//             val fileName = voiceNameGenMethod.invoke(null, selfCustomWxId, "amr_") as? String
-//                 ?: error("VoiceName Gen Failed")
-//             val accPath = getAccPath()
-//             val voice2Root = if (accPath.endsWith("/")) "${accPath}voice2/" else "$accPath/voice2/"
-//             val destFullPath =
-//                 pathGenMethod.invoke(null, voice2Root, "msg_", fileName, ".amr", 2) as? String
-//                     ?: error("Path Gen Failed")
-//
-//             if (!copyFileViaVfs(path, destFullPath)) return false
-//
-//             // 构造任务
-//             val paramsObj = classVoiceParams.clazz.createInstance(toUser, fileName)
-//             voiceDurationField.set(paramsObj, durationMs)
-//             voiceOffsetField.set(paramsObj, 0)
-//
-//             val taskObj = voiceTaskConstructor.newInstance(paramsObj)
-//                 ?: error("failed to construct voice task")
-//
-//             methodSendVoice.method.invoke(finalServiceObj, taskObj)
-//             WeLogger.i(TAG, "sent voice (Service method): $fileName")
-
             // 准备文件
             val fileName = voiceNameGenMethod.invoke(getReceiverForMethod(voiceNameGenMethod), toUser, "amr_") as? String
                 ?: error("failed to generate voice name")

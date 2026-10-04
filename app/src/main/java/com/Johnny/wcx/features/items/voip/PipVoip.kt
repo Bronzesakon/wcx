@@ -11,7 +11,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ResultReceiver
-import android.view.View
 import com.tencent.mm.plugin.multitalk.ui.MultiTalkMainUI
 import com.tencent.mm.plugin.voip.ui.VideoActivity
 import dev.ujhhgtg.reflekt.reflekt
@@ -25,6 +24,7 @@ import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.features.core.SwitchFeature
 import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.android.Intent
+import com.Johnny.wcx.utils.reflection.ClassLoaders
 import java.lang.reflect.Modifier
 import java.util.WeakHashMap
 
@@ -39,6 +39,18 @@ object PipVoip : SwitchFeature(), IResolveDex {
     private const val HANGUP_SCENE = 4103
     private const val FLAG_SUPPORTS_PICTURE_IN_PICTURE = 0x400000
     private const val RESIZE_MODE_RESIZEABLE = 2
+
+    // 8.0.77 适配: 微信插件类可能被 R8 混淆改名/移除, 直接类引用前必须做存在性检查,
+    // 检查失败整段 Hook 跳过(无感知, 不带来功能损失), 消除历史上未守卫直接注册导致的随机闪退。
+    private const val WE_CHAT_VIDEO_ACTIVITY = "com.tencent.mm.plugin.voip.ui.VideoActivity"
+    private const val WE_CHAT_MULTI_TALK_MAIN_UI = "com.tencent.mm.plugin.multitalk.ui.MultiTalkMainUI"
+
+    private fun wechatClassExists(name: String): Boolean = try {
+        Class.forName(name, false, ClassLoaders.HOST) != null
+    } catch (e: Throwable) {
+        WeLogger.d(TAG, "$name 不存在(8.0.77 混淆/移除), 跳过相关 Hook")
+        false
+    }
 
     private sealed class Session(val activity: Activity) {
         var pipActive = false
@@ -161,20 +173,6 @@ object PipVoip : SwitchFeature(), IResolveDex {
     }
 
     private val sessions = WeakHashMap<Activity, Session>()
-
-    private val classVoipActivityProxy by dexClass(allowFailure = true) {
-        matcher {
-            usingEqStrings("MicroMsg.ILinkVoipVideoActivityProxy-")
-        }
-    }
-
-    private val methodVoipActivityProxyDealContentView by dexMethod(allowFailure = true) {
-        matcher {
-            declaredClass(classVoipActivityProxy.clazz)
-            paramTypes(View::class.java)
-            returnType = "void"
-        }
-    }
 
     private val classBaseVoipManager by dexClass(allowFailure = true) {
         matcher {
@@ -322,7 +320,7 @@ object PipVoip : SwitchFeature(), IResolveDex {
 
     private val fieldMultiTalkViewModel by dexField(allowFailure = true) {
         matcher {
-            declaredClass(MultiTalkMainUI::class.java)
+            declaredClass(runCatching { MultiTalkMainUI::class.java }.getOrDefault(Any::class.java))
             type(classMultiTalkViewModel.clazz)
         }
     }
@@ -348,7 +346,7 @@ object PipVoip : SwitchFeature(), IResolveDex {
 
     private val methodMultiTalkMinimize by dexMethod(allowFailure = true) {
         matcher {
-            declaredClass(MultiTalkMainUI::class.java)
+            declaredClass(runCatching { MultiTalkMainUI::class.java }.getOrDefault(Any::class.java))
             paramCount = 0
             returnType = "void"
             usingEqStrings("onMiniMultiTalk")
@@ -357,7 +355,7 @@ object PipVoip : SwitchFeature(), IResolveDex {
 
     private val methodMultiTalkExit by dexMethod(allowFailure = true) {
         matcher {
-            declaredClass(MultiTalkMainUI::class.java)
+            declaredClass(runCatching { MultiTalkMainUI::class.java }.getOrDefault(Any::class.java))
             paramCount = 0
             returnType = "void"
             usingEqStrings("onExitMultiTalk")
@@ -408,128 +406,136 @@ object PipVoip : SwitchFeature(), IResolveDex {
     }
 
     override fun onEnable() {
-        methodVoipActivityProxyDealContentView.hookBefore {
-            // 8.0.77 加固: args 取值做空安全
-            WeLogger.d(TAG, "dealContentView: ${args?.getOrNull(0)?.javaClass}")
+        // 8.0.77 适配: 所有微信侧 Hook 注册前必须做类存在/委托解析守卫。
+        // 解析失败整段跳过——该段 Hook 用户无感知, 跳过不带来任何功能损失,
+        // 消除历史上"解析失败仍直接 hookBefore/hookAfter"导致的随机闪退。
+        val videoActivityExists = wechatClassExists(WE_CHAT_VIDEO_ACTIVITY)
+        val multiTalkMainUiExists = wechatClassExists(WE_CHAT_MULTI_TALK_MAIN_UI)
+        WeLogger.i(TAG, "8.0.77 适配: VideoActivity=$videoActivityExists MultiTalkMainUI=$multiTalkMainUiExists")
+
+        if (videoActivityExists) {
+            ActivityInfo::class.reflekt()
+                .firstConstructor()
+                .hookAfter {
+                    // 8.0.77 加固: as? + 空返
+                    val info = thisObject as? ActivityInfo ?: return@hookAfter
+                    if (info.name == VideoActivity::class.java.name) applyPipFlags(info)
+                }
+
+            // 8.0.77 适配: 类存在才直接引用, 否则整段跳过
+            VideoActivity::class.reflekt().firstMethod {
+                name = "onUserLeaveHint"
+                parameterCount = 0
+            }.hookBefore {
+                // 8.0.77 加固: as? + 空返, 找不到 session 只记日志
+                val activity = thisObject as? VideoActivity ?: return@hookBefore
+                sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
+            }
+            VideoActivity::class.reflekt().firstMethod {
+                name = "onDestroy"
+                parameterCount = 0
+            }.hookBefore {
+                removeSession(thisObject as? VideoActivity ?: return@hookBefore)
+            }
         }
 
-        ActivityInfo::class.reflekt()
-            .firstConstructor()
-            .hookAfter {
+        if (multiTalkMainUiExists) {
+            MultiTalkMainUI::class.reflekt().firstMethod {
+                name = "onCreate"
+                parameterCount = 1
+            }.hookAfter {
                 // 8.0.77 加固: as? + 空返
-                val info = thisObject as? ActivityInfo ?: return@hookAfter
-                if (info.name == VideoActivity::class.java.name) applyPipFlags(info)
+                val activity = thisObject as? MultiTalkMainUI ?: return@hookAfter
+                sessions[activity] = GroupSession(activity)
             }
-
-        Activity::class.reflekt()
-            .firstMethod {
-                name = "onPictureInPictureModeChanged"
-                parameterCount = 2
+            MultiTalkMainUI::class.reflekt().firstMethod {
+                name = "onDestroy"
+                parameterCount = 0
+            }.hookBefore {
+                removeSession(thisObject as? MultiTalkMainUI ?: return@hookBefore)
             }
-            .hookBefore {
-                if (thisObject is VideoActivity) {
-                    WeLogger.i(TAG, "VideoActivity picture-in-picture mode: ${args?.getOrNull(0)}")
-                }
-            }
-
-        methodFlutterVoipAttachedToActivity.hookAfter {
-            registerSingleSession(thisObject)
         }
 
-        methodFlutterVoipReattachedToActivity.hookAfter {
-            registerSingleSession(thisObject)
+        if (!methodFlutterVoipAttachedToActivity.isPlaceholder) {
+            methodFlutterVoipAttachedToActivity.hookAfter {
+                registerSingleSession(thisObject)
+            }
         }
 
-        methodFlutterVoipMinimize.hookBefore {
-            // 8.0.77 加固: as? + 空返; 取值与 Dart 回调 invoke 用 runCatching 兜底
-            val activity = fieldFlutterVoipActivity.field.get(thisObject) as? VideoActivity
-                ?: return@hookBefore
-            sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
-            runCatching {
-                val callbackArg = args?.getOrNull(3) ?: return@runCatching
-                methodFlutterCallbackInvoke.method.invoke(callbackArg, true)
-            }.onFailure { WeLogger.e(TAG, "flutter minimize callback invoke failed", it) }
-            try {
-                // 仅当原方法返回 void 时才设置 result = null
-                if (method is java.lang.reflect.Method) {
-                    val returnType = (method as java.lang.reflect.Method).returnType
-                    if (returnType == Void.TYPE) {
-                        result = null
+        if (!methodFlutterVoipReattachedToActivity.isPlaceholder) {
+            methodFlutterVoipReattachedToActivity.hookAfter {
+                registerSingleSession(thisObject)
+            }
+        }
+
+        if (!methodFlutterVoipMinimize.isPlaceholder) {
+            methodFlutterVoipMinimize.hookBefore {
+                // 8.0.77 加固: as? + 空返; 取值与 Dart 回调 invoke 用 runCatching 兜底
+                val activity = fieldFlutterVoipActivity.field.get(thisObject) as? VideoActivity
+                    ?: return@hookBefore
+                sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
+                runCatching {
+                    val callbackArg = args?.getOrNull(3) ?: return@runCatching
+                    methodFlutterCallbackInvoke.method.invoke(callbackArg, true)
+                }.onFailure { WeLogger.e(TAG, "flutter minimize callback invoke failed", it) }
+                try {
+                    // 仅当原方法返回 void 时才设置 result = null
+                    if (method is java.lang.reflect.Method) {
+                        val returnType = (method as java.lang.reflect.Method).returnType
+                        if (returnType == Void.TYPE) {
+                            result = null
+                        }
                     }
+                } catch (e: Throwable) {
+                    // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
                 }
-            } catch (e: Throwable) {
-                // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
             }
         }
 
-        methodVoipMinimize.hookBefore {
-            // 8.0.77 加固: firstOrNull + 空返, 找不到匹配 session 时静默放行
-            val session = sessions.values.filterIsInstance<SingleSession>()
-                .firstOrNull { it.manager === thisObject } ?: return@hookBefore
-            session.enterPip()
-            try {
-                // 仅当原方法返回 boolean 时才设置 result = true
-                if (method is java.lang.reflect.Method) {
-                    val returnType = (method as java.lang.reflect.Method).returnType
-                    if (returnType == Boolean::class.javaPrimitiveType || returnType == java.lang.Boolean::class.java) {
-                        result = true
+        if (!methodVoipMinimize.isPlaceholder) {
+            methodVoipMinimize.hookBefore {
+                // 8.0.77 加固: firstOrNull + 空返, 找不到匹配 session 时静默放行
+                val session = sessions.values.filterIsInstance<SingleSession>()
+                    .firstOrNull { it.manager === thisObject } ?: return@hookBefore
+                session.enterPip()
+                try {
+                    // 仅当原方法返回 boolean 时才设置 result = true
+                    if (method is java.lang.reflect.Method) {
+                        val returnType = (method as java.lang.reflect.Method).returnType
+                        if (returnType == Boolean::class.javaPrimitiveType || returnType == java.lang.Boolean::class.java) {
+                            result = true
+                        }
                     }
+                } catch (e: Throwable) {
+                    // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
                 }
-            } catch (e: Throwable) {
-                // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
             }
         }
 
-        VideoActivity::class.reflekt().firstMethod {
-            name = "onUserLeaveHint"
-            parameterCount = 0
-        }.hookBefore {
-            // 8.0.77 加固: as? + 空返, 找不到 session 只记日志
-            val activity = thisObject as? VideoActivity ?: return@hookBefore
-            sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
-        }
-        VideoActivity::class.reflekt().firstMethod {
-            name = "onDestroy"
-            parameterCount = 0
-        }.hookBefore {
-            removeSession(thisObject as? VideoActivity ?: return@hookBefore)
-        }
-
-        MultiTalkMainUI::class.reflekt().firstMethod {
-            name = "onCreate"
-            parameterCount = 1
-        }.hookAfter {
-            // 8.0.77 加固: as? + 空返
-            val activity = thisObject as? MultiTalkMainUI ?: return@hookAfter
-            sessions[activity] = GroupSession(activity)
-        }
-        MultiTalkMainUI::class.reflekt().firstMethod {
-            name = "onDestroy"
-            parameterCount = 0
-        }.hookBefore {
-            removeSession(thisObject as? MultiTalkMainUI ?: return@hookBefore)
-        }
-
-        methodMultiTalkMinimize.hookBefore {
-            // 8.0.77 加固: as? + 空返
-            val activity = thisObject as? MultiTalkMainUI ?: return@hookBefore
-            sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
-            try {
-                // 仅当原方法返回 void 时才设置 result = null
-                if (method is java.lang.reflect.Method) {
-                    val returnType = (method as java.lang.reflect.Method).returnType
-                    if (returnType == Void.TYPE) {
-                        result = null
+        if (!methodMultiTalkMinimize.isPlaceholder) {
+            methodMultiTalkMinimize.hookBefore {
+                // 8.0.77 加固: as? + 空返
+                val activity = thisObject as? MultiTalkMainUI ?: return@hookBefore
+                sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
+                try {
+                    // 仅当原方法返回 void 时才设置 result = null
+                    if (method is java.lang.reflect.Method) {
+                        val returnType = (method as java.lang.reflect.Method).returnType
+                        if (returnType == Void.TYPE) {
+                            result = null
+                        }
                     }
+                } catch (e: Throwable) {
+                    // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
                 }
-            } catch (e: Throwable) {
-                // 兜底异常捕获，防止单条 Hook 异常导致微信主线程崩溃
             }
         }
 
+        // framework 类必然存在, 无守卫需求; 收到多聊 UI 的 onUserLeaveHint 时同样触发画中画
+        // 8.0.77 适配: MultiTalkMainUI 类缺失时先短路, 避免 is 检查触发 NoClassDefFoundError
         Activity::class.reflekt().firstMethod { name = "onUserLeaveHint" }.hookBefore {
             val activity = thisObject
-            if (activity is MultiTalkMainUI) {
+            if (multiTalkMainUiExists && activity is MultiTalkMainUI) {
                 sessions[activity]?.enterPip() ?: WeLogger.w(TAG, "no session for $activity, leaving wechat alone")
             }
         }
@@ -541,7 +547,11 @@ object PipVoip : SwitchFeature(), IResolveDex {
     }
 
     private fun registerSingleSession(plugin: Any) {
-        // 8.0.77 加固: 字段可能已混淆/移除, as? + 空返, 异常不再抛进微信执行栈
+        // 8.0.77 加固: 字段可能已混淆/移除, isPlaceholder + as? + 空返, 异常不再抛进微信执行栈
+        if (fieldFlutterVoipActivity.isPlaceholder || fieldFlutterVoipManager.isPlaceholder) {
+            WeLogger.w(TAG, "flutter voip fields unresolved, skipping session registration")
+            return
+        }
         val activity = fieldFlutterVoipActivity.field.get(plugin) as? VideoActivity ?: run {
             WeLogger.w(TAG, "flutter voip plugin has no activity attached")
             return

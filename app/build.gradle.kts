@@ -25,11 +25,6 @@ fun getGitHash(): String {
 }
 
 android {
-    lint {
-        abortOnError = false
-        checkReleaseBuilds = false
-    }
-
     namespace = libs.versions.namespace.get()
     compileSdk {
         version = release(libs.versions.compileSdk.get().toInt()) {
@@ -41,21 +36,19 @@ android {
     val commitCount = getCommitCount()
     val gitHash = getGitHash()
 
-    // CI 发布时由 Sync Upstream & Build APK 工作流注入本次将发布的 Release tag
-    // (固定 v247), 写入 BuildConfig.RELEASE_TAG 供 AppUpdater 判等,
-    // 避免重复发布时每次启动都误报新版本。本地构建为空字符串。
+    // 本地定制：CI 发布时由 sync-upstream 工作流注入本次将发布的 Release tag (v259),
+    // 写入 BuildConfig.RELEASE_TAG 供 AppUpdater 判等, 避免重复发布时每次启动都误报新版本。
+    // 本地构建为空字符串。
     val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
-
-    // v194 基线：commitCount 基于 v148，偏移 +26
-    // 后续每增加一个 commit，versionCode 自动递增
-    val versionBaseOffset = 30  // v210 连号起点（commit 180+30=210，下次 commit 181+30=211）
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 258
-        versionName = "v258"
+        // 版本号单一数据源：CI（.github/workflows/ci.yml）直接读取此处，
+        // 发版时只需在此递增 versionCode / versionName
+        versionCode = 259
+        versionName = "v259"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
@@ -184,6 +177,12 @@ android {
         resValues = false
         compose = true
         buildConfig = true
+    }
+
+    lint {
+        // 默认 locale values/ 仅有少量 key，完整字符串位于 values-zh-rCN；
+        // androidResources.localeFilters=zh 打包时只保留中文资源，ExtraTranslation 属误报。
+        disable += "ExtraTranslation"
     }
 }
 

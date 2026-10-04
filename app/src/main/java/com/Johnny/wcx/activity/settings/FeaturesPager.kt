@@ -51,7 +51,13 @@ fun FeaturesPager(onOpenCategory: (String) -> Unit) {
     val query = queryState.text.toString()
     val searching = query.isNotBlank()
 
-    val searchableItems = remember { FeaturesProvider.ALL_HOOK_ITEMS.filterIsInstance<SwitchFeature>() }
+    // 设置页搜索**显式排除密友功能**：避免输入任意关键词（如"隐藏"）就把密友功能暴露出来。
+    // 密友入口 = 设置分类列表最后一项；分类详情页仍按 categories 正常显示全部密友开关。
+    val searchableItems = remember {
+        FeaturesProvider.ALL_HOOK_ITEMS
+            .filterIsInstance<SwitchFeature>()
+            .filter { item -> "密友功能" !in item.categories }
+    }
     val filteredItems = remember(query) {
         if (!searching) emptyList()
         else searchableItems.filter {

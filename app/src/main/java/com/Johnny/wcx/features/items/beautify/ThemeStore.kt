@@ -87,7 +87,7 @@ import kotlin.io.path.name
  * - 六款内置主题：Hello Kitty（花朵气泡）/ 小熊（miko 小狗边框气泡）/ 线条小狗（加油鸭鸭气泡）/
  *   吉伊卡哇（花朵气泡）/ 美食小狗（面包🍞气泡）/ 小兔子（猫咪气泡）
  * - 使用主题后全局沉浸式：状态栏/导航栏透明，壁纸悬浮层铺满全屏（含状态栏/导航栏区域），
- *   微信主页、设置页、朋友圈等所有微信页面一律生效；**扫一扫页面不覆盖壁纸**
+ *   微信主页、设置页、朋友圈等所有微信页面一律生效；**扫一扫与查看相册页面不挂壁纸**
  *   （仅取消壁纸覆盖，沉浸式等其余不变，避免相机取景区域被遮挡影响扫码）
  * - 气泡按「自定义消息气泡」的方式应用：主题气泡写入 <模块数据>/assets/left_bubble.9.png（对方）
  *   与 right_bubble.9.png（自己），9-patch 黑边解析为 NinePatchDrawable，同时开启该功能开关
@@ -341,17 +341,51 @@ object ThemeStore : ClickableFeature(), WeChatMessageViewApi.ICreateViewListener
     private fun applyThemeTo(activity: Activity) {
         if (activeThemeId.isEmpty()) return
         applyImmersive(activity)
-        // 扫一扫页面不覆盖壁纸：相机取景区域被壁纸遮挡会影响扫码（沉浸式与气泡等其余全部不变）
-        if (isScannerPage(activity)) {
-            removeWallpaper(activity)
+        // 扫一扫页面与照片/视频「放大查看」页面不挂壁纸：相机取景被遮挡影响扫码、
+        // 查看页被壁纸盖住会与照片重叠。查看页多为半透明 Activity / 同窗口浮层 / 独立窗口，
+        // 不一定有 Activity resume 信号——因此聊天页（ChattingUI）本身也不挂壁纸，
+        // 从源头消除「照片透出聊天页壁纸蒙版」的可能；返回时其他页面 onResume 自动恢复。
+        if (isScannerPage(activity) || isPhotoViewerPage(activity) || isChattingPage(activity)) {
+            liveActivities().forEach { act ->
+                try { removeWallpaper(act) } catch (e: Throwable) { WeLogger.w(TAG, "豁免页移除壁纸异常", e) }
+            }
         } else {
             applyWallpaper(activity)
         }
     }
 
+    /** 聊天页：壁纸会透过照片查看浮层/半透明查看页覆盖照片，故不挂壁纸。 */
+    private fun isChattingPage(activity: Activity): Boolean =
+        activity.javaClass.name == "com.tencent.mm.ui.ChattingUI"
+
+    
+
     /** 微信「扫一扫」相关页面：plugin.scanner 包（扫码页/选模式/相册扫码/扫码结果等）。 */
     private fun isScannerPage(activity: Activity): Boolean =
         activity.javaClass.name?.startsWith("com.tencent.mm.plugin.scanner") == true
+
+    /**
+     * 照片/视频「放大查看」页面：壁纸若悬浮其上会盖住照片，一律不挂壁纸。
+     * 类名取自微信 8.0.77 manifest 实测：
+     * - ui.chatting.gallery.* ：聊天图片/视频查看（ImageGalleryUI 等）与聊天记录媒体页
+     * - plugin.gallery.*      ：相册选图预览
+     * - plugin.sns.ui.SnsGalleryUI / SnsSightPlayerUI / VideoFullScreenActivity：朋友圈照片/视频
+     * - plugin.fav.ui.FavImgGalleryUI / gallery.FavMediaGalleryUI / detail.FavoriteSightDetailUI：收藏媒体
+     * - view.activity.ImageQueryGalleryUI、ui.media.MediaGalleryContainerUI：通用媒体查看容器
+     */
+    private fun isPhotoViewerPage(activity: Activity): Boolean {
+        val name = activity.javaClass.name ?: return false
+        return name.startsWith("com.tencent.mm.ui.chatting.gallery") ||
+            name.startsWith("com.tencent.mm.plugin.gallery") ||
+            name == "com.tencent.mm.plugin.sns.ui.SnsGalleryUI" ||
+            name == "com.tencent.mm.plugin.sns.ui.SnsSightPlayerUI" ||
+            name == "com.tencent.mm.plugin.sns.ui.VideoFullScreenActivity" ||
+            name == "com.tencent.mm.plugin.fav.ui.FavImgGalleryUI" ||
+            name == "com.tencent.mm.plugin.fav.ui.gallery.FavMediaGalleryUI" ||
+            name == "com.tencent.mm.plugin.fav.ui.detail.FavoriteSightDetailUI" ||
+            name == "com.tencent.mm.view.activity.ImageQueryGalleryUI" ||
+            name == "com.tencent.mm.ui.media.MediaGalleryContainerUI"
+    }
 
     /**
      * 沉浸式系统栏：状态栏/导航栏透明 + 浅色图标（可恢复）。
@@ -393,6 +427,8 @@ object ThemeStore : ClickableFeature(), WeChatMessageViewApi.ICreateViewListener
     /**
      * 壁纸悬浮层：挂在 decorView 顶层（触摸透明），铺满全屏（含状态栏/导航栏区域）。
      * 已存在则复用并刷新壁纸图/透明度，避免闪烁。
+     * 注：曾尝试「内容底衬」（挂在窗体容器 index 0）——微信各页根布局不透明会完全盖住底衬
+     * （看不到壁纸），且影响微信自绘窗口（wcx 设置入口卡启动图），故回退为顶层悬浮。
      */
     private fun applyWallpaper(activity: Activity) {
         val decor = activity.window?.decorView as? ViewGroup ?: return
@@ -474,7 +510,7 @@ object ThemeStore : ClickableFeature(), WeChatMessageViewApi.ICreateViewListener
         }
     }
 
-    /** 通过 ActivityThread.mActivities 获取进程内所有存活 Activity。 */
+/** 通过 ActivityThread.mActivities 获取进程内所有存活 Activity。 */
     private fun liveActivities(): List<Activity> = try {
         val atClass = Class.forName("android.app.ActivityThread")
         val at = atClass.getDeclaredMethod("currentActivityThread").invoke(null)

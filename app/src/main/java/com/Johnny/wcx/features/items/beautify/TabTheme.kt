@@ -103,6 +103,9 @@ object TabTheme : ClickableFeature() {
     private var opacity by prefOption("tab_theme_opacity", 0.15f)
     private var transparentStatusBar by prefOption("tab_theme_transparent_status_bar", true)
 
+    /** 聊天页隔离开关：开启后 Tab 背景只在主页/通讯录/发现/我四个 Tab 界面生效，聊天界面不生效。 */
+    private var chatOnlyEnabled by prefOption("tab_theme_chat_only", true)
+
     @Serializable
     data class TabThemeConfig(
         val name: String = "默认主题",
@@ -257,7 +260,7 @@ object TabTheme : ClickableFeature() {
                 .hookAfter {
                     try {
                         val position = args[0] as Int
-                        val inChatPage = isChatActivityForeground()
+                        val inChatPage = chatOnlyEnabled && isChatActivityForeground()
                         tabImageViews.forEach { (idx, iv) ->
                             if (inChatPage) {
                                 // 聊天会话页面内，模块全局主题背景强制失效
@@ -368,6 +371,7 @@ object TabTheme : ClickableFeature() {
         var enabledState by remember { mutableStateOf(tabThemeEnabled) }
         var opacityState by remember { mutableFloatStateOf(opacity) }
         var transparentStatusBarState by remember { mutableStateOf(transparentStatusBar) }
+        var chatOnlyState by remember { mutableStateOf(chatOnlyEnabled) }
 
         // Reactive state: track which tabs have images, initialized from disk
         val hasImageStates = remember {
@@ -415,6 +419,13 @@ object TabTheme : ClickableFeature() {
                         },
                         headlineContent = { Text("沉浸式全屏") },
                         supportingContent = { Text("背景完整铺满屏幕，消除上下白条") }
+                    )
+
+                    ListItem(
+                        modifier = Modifier.clickable { chatOnlyState = !chatOnlyState },
+                        trailingContent = { Switch(checked = chatOnlyState, onCheckedChange = null) },
+                        headlineContent = { Text("聊天页不生效") },
+                        supportingContent = { Text("Tab 背景仅作用于主页/通讯录/发现/我四页，聊天界面不显示") }
                     )
 
                     Text(
@@ -465,6 +476,7 @@ object TabTheme : ClickableFeature() {
                     tabThemeEnabled = enabledState
                     opacity = opacityState
                     transparentStatusBar = transparentStatusBarState
+                    chatOnlyEnabled = chatOnlyState
                     if (enabledState) {
                         showToast("设置已保存，重启微信生效")
                     } else {
