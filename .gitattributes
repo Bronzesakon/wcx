@@ -1,0 +1,3 @@
+# 该文件在 dostume/wcx 里以 CRLF 存储（内容与我们相同），
+# 关闭行尾归一化以便我们的 blob 与上游逐字节一致，避免每次合并都出现整文件伪冲突。
+app/src/main/java/com/Johnny/wcx/features/items/chat/MonitorGroupMemberOperations.kt -text
