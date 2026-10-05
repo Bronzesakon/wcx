@@ -239,6 +239,11 @@ internal class HomeSidePanelState(
         }
     }
 
+    /** 面板关闭时调用：编辑中则保存草稿并回到运行模式（用户收起面板即视为完成编辑） */
+    fun exitEditingOnPanelClose() {
+        if (editing != null) saveEditing()
+    }
+
     fun openAddCard() {
         cancelDrag?.invoke()
         requireEditing()

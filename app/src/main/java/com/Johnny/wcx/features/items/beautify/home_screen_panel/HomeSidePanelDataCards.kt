@@ -36,7 +36,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -119,8 +118,8 @@ internal fun HomeSidePanelDateTimeCard(
                 prefix = "农历",
                 leapPrefix = "闰",
                 separator = "、",
-                monthNames = stringArrayResource(com.Johnny.wcx.R.array.home_side_panel_lunar_month_names).asList(),
-                dayNames = stringArrayResource(com.Johnny.wcx.R.array.home_side_panel_lunar_day_names).asList(),
+                monthNames = LUNAR_MONTH_NAMES,
+                dayNames = LUNAR_DAY_NAMES,
             ),
         )
     }
@@ -722,3 +721,16 @@ private fun formatWeatherPublishedAt(publishedAt: String): String = runCatching 
 }.getOrDefault(publishedAt)
 
 private val HOME_SIDE_PANEL_TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm")
+
+// 农历月/日名：不再走 string-array 资源（R8 资源优化会移除 → 渲染时 Resources$NotFoundException），
+// 直接以 Kotlin 常量提供（与 values/arrays.xml 相同内容）。
+private val LUNAR_MONTH_NAMES = listOf(
+    "正月", "二月", "三月", "四月", "五月", "六月",
+    "七月", "八月", "九月", "十月", "冬月", "腊月",
+)
+
+private val LUNAR_DAY_NAMES = listOf(
+    "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
+    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+    "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十",
+)

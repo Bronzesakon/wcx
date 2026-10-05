@@ -69,6 +69,8 @@ internal fun HomeSidePanelDragHost(
         onDispose {
             dragState.cancel()
             panelState.setDragCancellation(null)
+            // 面板收起即自动保存并退出编辑（否则重开仍停留编辑态, 动作卡片点击不生效）
+            panelState.exitEditingOnPanelClose()
         }
     }
     LaunchedEffect(panelState, dragState) {

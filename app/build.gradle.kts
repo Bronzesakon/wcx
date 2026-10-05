@@ -19,11 +19,6 @@ fun getGitHash(): String {
 }
 
 android {
-    lint {
-        abortOnError = false
-        checkReleaseBuilds = false
-    }
-
     namespace = libs.versions.namespace.get()
     compileSdk {
         version = release(libs.versions.compileSdk.get().toInt()) {
@@ -34,24 +29,19 @@ android {
 
     val gitHash = getGitHash()
 
-    // CI 发布时由 Sync Upstream & Build APK 工作流注入本次将发布的 Release tag
-    // (固定 v247), 写入 BuildConfig.RELEASE_TAG 供 AppUpdater 判等,
-    // 避免重复发布时每次启动都误报新版本。本地构建为空字符串。
+    // 本地定制：CI 发布时由 sync-upstream 工作流注入本次将发布的 Release tag (v259),
+    // 写入 BuildConfig.RELEASE_TAG 供 AppUpdater 判等, 避免重复发布时每次启动都误报新版本。
+    // 本地构建为空字符串。
     val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
-
-    // fork 版本号: 默认 261（高于 dostume 已发布的 260，保证被系统识别为更新而非降级）。
-    // 发版时可覆盖: -Pwcx.versionCode=262 -Pwcx.versionName=v262（CI 同样可传）。
-    val wcxVersionCode =
-        (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 261
-    val wcxVersionName =
-        (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v$wcxVersionCode"
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = wcxVersionCode
-        versionName = wcxVersionName
+        // fork 版本号: 默认 261（高于 dostume 已发布的 260，保证被识别为更新而非降级）。
+        // 发版时可覆盖: -Pwcx.versionCode=262 -Pwcx.versionName=v262（CI 同样可传）。
+        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 261
+        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v261"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
@@ -64,11 +54,7 @@ android {
         abi {
             reset()
             isEnable = true
-            // 可用 -Pwcx.abi=arm64-v8a 覆盖（CI 精简构建用）；默认全部 ABI
-            val abiFilter = (project.findProperty("wcx.abi") as String?)
-                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
-                ?: listOf("arm64-v8a", "armeabi-v7a")
-            include(*abiFilter.toTypedArray())
+            include("arm64-v8a", "armeabi-v7a")
             isUniversalApk = false
         }
     }
@@ -184,6 +170,12 @@ android {
         resValues = false
         compose = true
         buildConfig = true
+    }
+
+    lint {
+        // 默认 locale values/ 仅有少量 key，完整字符串位于 values-zh-rCN；
+        // androidResources.localeFilters=zh 打包时只保留中文资源，ExtraTranslation 属误报。
+        disable += "ExtraTranslation"
     }
 }
 

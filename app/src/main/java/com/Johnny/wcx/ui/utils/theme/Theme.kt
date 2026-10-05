@@ -2,8 +2,6 @@ package com.Johnny.wcx.ui.utils.theme
 
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.runtime.Immutable
-import androidx.compose.ui.graphics.Color
 
 val lightScheme = lightColorScheme(
     primary = primaryLight,
@@ -233,10 +231,3 @@ private val highContrastDarkColorScheme = darkColorScheme(
     surfaceContainerHighest = surfaceContainerHighestDarkHighContrast,
 )
 
-@Immutable
-data class ColorFamily(
-    val color: Color,
-    val onColor: Color,
-    val colorContainer: Color,
-    val onColorContainer: Color
-)

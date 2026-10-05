@@ -205,8 +205,6 @@ object WePacketHelper : ApiFeature(), IResolveDex {
             returnType = queueName
         }
     }
-//    private val methodNetDispatch by dexMethod()
-
     private val cgiReqClassMap = mutableMapOf<Int, Class<*>>()
 
     private val signers = listOf(

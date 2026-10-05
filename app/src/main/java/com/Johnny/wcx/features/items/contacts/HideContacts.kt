@@ -1,4 +1,4 @@
-﻿package com.Johnny.wcx.features.items.contacts
+package com.Johnny.wcx.features.items.contacts
 
 import com.Johnny.wcx.R
 
@@ -21,7 +21,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.composables.icons.materialsymbols.MaterialSymbols
 import com.composables.icons.materialsymbols.outlined.Chevron_right
@@ -407,7 +406,10 @@ object HideContacts : ClickableFeature(), IResolveDex, WeChatInputBarApi.IInputB
         }
     }
 
-    override fun onQuery(sql: String): String? = rewriteMomentsFeedSql(sql)
+    override fun onQuery(sql: String): String? {
+        if (isTemporarilyShown) return null
+        return rewriteMomentsFeedSql(sql, hiddenContacts)
+    }
 
     // The parentRef marker older versions wrote via WeConversationApi.setConversationsVisibility to
     // hide a chat. WeChat's native list filter (m4.O) hides rows whose parentRef isn't null/empty.
@@ -653,8 +655,6 @@ object HideContacts : ClickableFeature(), IResolveDex, WeChatInputBarApi.IInputB
             )
         }
     }
-
-    //    private val methodMainAdapterPerformSearch by dexMethod()
 
     // WeChat's SQLite wrapper query: d95.b0.f(String sql, String[] args, int) -> Cursor. The
     // homepage conversation-list cursor (com.tencent.mm.storage.m4.A/B) is built through this
@@ -1080,12 +1080,4 @@ object HideContacts : ClickableFeature(), IResolveDex, WeChatInputBarApi.IInputB
         }
     }
 
-//    private val classVoipService by dexClass()
-//    private val classVoipManager by dexClass()
-//    private val classIncomingVoipInvite by dexClass()
-//    private val classIncomingVoipILinkInvite by dexClass()
-//    private val classMultiTalkInvite by dexClass()
-//    private val classVoipFloatCard by dexClass()
-//    private val classRecentForwardInfoHelperV3 by dexClass()
-//    private val classContactRecommendHelperV3 by dexClass()
 }
