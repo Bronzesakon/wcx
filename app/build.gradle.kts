@@ -54,7 +54,11 @@ android {
         abi {
             reset()
             isEnable = true
-            include("arm64-v8a", "armeabi-v7a")
+            // 可用 -Pwcx.abi=arm64-v8a 覆盖（CI 精简构建用）；默认全部 ABI
+            val abiFilter = (project.findProperty("wcx.abi") as String?)
+                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?: listOf("arm64-v8a", "armeabi-v7a")
+            include(*abiFilter.toTypedArray())
             isUniversalApk = false
         }
     }
