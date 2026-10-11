@@ -126,7 +126,7 @@ object MassSendMessage : ClickableFeature() {
         mode: SendMode,
         text: String
     ) {
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = "选择群发对象",
                 contacts = contacts,

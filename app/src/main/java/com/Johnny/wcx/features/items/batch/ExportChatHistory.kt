@@ -54,7 +54,7 @@ object ExportChatHistory : ClickableFeature() {
     override fun onClick(context: ComponentActivity) {
         val contacts = WeDatabaseApi.getFriends() + WeDatabaseApi.getGroups()
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             var selectedWxIds by remember { mutableStateOf(emptySet<String>()) }
             var step by remember { mutableIntStateOf(0) }
             var selectedFormat by remember { mutableStateOf(ExportFormat.TXT) }

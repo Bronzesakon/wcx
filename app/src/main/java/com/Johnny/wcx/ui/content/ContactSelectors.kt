@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -158,7 +160,8 @@ fun BaseContactSelector(
     onItemClick: (IWeContact) -> Unit,
     onSelectAll: ((List<IWeContact>) -> Unit)? = null,
     onDeselectAll: ((List<IWeContact>) -> Unit)? = null,
-    onInvertSelection: ((List<IWeContact>) -> Unit)? = null
+    onInvertSelection: ((List<IWeContact>) -> Unit)? = null,
+    fullScreen: Boolean = true
 ) {
     val context = LocalContext.current
     val localizedContext = LocalContext.current
@@ -421,7 +424,16 @@ fun BaseContactSelector(
             }
         }
     }
-    val showFilterModeRow = availableFilterModes.isNotEmpty()
+    // 当前筛选方式下是否真的有可选项 (标签 / 归拢 / 分组 各一组)。
+    // 没有可选项时连「不限」一起隐藏 —— 孤零零一个按钮反而让人猜它在筛什么。
+    val hasFilterModeOptions = when (filterMode) {
+        ContactFilterMode.LABELS -> availableLabels.isNotEmpty()
+        ContactFilterMode.AGGREGATION -> availableAggregationOptions.isNotEmpty()
+        ContactFilterMode.GROUPING -> availableGroupingOptions.isNotEmpty()
+    }
+    // 类型筛选 chip 与后面的筛选条件 chip 之间画一条竖线做区隔,
+    // 否则「不限」紧跟在「群聊 (55)」后面, 看着像同一组里的第四个分类。
+    val showFilterDivider = showTypeFilterRow && (availableFilterModes.size > 1 || hasFilterModeOptions)
 
     val displayedContacts = remember(filteredContacts, selectedType, filterMode, selectedLabelName, selectedAggregationId, selectedGroupingId, friendWxIds, groupWxIds, officialAccountWxIds, labelContactsMap, aggregationOptions, groupingOptions) {
         filteredContacts.filter { contact ->
@@ -493,6 +505,7 @@ fun BaseContactSelector(
         modifier = modifier
             .fillMaxWidth()
             .fillMaxHeight(),
+        fullScreen = fullScreen,
         title = { Text(title) },
         text = {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -573,7 +586,7 @@ fun BaseContactSelector(
                             }
                         }
 
-                        if (showFilterModeRow) {
+                        if (availableFilterModes.size > 1 || hasFilterModeOptions) {
                             LazyRow(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 contentPadding = PaddingValues(horizontal = 4.dp),
@@ -582,56 +595,70 @@ fun BaseContactSelector(
                                     .padding(bottom = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                item {
-                                    val modeIndex = availableFilterModes.indexOf(filterMode).coerceAtLeast(0)
-                                    val hasMoreModes = availableFilterModes.size > 1
-                                    FilterChip(
-                                        selected = true,
-                                        onClick = {
-                                            if (!hasMoreModes) {
-                                                showToast(
-                                                    context,
-                                                    "可启用「对话归拢」或「对话分组」以使用更多筛选方式",
-                                                )
-                                            } else {
+                                if (showFilterDivider) {
+                                    item {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(1.dp)
+                                                .height(16.dp)
+                                                .background(MaterialTheme.colorScheme.outlineVariant)
+                                        )
+                                    }
+                                }
+                                if (availableFilterModes.size > 1) {
+                                    // 筛选方式切换 chip (标签 / 归拢 / 分组) 只在真的存在多种方式时才有意义。
+                                    // 单模式下它点不动 (点击只弹提示), 而且「标签」两个字紧贴在标签列表前面,
+                                    // 会被当成列表里的第一个标签项 —— 索性不显示。
+                                    item {
+                                        val modeIndex = availableFilterModes.indexOf(filterMode).coerceAtLeast(0)
+                                        FilterChip(
+                                            selected = true,
+                                            onClick = {
                                                 filterMode = availableFilterModes[(modeIndex + 1) % availableFilterModes.size]
                                                 persistedContactFilterMode = filterMode.name
                                                 selectedLabelName = null
                                                 selectedAggregationId = null
                                                 selectedGroupingId = null
-                                            }
-                                        },
-                                        label = { Text(filterMode.nameRes) },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = filterMode.icon,
-                                                contentDescription = filterMode.nameRes,
-                                                modifier = Modifier.size(16.dp),
-                                            )
-                                        },
-                                    )
+                                            },
+                                            label = { Text(filterMode.nameRes, style = MaterialTheme.typography.labelSmall) },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = filterMode.icon,
+                                                    contentDescription = filterMode.nameRes,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            },
+                                            modifier = Modifier.height(28.dp)
+                                        )
+                                    }
                                 }
 
                                 if (filterMode == ContactFilterMode.LABELS) {
-                                    item {
-                                        val isSelected = selectedLabelName == null
-                                        FilterChip(
-                                            selected = isSelected,
-                                            onClick = { selectedLabelName = null },
-                                            label = { Text("全部") }
-                                        )
-                                    }
+                                    if (hasFilterModeOptions) {
+                                        // 「不限」= 不按标签过滤。原先叫「全部」, 和左侧类型筛选的
+                                        // 「全部 (数量)」撞名, 会被当成同一个东西。
+                                        item {
+                                            val isSelected = selectedLabelName == null
+                                            FilterChip(
+                                                selected = isSelected,
+                                                onClick = { selectedLabelName = null },
+                                                label = { Text("不限", style = MaterialTheme.typography.labelSmall) },
+                                                modifier = Modifier.height(28.dp)
+                                            )
+                                        }
 
-                                    items(availableLabels) { label ->
-                                        val isSelected = selectedLabelName == label.labelName
-                                        val labelCount = labelCounts[label.labelName] ?: 0
-                                        FilterChip(
-                                            selected = isSelected,
-                                            onClick = { selectedLabelName = if (isSelected) null else label.labelName },
-                                            label = {
-                                                Text("%1\$s (".format(label.labelName, labelCount))
-                                            }
-                                        )
+                                        items(availableLabels) { label ->
+                                            val isSelected = selectedLabelName == label.labelName
+                                            val labelCount = labelCounts[label.labelName] ?: 0
+                                            FilterChip(
+                                                selected = isSelected,
+                                                onClick = { selectedLabelName = if (isSelected) null else label.labelName },
+                                                label = {
+                                                    Text("%1\$s (".format(label.labelName, labelCount))
+                                                },
+                                                modifier = Modifier.height(28.dp)
+                                            )
+                                        }
                                     }
                                 } else {
                                     val options = if (filterMode == ContactFilterMode.AGGREGATION) {
@@ -639,39 +666,44 @@ fun BaseContactSelector(
                                     } else {
                                         availableGroupingOptions
                                     }
-                                    item {
-                                        val isSelected = if (filterMode == ContactFilterMode.AGGREGATION) {
-                                            selectedAggregationId == null
-                                        } else {
-                                            selectedGroupingId == null
+                                    // 与标签分组同理: 没有可选项时连「不限」一起隐藏。
+                                    if (hasFilterModeOptions) {
+                                        item {
+                                            val isSelected = if (filterMode == ContactFilterMode.AGGREGATION) {
+                                                selectedAggregationId == null
+                                            } else {
+                                                selectedGroupingId == null
+                                            }
+                                            FilterChip(
+                                                selected = isSelected,
+                                                onClick = {
+                                                    if (filterMode == ContactFilterMode.AGGREGATION) {
+                                                        selectedAggregationId = null
+                                                    } else {
+                                                        selectedGroupingId = null
+                                                    }
+                                                },
+                                                label = { Text("不限", style = MaterialTheme.typography.labelSmall) },
+                                                modifier = Modifier.height(28.dp)
+                                            )
                                         }
-                                        FilterChip(
-                                            selected = isSelected,
-                                            onClick = {
-                                                if (filterMode == ContactFilterMode.AGGREGATION) {
-                                                    selectedAggregationId = null
-                                                } else {
-                                                    selectedGroupingId = null
-                                                }
-                                            },
-                                            label = { Text("全部") },
-                                        )
-                                    }
-                                    items(options, key = { it.id }) { option ->
-                                        val selectedId = if (filterMode == ContactFilterMode.AGGREGATION) selectedAggregationId else selectedGroupingId
-                                        val isSelected = selectedId == option.id
-                                        val count = filteredContacts.count { it.wxId in option.wxIds }
-                                        FilterChip(
-                                            selected = isSelected,
-                                            onClick = {
-                                                if (filterMode == ContactFilterMode.AGGREGATION) {
-                                                    selectedAggregationId = if (isSelected) null else option.id
-                                                } else {
-                                                    selectedGroupingId = if (isSelected) null else option.id
-                                                }
-                                            },
-                                            label = { Text("%1\$s (".format(option.name, count)) },
-                                        )
+                                        items(options, key = { it.id }) { option ->
+                                            val selectedId = if (filterMode == ContactFilterMode.AGGREGATION) selectedAggregationId else selectedGroupingId
+                                            val isSelected = selectedId == option.id
+                                            val count = filteredContacts.count { it.wxId in option.wxIds }
+                                            FilterChip(
+                                                selected = isSelected,
+                                                onClick = {
+                                                    if (filterMode == ContactFilterMode.AGGREGATION) {
+                                                        selectedAggregationId = if (isSelected) null else option.id
+                                                    } else {
+                                                        selectedGroupingId = if (isSelected) null else option.id
+                                                    }
+                                                },
+                                                label = { Text("%1\$s (".format(option.name, count)) },
+                                                modifier = Modifier.height(28.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -723,58 +755,60 @@ fun BaseContactSelector(
                             )
                         }
 
-                        if (onSelectAll != null || onDeselectAll != null || onInvertSelection != null) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 4.dp)
-                                    .padding(bottom = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                onSelectAll?.let {
-                                    FilterChip(
-                                        selected = false,
-                                        onClick = { it(displayedContacts) },
-                                        label = { Text("全选") },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = MaterialSymbols.Outlined.Select_all,
-                                                contentDescription = "全选",
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
+                    }
+                }
+
+                // 全选 / 全不选 / 反选常驻显示, 不被「折叠筛选」收起。
+                if (onSelectAll != null || onDeselectAll != null || onInvertSelection != null) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp)
+                            .padding(bottom = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        onSelectAll?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("全选") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Select_all,
+                                        contentDescription = "全选",
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
-                                onDeselectAll?.let {
-                                    FilterChip(
-                                        selected = false,
-                                        onClick = { it(displayedContacts) },
-                                        label = { Text("全不选") },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = MaterialSymbols.Outlined.Deselect,
-                                                contentDescription = "全不选",
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
+                            )
+                        }
+                        onDeselectAll?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("全不选") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Deselect,
+                                        contentDescription = "全不选",
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
-                                onInvertSelection?.let {
-                                    FilterChip(
-                                        selected = false,
-                                        onClick = { it(displayedContacts) },
-                                        label = { Text("反选") },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = MaterialSymbols.Outlined.Compare_arrows,
-                                                contentDescription = "反选",
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
+                            )
+                        }
+                        onInvertSelection?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("反选") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Compare_arrows,
+                                        contentDescription = "反选",
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
-                            }
+                            )
                         }
                     }
                 }
@@ -1082,10 +1116,71 @@ private fun sortContactsByDisplayName(contacts: List<IWeContact>): List<IWeConta
 /**
  * 在已排好序的列表上过滤。过滤保序, 所以结果与"先过滤再排序"完全一致。
  */
+/**
+ * 搜索不再只看 displayName / wxId, 还覆盖:
+ * - 备注 (remarkName)
+ * - 昵称拼音全拼 (nicknamePinyin) 与首字母 (initialNickname, 来自微信数据库)
+ * - 备注 / 昵称的拼音全拼与首字母 (用 ICU 现转, 设备不支持时跳过)
+ *
+ * 拼成一段小写 blob, 查询串在 blob 里 contains 即命中。首字母 (如 "zhs") 也作为一段
+ * 拼进 blob, 所以输入首字母也能命中 (纯 contains 即可, 不必单独比前缀)。
+ */
+private val pinyinTransliterator: Transliterator? by lazy {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Transliterator.getInstance("Han-Latin; Any-Latin; Latin-ASCII")
+        } else {
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun toPinyin(str: String): String {
+    val t = pinyinTransliterator ?: return ""
+    return synchronized(t) { t.transliterate(str) }.lowercase()
+}
+
+private fun pinyinInitials(str: String): String {
+    val full = toPinyin(str)
+    if (full.isEmpty()) return ""
+    return full.split(Regex("[^a-z]+"))
+        .filter { it.isNotEmpty() }
+        .joinToString("") { it.first().toString() }
+}
+
+private val searchBlobCache = ConcurrentHashMap<String, String>()
+
+private fun buildSearchBlob(contact: IWeContact): String {
+    val sb = StringBuilder()
+    sb.append(contact.displayName).append(' ')
+    sb.append(contact.wxId).append(' ')
+    if (contact is WeContact) {
+        sb.append(contact.remarkName).append(' ')
+        sb.append(contact.customWxId).append(' ')
+        sb.append(contact.nicknamePinyin).append(' ')
+        sb.append(contact.initialNickname).append(' ')
+        val remark = contact.remarkName
+        if (remark.isNotBlank()) {
+            sb.append(toPinyin(remark)).append(' ')
+            sb.append(pinyinInitials(remark)).append(' ')
+        }
+        val nick = contact.nickname
+        if (nick.isNotBlank()) {
+            sb.append(toPinyin(nick)).append(' ')
+            sb.append(pinyinInitials(nick)).append(' ')
+        }
+    }
+    return sb.toString().lowercase()
+}
+
 private fun filterSortedContacts(sorted: List<IWeContact>, query: String): List<IWeContact> {
     if (query.isEmpty()) return sorted
+    val q = query.lowercase().trim()
+    if (q.isEmpty()) return sorted
     return sorted.filter {
-        it.displayName.contains(query, ignoreCase = true) ||
-                it.wxId.contains(query, ignoreCase = true)
+        // wxId 是稳定主键, 每个联系人只算一次 blob 并缓存, 避免每次按键都对备注做 ICU 转写。
+        searchBlobCache.getOrPut(it.wxId) { buildSearchBlob(it) }.contains(q)
     }
 }

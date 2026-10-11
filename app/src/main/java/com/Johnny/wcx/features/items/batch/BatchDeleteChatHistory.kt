@@ -34,7 +34,7 @@ object BatchDeleteChatHistory : ClickableFeature() {
     override fun onClick(context: ComponentActivity) {
         val contacts = WeDatabaseApi.getFriends() + WeDatabaseApi.getGroups()
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = "选择要删除聊天记录的对话",
                 contacts = contacts,

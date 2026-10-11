@@ -67,7 +67,7 @@ object BatchMuteConversations : ClickableFeature() {
     private fun pickAndApply(context: Context, mute: Boolean) {
         val contacts = WeDatabaseApi.getFriends() + WeDatabaseApi.getGroups()
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = if (mute) "选择要静音的对话" else "选择要取消静音的对话",
                 contacts = contacts,

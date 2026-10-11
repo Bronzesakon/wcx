@@ -549,7 +549,7 @@ object CustomLocalFriendAvatars : ClickableFeature(), IContactInfoProvider, IRes
 
     private fun showContactAvatarDialog(context: Context, wxId: String) {
         val displayName = WeDatabaseApi.getDisplayName(wxId)
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             AlertDialogContent(
                 title = { Text("自定义头像") },
                 text = {

@@ -44,7 +44,7 @@ object DeleteFakeGroups : ClickableFeature() {
             return
         }
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = context.localizedContactsQuantity(
                     R.plurals.contacts_delete_fake_select_title,

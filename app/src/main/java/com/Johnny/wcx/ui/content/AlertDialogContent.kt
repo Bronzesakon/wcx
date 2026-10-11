@@ -4,10 +4,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.LocalTextStyle
@@ -27,17 +29,18 @@ fun AlertDialogContent(
     title: @Composable (() -> Unit)?,
     text: @Composable (() -> Unit)?,
     confirmButton: (@Composable () -> Unit)? = null,
-    dismissButton: (@Composable () -> Unit)? = null
+    dismissButton: (@Composable () -> Unit)? = null,
+    fullScreen: Boolean = false
 ) {
     Surface(
-        shape = MaterialTheme.shapes.extraLarge,
-        tonalElevation = 6.dp,
-        modifier = modifier
-            .fillMaxWidth()
-            .wrapContentHeight()
+        shape = if (fullScreen) RectangleShape else MaterialTheme.shapes.extraLarge,
+        tonalElevation = if (fullScreen) 0.dp else 6.dp,
+        modifier = modifier.then(
+            if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
+        )
     ) {
         Column(
-            modifier = Modifier.padding(20.dp),
+            modifier = Modifier.fillMaxSize().padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Row(
@@ -70,8 +73,7 @@ fun AlertDialogContent(
 
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 400.dp)
+                        .then(if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().heightIn(max = 400.dp))
                 ) {
                     CompositionLocalProvider(
                         LocalTextStyle provides bodyStyle,

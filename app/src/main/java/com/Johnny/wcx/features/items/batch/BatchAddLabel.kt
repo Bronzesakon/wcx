@@ -54,7 +54,7 @@ object BatchAddLabel : ClickableFeature() {
     override fun onClick(context: ComponentActivity) {
         val friends = WeDatabaseApi.getFriends()
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = "选择要打标签的好友",
                 contacts = friends,

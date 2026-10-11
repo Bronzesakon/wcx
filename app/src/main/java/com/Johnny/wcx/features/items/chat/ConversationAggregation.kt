@@ -906,7 +906,7 @@ object ConversationAggregation : ClickableFeature(),
             }
         }.getOrDefault(emptyList())
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             FolderShareTargetSelector(
                 contacts = contacts,
                 onDismiss = onDismiss,
@@ -2710,7 +2710,7 @@ object ConversationAggregation : ClickableFeature(),
                                 Button(
                                     modifier = Modifier.weight(1f),
                                     onClick = {
-                                        showComposeDialog(context) {
+                                        showComposeDialog(context, fullScreen = true) {
                                             ContactsSelector(
                                                 title = "选择对话",
                                                 contacts = remember { WeDatabaseApi.getContacts() },
@@ -2758,7 +2758,7 @@ object ConversationAggregation : ClickableFeature(),
                                         showToast("没有其他手动文件夹可移出")
                                         return@Button
                                     }
-                                    showComposeDialog(context) {
+                                    showComposeDialog(context, fullScreen = true) {
                                         val dismiss = this.onDismiss
                                         ContactsSelector(
                                             title = "选择要移出的对话",

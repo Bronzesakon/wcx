@@ -31,7 +31,7 @@ object BatchHideConversations : ClickableFeature() {
     override fun onClick(context: ComponentActivity) {
         val contacts = WeDatabaseApi.getFriends() + WeDatabaseApi.getGroups()
 
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             ContactsSelector(
                 title = "选择要隐藏的对话",
                 contacts = contacts,

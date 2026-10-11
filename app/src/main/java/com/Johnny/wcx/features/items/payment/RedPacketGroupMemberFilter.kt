@@ -140,7 +140,7 @@ object RedPacketGroupMemberFilter {
     }
 
     private fun showAddGroupDialog(context: Context, onAdded: () -> Unit) {
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             SingleContactSelector(
                 title = "选择群聊",
                 contacts = remember { WeDatabaseApi.getGroups() },
@@ -171,7 +171,7 @@ object RedPacketGroupMemberFilter {
         onUpdated: () -> Unit,
         onDeleted: () -> Unit
     ) {
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             var useWhitelist by remember { mutableStateOf(rule.useWhitelist) }
             var members by remember { mutableStateOf(rule.members.toSet()) }
             var selectingMembers by remember { mutableStateOf(false) }
