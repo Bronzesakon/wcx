@@ -170,6 +170,16 @@ fun BaseContactSelector(
     val coroutineScope = rememberCoroutineScope()
     val alphabet = remember { listOf(SELECTED_SECTION_KEY) + ('A'..'Z').map { it.toString() } + "#" }
 
+    // 打开选择器时在后台线程重建搜索索引: searchBlobCache 是跨会话的静态缓存,
+    // 用户改了备注之后如果一直沿用旧 blob 会搜不到; 但每次按键在主线程做 ICU 转写
+    // 又会卡, 所以进页面就预先算好填满缓存, 输入时直接命中。
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            searchBlobCache.clear()
+            allContacts.forEach { searchBlobCache[it.wxId] = buildSearchBlob(it) }
+        }
+    }
+
     val transliterator = remember {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -222,7 +232,7 @@ fun BaseContactSelector(
         withContext(Dispatchers.IO) {
             // 先在 IO 线程把分组字母算好, 主线程之后每次按键都只命中缓存。
             // (之后新增的联系人会在 initialOf 里按需补算, 结果一致。)
-            runCatching { allContacts.forEach { initialOf(it.displayName) } }
+            runCatching { allContacts.forEach { initialOf(it.selectorName) } }
 
             try {
                 if (WeDatabaseApi.isReady) {
@@ -476,7 +486,7 @@ fun BaseContactSelector(
             }
         } else {
             displayedContacts.groupBy { contact ->
-                if (isSelected(contact)) SELECTED_SECTION_KEY else initialOf(contact.displayName)
+                if (isSelected(contact)) SELECTED_SECTION_KEY else initialOf(contact.selectorName)
             }.toSortedMap { c1, c2 ->
                 when {
                     c1 == c2 -> 0
@@ -654,7 +664,7 @@ fun BaseContactSelector(
                                                 selected = isSelected,
                                                 onClick = { selectedLabelName = if (isSelected) null else label.labelName },
                                                 label = {
-                                                    Text("%1\$s (".format(label.labelName, labelCount))
+                                                    Text("%1\$s (%2\$d)".format(label.labelName, labelCount))
                                                 },
                                                 modifier = Modifier.height(28.dp)
                                             )
@@ -700,7 +710,7 @@ fun BaseContactSelector(
                                                         selectedGroupingId = if (isSelected) null else option.id
                                                     }
                                                 },
-                                                label = { Text("%1\$s (".format(option.name, count)) },
+                                                label = { Text("%1\$s (%2\$d)".format(option.name, count)) },
                                                 modifier = Modifier.height(28.dp)
                                             )
                                         }
@@ -889,7 +899,7 @@ fun BaseContactSelector(
 
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(
-                                                text = contact.displayName,
+                                                text = contact.selectorName,
                                                 style = MaterialTheme.typography.bodyLarge
                                             )
                                             Text(
@@ -1096,13 +1106,23 @@ private class SortableContact(
  * 调用方只在联系人列表变化时调用一次, 搜索时改用 [filterSortedContacts] 在已排好序的
  * 列表上做纯字符串过滤, 避免每敲一个字就在主线程上重跑一遍 ICU 排序。
  */
+/**
+ * 选择器里代表联系人的名字: 有备注就用备注, 没备注才用昵称。
+ *
+ * 不能用 displayName —— 它是 "备注 (昵称)" 的拼合形式, 会把昵称混进展示 / 排序 /
+ * 分组首字母 / 搜索, 与「以备注为准」冲突。展示、排序、分组、搜索必须统一用它,
+ * 只改其中一处会留下"显示的是备注、却按昵称命中"的错位感。
+ */
+private val IWeContact.selectorName: String
+    get() = (this as? WeContact)?.remarkName?.takeIf { it.isNotBlank() } ?: nickname
+
 private fun sortContactsByDisplayName(contacts: List<IWeContact>): List<IWeContact> {
     if (contacts.size < 2) return contacts
     val collator = Collator.getInstance(Locale.CHINA)
     val keyCache = HashMap<String, CollationKey>()
     return contacts
         .map { contact ->
-            val name = contact.displayName
+            val name = contact.selectorName
             SortableContact(
                 contact = contact,
                 isBlankName = name.isBlank(),
@@ -1113,9 +1133,6 @@ private fun sortContactsByDisplayName(contacts: List<IWeContact>): List<IWeConta
         .map { it.contact }
 }
 
-/**
- * 在已排好序的列表上过滤。过滤保序, 所以结果与"先过滤再排序"完全一致。
- */
 /**
  * 搜索不再只看 displayName / wxId, 还覆盖:
  * - 备注 (remarkName)
@@ -1154,23 +1171,17 @@ private val searchBlobCache = ConcurrentHashMap<String, String>()
 
 private fun buildSearchBlob(contact: IWeContact): String {
     val sb = StringBuilder()
-    sb.append(contact.displayName).append(' ')
+    // 「以备注为准」: 有备注就只认备注, 没备注才退到昵称(否则没备注的联系人根本搜不到)。
+    // 因此昵称的 nicknamePinyin / initialNickname 一律不进索引 —— 否则给某人设了备注之后
+    // 还能用他的旧昵称搜到他, 正是用户不要的行为。
+    val name = contact.selectorName
+    sb.append(name).append(' ')
+    sb.append(toPinyin(name)).append(' ')
+    sb.append(pinyinInitials(name)).append(' ')
+    // wxId / 自定义微信号只作精确查找兜底, 界面不展示。
     sb.append(contact.wxId).append(' ')
     if (contact is WeContact) {
-        sb.append(contact.remarkName).append(' ')
         sb.append(contact.customWxId).append(' ')
-        sb.append(contact.nicknamePinyin).append(' ')
-        sb.append(contact.initialNickname).append(' ')
-        val remark = contact.remarkName
-        if (remark.isNotBlank()) {
-            sb.append(toPinyin(remark)).append(' ')
-            sb.append(pinyinInitials(remark)).append(' ')
-        }
-        val nick = contact.nickname
-        if (nick.isNotBlank()) {
-            sb.append(toPinyin(nick)).append(' ')
-            sb.append(pinyinInitials(nick)).append(' ')
-        }
     }
     return sb.toString().lowercase()
 }
