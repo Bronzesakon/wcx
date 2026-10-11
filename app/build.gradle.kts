@@ -39,6 +39,9 @@ android {
 
     val commitCount = getCommitCount()
     val gitHash = getGitHash()
+    // CI 发布工作流（sync-upstream.yml）注入 WCX_RELEASE_TAG，写入 BuildConfig.RELEASE_TAG
+    // 供 AppUpdater 与最新 Release 的 tag 判等，避免重复发布时每次启动都误报新版本。
+    val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
@@ -46,11 +49,12 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         // 版本号单一数据源：CI（.github/workflows/ci.yml）直接读取此处，
         // 发版时只需在此递增 versionCode / versionName
-        versionCode = 2731
-        versionName = "v273.1"
+        versionCode = 2732
+        versionName = "v273.2"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
+        buildConfigField("String", "RELEASE_TAG", "\"${ciReleaseTag.replace("\"", "\\\"")}\"")
         buildConfigField("long", "BUILD_TIMESTAMP", "${System.currentTimeMillis()}L")
         buildConfigField("boolean", "BEAUTIFY_ENABLED", "true")
     }

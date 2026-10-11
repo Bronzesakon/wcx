@@ -5,11 +5,13 @@
 -keep class com.Johnny.wcx.entry.** { *; }
 -keep class com.Johnny.wcx.application.** { *; }
 
-# ─── Feature / Hook Classes ─────────────────────────────────────────
-# Keep class structure (for reflection/Xposed callback) but allow obfuscation
--keep class com.Johnny.wcx.features.** { *; }
--keep,allowobfuscation class com.Johnny.wcx.hooks.** { *; }
--keep,allowobfuscation class com.Johnny.wcx.datas.** { *; }
+# ─── Feature / Hook / Data Classes ─────────────────────────────────
+# 不再整体 -keep：功能类由 KSP 生成的 FeaturesProvider 直接引用注册
+# （ALL_HOOK_ITEMS 列表逐项引用每个 Feature 类，见 app/build/generated/ksp/**/
+# FeaturesProvider.kt），功能名取自 @Feature 注解的 name 字段而非类名，
+# R8 只会重命名、不会误删被引用的类；删除整体 keep 后 R8 还可额外摇掉
+# 包内未被任何代码路径引用的辅助类，进一步减小体积。
+# （下方 @com.Johnny.wcx.annotations.* 成员 keep 保留，供编译期处理器使用）
 
 # Keep annotation-annotated members (used by compile-time processors)
 -keepclassmembers,allowobfuscation class * {
@@ -53,6 +55,10 @@
 # 不要全量 keep androidx.compose：Compose 依赖自带 consumer rules，
 # 全量 keep 会阻止 R8 删除未使用的 UI/运行时实现，显著增大 release APK。
 -dontwarn androidx.compose.**
+# Compose 编译器生成的单例字段由运行时按名查找，必须保住字段本身
+-keepclassmembers,allowobfuscation class **.ComposableSingletons* {
+    public static <fields>;
+}
 
 # ─── Third-party (dontwarn only, allow R8 optimization) ──────────────
 -dontwarn com.alibaba.fastjson2.**

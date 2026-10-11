@@ -30,10 +30,17 @@ object FeaturesLoader {
         val allDexItems = allFeatures.filterIsInstance<IResolveDex>()
 
         val outdatedItems = DexCacheManager.getOutdatedItems(allDexItems)
-        val validItems = allDexItems - outdatedItems.toSet()
+        val validItems = allDexItems.filter { DexCacheManager.isItemCacheValid(it) }
+        // 已定论：上次启动已经适配过、当前代码版本下结果不会再变（缓存仍不完整，
+        // 说明该功能在当前微信版本上定位不到符号）。保持禁用，但不重复弹适配框。
+        val settledItems = allDexItems - outdatedItems.toSet() - validItems.toSet()
 
-        if (outdatedItems.isNotEmpty())
-            WeLogger.i(TAG, "found ${validItems.size} valid items, ${outdatedItems.size} outdated items")
+        if (outdatedItems.isNotEmpty() || settledItems.isNotEmpty())
+            WeLogger.i(
+                TAG,
+                "found ${validItems.size} valid items, ${outdatedItems.size} outdated items, " +
+                        "${settledItems.size} settled (skipped) items"
+            )
 
         // Load what we can from cache. Items with *some* missing keys are still partially loaded —
         // their valid delegates work immediately; only the item itself is queued for re-resolution.
@@ -43,9 +50,11 @@ object FeaturesLoader {
         if (allBrokenItems.isNotEmpty())
             handleBrokenItems(allBrokenItems)
 
+        val skipItems = (allBrokenItems + settledItems).toSet()
+
         val elapsed = measureTime {
             allFeatures.forEach { feature ->
-                val isBroken = feature is IResolveDex && allBrokenItems.contains(feature)
+                val isBroken = feature is IResolveDex && skipItems.contains(feature)
 
                 if (isBroken && feature !is WeSettingsInjector) {
                     WeLogger.w(TAG, "skipping ${feature.name} — incomplete cache, awaiting re-resolution")

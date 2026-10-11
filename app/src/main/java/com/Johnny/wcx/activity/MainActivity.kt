@@ -72,12 +72,15 @@ import com.Johnny.wcx.ui.utils.theme.darkScheme
 import com.Johnny.wcx.ui.utils.theme.lightScheme
 import com.Johnny.wcx.utils.android.androidUserId
 import com.Johnny.wcx.utils.android.getEnabled
+import com.Johnny.wcx.utils.android.runOnUiThread
 import com.Johnny.wcx.utils.android.setEnabled
 import com.Johnny.wcx.utils.android.showToast
 import com.Johnny.wcx.utils.formatEpoch
 import com.Johnny.wcx.utils.hook_status.HookStatus
 import com.Johnny.wcx.utils.openInSystem
 import com.Johnny.wcx.utils.registerBshSnapshotDecompileLaunchers
+import java.io.IOException
+import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
 
@@ -91,6 +94,48 @@ class MainActivity : ComponentActivity() {
             isLaunchingWeChat = false
             finishAndRemoveTask()
         }
+    }
+
+    // 不同 root 方案 (Magisk/KernelSU/APatch) 的 su 挂载路径不同,
+    // 部分 ROM 还会裁剪应用进程的 PATH, 导致裸 "su" 直接抛 IOException,
+    // 因此按常见挂载点逐一尝试, 全部失败再交给 libsu 自动探测兜底
+    private val SU_CANDIDATES = listOf(
+        "su",
+        "/system/bin/su",
+        "/system/xbin/su",
+        "/sbin/su",
+        "/su/bin/su",
+        "/magisk/.core/bin/su",
+        "/debug_ramdisk/su",
+        "/data/adb/ksu/bin/su",
+        "/data/adb/ap/bin/su",
+    )
+
+    /**
+     * 依次尝试各候选路径拉起 su 执行命令。
+     * @param suArgs 传给 su 本身的参数 (如 -c/-mm 及其命令串), 不含 su 路径
+     * @param libsuCmd 所有 su 候选路径都无法启动时, 交给 libsu 执行的命令
+     * @return (退出码, 输出), 所有通道都拉不起 su 时返回 null
+     */
+    private fun execSu(suArgs: List<String>, libsuCmd: String): Pair<Int, String>? {
+        for (su in SU_CANDIDATES) {
+            try {
+                val proc = ProcessBuilder(su, *suArgs.toTypedArray())
+                    .redirectErrorStream(true)
+                    .start()
+                val output = proc.inputStream.bufferedReader().readText()
+                return proc.waitFor() to output.trim()
+            } catch (_: IOException) {
+                // 该路径不存在或不可执行, 继续尝试下一个候选
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return runCatching {
+            val result = Shell.cmd(libsuCmd).exec()
+            result.code to (result.out + result.err).joinToString("\n").trim()
+        }.getOrNull()
     }
 
     @Composable
@@ -163,17 +208,22 @@ class MainActivity : ComponentActivity() {
         fun rememberActivationState(): ActivationState {
             val xposedService by HookStatus.xposedService.collectAsState()
             val isHookEnabled = remember(xposedService) {
-                xposedService?.scope?.contains(PackageNames.WECHAT) == true
+                HookStatus.isActivated(this)
             }
+            val service = xposedService
 
-            return remember(isHookEnabled, xposedService) {
+            return remember(isHookEnabled, service) {
                 ActivationState(
                     isActivated = isHookEnabled,
                     title = if (isHookEnabled) "已激活" else "未激活",
-                    desc = xposedService?.let {
-                        "${it.frameworkName} ${it.frameworkVersion} " +
-                                "(${it.frameworkVersionCode}), API ${it.apiVersion}"
-                    } ?: "未检测到 Xposed 框架, 请确认已在管理器中启用模块并勾选微信",
+                    desc = if (service != null) {
+                        "${service.frameworkName} ${service.frameworkVersion} " +
+                                "(${service.frameworkVersionCode}), API ${service.apiVersion}"
+                    } else if (isHookEnabled) {
+                        "Xposed 框架已注入（分身环境，状态检测受限）"
+                    } else {
+                        "未检测到 Xposed 框架, 请确认已在管理器中启用模块并勾选微信"
+                    },
                     color = if (isHookEnabled) Color(0xFF4CAF50) else Color(0xFFF44336)
                 )
             }
@@ -343,22 +393,30 @@ class MainActivity : ComponentActivity() {
 
                 ElevatedCard(
                     onClick = {
-                        if (!(Shell.isAppGrantedRoot() ?: false)) {
-                            showNoRootDialog = true
-                        } else {
-                            val userId = androidUserId
-                            val hostPkg =
-                                prefs.getString("host_pkg_name", PackageNames.WECHAT)!!
-                            Shell.cmd(
-                                "am force-stop --user $userId $hostPkg",
-                                "am start --user $userId -n $hostPkg/${PackageNames.WECHAT}.ui.LauncherUI"
-                            ).submit { result ->
-                                if (result.isSuccess) {
-                                    finishAndRemoveTask()
-                                } else {
-                                    shortcutError = (result.out + result.err)
-                                        .joinToString("\n")
-                                        .ifBlank { "无法启动微信 (包名: $hostPkg)" }
+                        val userId = androidUserId
+                        val hostPkg =
+                            prefs.getString("host_pkg_name", PackageNames.WECHAT)!!
+                        // 不用 Shell.isAppGrantedRoot() 的过期缓存, 每次点击直接实时拉起 su
+                        thread {
+                            val forceStopCmd =
+                                "am force-stop --user $userId $hostPkg && " +
+                                        "am start --user $userId -n $hostPkg/${PackageNames.WECHAT}.ui.LauncherUI"
+                            val outcome = execSu(listOf("-c", forceStopCmd), forceStopCmd)
+
+                            runOnUiThread {
+                                when {
+                                    outcome == null ->
+                                        shortcutError = "无法拉起 su: 本应用可能被 root 管理器的" +
+                                                "排除名单(DenyList)/隐藏应用屏蔽, 或设备未 root。请检查后重试"
+                                    outcome.first == 0 ->
+                                        finishAndRemoveTask()
+                                    outcome.second.isEmpty() ||
+                                            outcome.second.contains("denied", ignoreCase = true) ||
+                                            outcome.second.contains("not found", ignoreCase = true) ->
+                                        showNoRootDialog = true
+                                    else ->
+                                        shortcutError = outcome.second
+                                            .ifBlank { "无法启动微信 (包名: $hostPkg)" }
                                 }
                             }
                         }
@@ -516,21 +574,34 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             Button(onClick = {
                                 showConfirmDeleteTinkerDialog = false
-                                if (!(Shell.isAppGrantedRoot() ?: false)) {
-                                    showNoRootDialog = true
-                                } else {
-                                    paths.forEach { path ->
-                                        ProcessBuilder(
-                                            "su", "-mm", "-c",
+                                // 不用 isAppGrantedRoot() 的过期缓存, 直接拉起 su 实时判定
+                                thread {
+                                    val failed = paths.mapNotNull { path ->
+                                        val cmd =
                                             "if [ -d '$path' ]; then " +
                                                     "find '$path' -mindepth 1 -exec rm -rf {} + ; " +
                                                     "chmod -R 000 '$path' ; " +
                                                     "fi"
-                                        )
-                                            .redirectErrorStream(true)
-                                            .start()
+                                        when (val r = execSu(listOf("-mm", "-c", cmd), cmd)) {
+                                            null -> path to "无法拉起 su (可能被 root 管理器排除名单屏蔽或未 root)"
+                                            else -> if (r.first == 0) null else path to r.second
+                                        }
                                     }
-                                    showToast(this@MainActivity, "操作成功!")
+                                    runOnUiThread {
+                                        when {
+                                            failed.isEmpty() ->
+                                                showToast(this@MainActivity, "操作成功!")
+                                            failed.any { (_, output) ->
+                                                output.isEmpty() ||
+                                                        output.contains("denied", ignoreCase = true) ||
+                                                        output.contains("not found", ignoreCase = true)
+                                            } -> showNoRootDialog = true
+                                            else ->
+                                                shortcutError = failed.joinToString("\n") { (path, output) ->
+                                                    "$path: $output"
+                                                }
+                                        }
+                                    }
                                 }
                             }) { Text("确定") }
                         })
@@ -563,16 +634,30 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             Button(onClick = {
                                 showConfirmDeleteModuleDataDialog = false
-                                if (!(Shell.isAppGrantedRoot() ?: false)) {
-                                    showNoRootDialog = true
-                                } else {
-                                    // if using Shell.cmd or su -c without -mm, the view of /data/user/0 is restricted
-                                    paths.forEach { path ->
-                                        ProcessBuilder("su", "-mm", "-c", "rm -rf $path")
-                                            .redirectErrorStream(true)
-                                            .start()
+                                // 不用 isAppGrantedRoot() 的过期缓存, 直接拉起 su 实时判定
+                                thread {
+                                    val failed = paths.mapNotNull { path ->
+                                        // if using Shell.cmd or su -c without -mm, the view of /data/user/0 is restricted
+                                        when (val r = execSu(listOf("-mm", "-c", "rm -rf $path"), "rm -rf $path")) {
+                                            null -> path to "无法拉起 su (可能被 root 管理器排除名单屏蔽或未 root)"
+                                            else -> if (r.first == 0) null else path to r.second
+                                        }
                                     }
-                                    showToast(this@MainActivity, "删除成功!")
+                                    runOnUiThread {
+                                        when {
+                                            failed.isEmpty() ->
+                                                showToast(this@MainActivity, "删除成功!")
+                                            failed.any { (_, output) ->
+                                                output.isEmpty() ||
+                                                        output.contains("denied", ignoreCase = true) ||
+                                                        output.contains("not found", ignoreCase = true)
+                                            } -> showNoRootDialog = true
+                                            else ->
+                                                shortcutError = failed.joinToString("\n") { (path, output) ->
+                                                    "$path: $output"
+                                                }
+                                        }
+                                    }
                                 }
                             }) { Text("确定") }
                         })
@@ -610,17 +695,10 @@ class MainActivity : ComponentActivity() {
                 )
 
                 LinkCard(
-                    icon = MaterialSymbols.Outlined.Chat,
-                    title = "交流群组",
-                    subtitle = "https://t.me/wcx12138",
-                    onClick = { onUrlClick("https://t.me/wcx12138") }
-                )
-
-                LinkCard(
                     icon = GitHubIcon,
                     title = "GitHub",
-                    subtitle = "Johnny520/wcx",
-                    onClick = { onUrlClick("https://github.com/Johnny520/wcx") }
+                    subtitle = "dostume/wcx",
+                    onClick = { onUrlClick("https://github.com/dostume/wcx") }
                 )
             }
 
@@ -634,7 +712,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(modifier = Modifier.height(8.dp))
                             Text("版本: ${BuildConfig.VERSION_NAME}")
                             Text("版本号: ${BuildConfig.VERSION_CODE}")
-                            Text("作者：Johnny520@github")
+                            Text("作者：dostume@github")
                         }
                     },
                     confirmButton = {

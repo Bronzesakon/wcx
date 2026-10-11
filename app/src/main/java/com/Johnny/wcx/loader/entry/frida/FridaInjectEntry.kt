@@ -5,6 +5,7 @@ import android.app.ActivityThread
 import android.util.Log
 import androidx.annotation.Keep
 import com.Johnny.wcx.loader.entry.common.ModuleLoader
+import com.Johnny.wcx.utils.WeLogger
 import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
@@ -22,7 +23,7 @@ object FridaInjectEntry {
             startup(File(modulePath), hostData, xblService)
         }.onFailure { e ->
             val cause = e.unwrapIte()
-            Log.e(TAG, "FridaInjectEntry.entry3: failed", cause)
+            WeLogger.e(TAG, "FridaInjectEntry.entry3: failed", cause)
             throw cause
         }
     }
@@ -34,7 +35,7 @@ object FridaInjectEntry {
             startup(File(modulePath), File(hostDataDir), null)
         }.onFailure { e ->
             val cause = e.unwrapIte()
-            Log.e(TAG, "FridaInjectEntry.entry2: failed", cause)
+            WeLogger.e(TAG, "FridaInjectEntry.entry2: failed", cause)
             throw cause
         }
     }
@@ -46,7 +47,7 @@ object FridaInjectEntry {
             startup(File(modulePath), findHostDataDir(), null)
         }.onFailure { e ->
             val cause = e.unwrapIte()
-            Log.e(TAG, "FridaInjectEntry.entry1: failed", cause)
+            WeLogger.e(TAG, "FridaInjectEntry.entry1: failed", cause)
             throw cause
         }
     }
@@ -96,7 +97,7 @@ object FridaInjectEntry {
             runCatching {
                 entry3(modulePath, hostDataDir, xblService)
             }.onFailure { e ->
-                Log.e(TAG, "FridaInjectEntry.EntryRunnableV3: failed", e)
+                WeLogger.e(TAG, "FridaInjectEntry.EntryRunnableV3: failed", e)
             }
         }
     }

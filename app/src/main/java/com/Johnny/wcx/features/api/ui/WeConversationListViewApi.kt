@@ -124,11 +124,11 @@ object WeConversationListViewApi : ApiFeature(), IResolveDex {
             val bindContext = BindContext(
                 position = position,
                 itemCount = adapter.count,
-                previousConversation = if (position > 0) adapter.getItem(position - 1) else null,
-                nextConversation = if (position + 1 < adapter.count) adapter.getItem(position + 1) else null,
+                previousConversation = if (position > 0) runCatching { adapter.getItem(position - 1) }.getOrNull() else null,
+                nextConversation = if (position + 1 < adapter.count) runCatching { adapter.getItem(position + 1) }.getOrNull() else null,
             )
             if (latestAdapter?.get() !== adapter) latestAdapter = WeakReference(adapter)
-            (args[2] as? ListView)?.let { listView ->
+            (args.getOrNull(2) as? ListView)?.let { listView ->
                 if (latestListView?.get() !== listView) latestListView = WeakReference(listView)
             }
 

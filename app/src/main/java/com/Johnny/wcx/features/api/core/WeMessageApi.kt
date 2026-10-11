@@ -612,6 +612,56 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     }
 
     /**
+     * 按本地 msgId 从 message 表加载完整的 MsgInfo 实例（微信自身 convertFrom 填充全部字段）。
+     * 多选等 UI 场景拿到的消息对象可能只填充了部分字段，用此方法可换取权威数据。
+     * @return 完整的微信 MsgInfo 实例；查不到或出错返回 null
+     */
+    fun getMsgInfoInstanceByMsgId(msgId: Long): Any? {
+        return try {
+            WeDatabaseApi.rawQuery("SELECT * FROM message WHERE msgId=?", arrayOf(msgId)).use { cursor ->
+                if (cursor.moveToFirst()) convertMsgInfoInstanceFromCursor(cursor) else null
+            }
+        } catch (e: Exception) {
+            WeLogger.e(TAG, "getMsgInfoInstanceByMsgId failed (msgId=$msgId)", e)
+            null
+        }
+    }
+
+    /**
+     * 兜底匹配: 按会话+创建时间+类型+发送方向定位本地 msgId。
+     * 用于消息对象连 msgId 都缺失的场景；同秒多条同类型消息时可能匹配到相邻那条。
+     */
+    fun findMsgIdByAttributes(talker: String, createTime: Long, typeCode: Int, isSend: Int): Long? {
+        if (talker.isBlank() || createTime <= 0L) return null
+        return try {
+            WeDatabaseApi.rawQuery(
+                "SELECT msgId FROM message WHERE talker=? AND createTime=? AND type=? AND isSend=? ORDER BY msgId LIMIT 1",
+                arrayOf(talker, createTime, typeCode, isSend)
+            ).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getLong(0) else null
+            }
+        } catch (e: Exception) {
+            WeLogger.e(TAG, "findMsgIdByAttributes failed (talker=$talker, createTime=$createTime, type=$typeCode)", e)
+            null
+        }
+    }
+
+    /**
+     * 按相对路径解析已落地的 image2 大图文件（不触发 CDN 下载）。
+     * @return 绝对路径；文件不存在或路径非法（如 THUMBNAIL 缩略图）返回 null
+     */
+    fun resolveExistingImageByPath(bigImgPath: String): String? {
+        if (bigImgPath.isBlank() || bigImgPath.startsWith("THUMBNAIL")) return null
+        return runCatching {
+            resolveImageFile(bigImgPath)
+                ?.takeIf { it.isRegularFile() && it.fileSize() > 0 }
+                ?.absolutePathString()
+        }.onFailure {
+            WeLogger.e(TAG, "resolveExistingImageByPath failed for $bigImgPath", it)
+        }.getOrNull()
+    }
+
+    /**
      * 通过 msgSvrId 反查 talker。仅查 message 表 (C2C/群聊); 企业微信、小程序消息等不在此表中会返回 null。
      */
     fun getTalkerByMsgSvrId(msgSvrId: Long): String? {
@@ -1797,7 +1847,10 @@ object WeMessageApi : ApiFeature(), IResolveDex {
      * 在真正写入文件字节 *之前* 就从 SERVERID:// 改写为最终文件名, 所以只能以磁盘上文件是否存在为准。
      */
     private fun ensureImageCachedFile(msgSvrId: Long): Path? {
-        val baseRow = queryImgInfoRow(msgSvrId) ?: return null
+        val baseRow = queryImgInfoRow(msgSvrId) ?: run {
+            WeLogger.w(TAG, "no ImgInfo2 row for msgSvrId=$msgSvrId")
+            return null
+        }
 
         // 有原图行则优先下载原图, 否则退回基础行
         val targetRow = baseRow.hdImgId.takeIf { it > 0 }
@@ -1808,9 +1861,24 @@ object WeMessageApi : ApiFeature(), IResolveDex {
         // 已在磁盘上则直接返回
         resolveExistingImageFile(targetRow)?.let { return it }
 
-        // 触发 CDN 下载, 轮询直到文件真正落地。talker 用基础行的 (原图行可能未存 msgTalker)。
-        if (!triggerDownload(targetRow.localId, targetRow.talker.ifEmpty { baseRow.talker })) return null
-        return pollUntilImageFileExists(targetRow.localId)
+        val talker = targetRow.talker.ifEmpty { baseRow.talker }
+        WeLogger.i(TAG, "start cdn download: svrId=$msgSvrId localId=${targetRow.localId} talker=$talker")
+
+        // 分 3 轮触发下载并各轮询 20 秒: 实测单次触发可能被微信静默丢弃, 周期性重发更可靠;
+        // 总超时 60 秒 (原先单次触发 + 空轮询 120 秒)
+        repeat(3) { round ->
+            if (!triggerDownload(targetRow.localId, talker)) {
+                WeLogger.w(TAG, "triggerDownload invoke failed (round ${round + 1}, svrId=$msgSvrId)")
+            }
+            val deadline = System.currentTimeMillis() + 20_000
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(1000)
+                val row = queryImgInfoRowById(targetRow.localId) ?: continue
+                resolveExistingImageFile(row)?.let { return it }
+            }
+            WeLogger.w(TAG, "image not landed after round ${round + 1} (svrId=$msgSvrId)")
+        }
+        return null
     }
 
     /**
@@ -1869,16 +1937,6 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     }
 
     /** 轮询直到该 ImgInfo2 行的图片文件真正落地到磁盘 (以文件存在为准, 而非 iscomplete 标志)。 */
-    private fun pollUntilImageFileExists(imgLocalId: Long): Path? {
-        val deadline = System.currentTimeMillis() + 120_000
-        while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(1000)
-            val row = queryImgInfoRowById(imgLocalId) ?: continue
-            resolveExistingImageFile(row)?.let { return it }
-        }
-        return null
-    }
-
     private fun decodeAndSave(file: Path): String? {
         return try {
             val bytes = file.readBytes()
@@ -2095,6 +2153,22 @@ object WeMessageApi : ApiFeature(), IResolveDex {
      * 下载文件 (直接使用已有的 msgInfo 实例): 先确保文件已缓存到微信内部, 再拷贝到 Download/WCX/。
      * @return 拷贝到 Download/WCX/ 后的绝对路径, 失败返回 null
      */
+    /**
+     * 仅解析本地已完整缓存的文件路径 (纯查库, 不触发下载), 供创建定时任务时做瞬时检查。
+     * 文件未缓存时返回 null, 由调用方决定是否记为引用段延迟到发送时处理。
+     */
+    fun resolveExistingFilePath(msgInfoInstance: Any): String? {
+        return try {
+            val mi = MessageInfo(msgInfoInstance)
+            queryAppAttach(mi.id, mi.talker)
+                ?.takeIf { it.isComplete && !it.fileFullPath.isNullOrEmpty() }
+                ?.fileFullPath
+        } catch (e: Exception) {
+            WeLogger.e(TAG, "resolveExistingFilePath failed", e)
+            null
+        }
+    }
+
     fun downloadFile(msgInfoInstance: Any): String? {
         return try {
             val cachedPath = cacheFile(msgInfoInstance) ?: run {

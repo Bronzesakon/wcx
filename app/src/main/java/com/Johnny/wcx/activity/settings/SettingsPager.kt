@@ -85,6 +85,7 @@ import com.composables.icons.materialsymbols.outlined.Style
 import com.composables.icons.materialsymbols.outlined.Sync
 import com.composables.icons.materialsymbols.outlined.Update
 import com.composables.icons.materialsymbols.outlined.Upload
+import com.composables.icons.materialsymbols.outlined.Volume_off
 import com.composables.icons.materialsymbols.outlined.Volunteer_activism
 import com.composables.icons.materialsymbols.outlined.Wallpaper
 import com.composables.icons.materialsymbols.outlined.Qr_code
@@ -163,13 +164,11 @@ fun SettingsPager(onOpenLicense: () -> Unit, onOpenAcknowledgements: () -> Unit)
     var updateInfo by remember { mutableStateOf<UpdateResult.UpdateAvailable?>(null) }
     var updateError by remember { mutableStateOf<String?>(null) }
     var showChangelog by remember { mutableStateOf(false) }
-    var showDonate by remember { mutableStateOf(false) }
 
     ClearConfigDialog(show = showClearConfirm, onDismiss = { showClearConfirm = false })
     UpdateAvailableDialog(info = updateInfo, onDismiss = { updateInfo = null }, context = context)
     UpdateErrorDialog(message = updateError, onDismiss = { updateError = null })
     ChangelogDialog(show = showChangelog, onDismiss = { showChangelog = false }, context = context)
-    DonateDialog(show = showDonate, onDismiss = { showDonate = false }, context = context)
 
     MiuixListScaffold(title = "设置") {
         // Account info card — shown at top of Settings tab.
@@ -203,6 +202,13 @@ fun SettingsPager(onOpenLicense: () -> Unit, onOpenAcknowledgements: () -> Unit)
         item {
             MiuixSmallTitle(text = "调试", modifier = Modifier.padding(top = 12.dp))
             Card(modifier = Modifier.fillMaxWidth()) {
+                PrefSwitch(
+                    key = Preferences.DISABLE_ALL_LOGS,
+                    title = "关闭所有日志",
+                    summary = "开启后不输出、不记录任何模块日志 (logcat 与日志文件), 可减少性能开销与隐私暴露",
+                    icon = MaterialSymbols.Outlined.Volume_off,
+                    onChanged = { com.Johnny.wcx.utils.WeLogger.setLogsDisabledFlag(it) },
+                )
                 PrefSwitch(
                     key = Preferences.VERBOSE_LOG,
                     title = "详细日志",
@@ -316,12 +322,6 @@ fun SettingsPager(onOpenLicense: () -> Unit, onOpenAcknowledgements: () -> Unit)
                     icon = MaterialSymbols.Outlined.Lightbulb_2,
                 )
                 PrefArrow(
-                    title = "捐赠",
-                    summary = "支持项目开发 (模块完全开源免费, 捐赠无特权)",
-                    icon = MaterialSymbols.Outlined.Volunteer_activism,
-                    onClick = { showDonate = true },
-                )
-                PrefArrow(
                     title = "开放源代码许可",
                     summary = "本项目使用的开放源代码库许可",
                     icon = MaterialSymbols.Outlined.License,
@@ -329,19 +329,9 @@ fun SettingsPager(onOpenLicense: () -> Unit, onOpenAcknowledgements: () -> Unit)
                 )
                 PrefArrow(
                     title = "GitHub",
-                    summary = "Johnny520/wcx",
+                    summary = "dostume/wcx",
                     icon = GitHubIcon,
-                    onClick = { "https://github.com/Johnny520/wcx".toUri().openInSystem(context, true) })
-                PrefArrow(
-                    title = "TG 群组",
-                    summary = "@wcx12138",
-                    icon = MaterialSymbols.Outlined.Send,
-                    onClick = { "https://t.me/wcx12138".toUri().openInSystem(context, true) })
-                PrefArrow(
-                    title = "项目主页",
-                    summary = "https://johnny520.github.io/Johnny/",
-                    icon = MaterialSymbols.Outlined.Public,
-                    onClick = { "https://johnny520.github.io/Johnny/".toUri().openInSystem(context, true) })
+                    onClick = { "https://github.com/dostume/wcx".toUri().openInSystem(context, true) })
             }
         }
 
@@ -601,6 +591,7 @@ private fun PrefSwitch(
     title: String,
     summary: String,
     icon: ImageVector,
+    onChanged: ((Boolean) -> Unit)? = null,
 ) {
     var checked by remember { mutableStateOf(WePrefs.getBoolOrFalse(key)) }
     SwitchPreference(
@@ -611,6 +602,7 @@ private fun PrefSwitch(
         onCheckedChange = {
             checked = it
             WePrefs.putBool(key, it)
+            onChanged?.invoke(it)
         },
     )
 }
@@ -1003,48 +995,6 @@ private fun MiuixMessageDialog(
     }
 }
 
-
-@Composable
-private fun DonateDialog(show: Boolean, onDismiss: () -> Unit, context: Context) {
-    WindowDialog(show = show, title = "捐赠支持", onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-        ) {
-
-            Card(modifier = Modifier.fillMaxWidth(), onClick = {
-                "https://ifdian.net/a/Johnny520".toUri().openInSystem(context, true)
-            }) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(Color(0xFFE85D04)),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(text = "爱", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        }
-                        Spacer(Modifier.width(12.dp))
-                        Column {
-                            Text(text = "爱发电", fontWeight = FontWeight.SemiBold, color = MiuixTheme.colorScheme.onSurface)
-                            Text(text = "点击跳转至爱发电页面", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-            TextButton(
-                text = "关闭",
-                onClick = onDismiss,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.textButtonColorsPrimary(),
-            )
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 //  Open-source license screen

@@ -46,6 +46,7 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.luckypray.dexkit.DexKitBridge
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -69,6 +70,21 @@ private sealed class DialogPhase {
 }
 
 private val TAG = "DexResolver"
+
+/**
+ * 单项适配的超时上限。
+ *
+ * DexKit 的全量查找是 native 调用，遇到不匹配的微信版本可能长时间不返回
+ * （线程挂死、不抛异常）。没有超时的话整个适配流程会永远停在「N/total」，
+ * 用户看到的就是「卡在适配中」，重启也不会好。超时后按失败处理并继续下一项。
+ */
+private const val ITEM_TIMEOUT_MS = 120_000L
+
+/**
+ * 适配并发度：每项都会在 native 层做一次全量 dex 查找，并发过高时内存与
+ * native 压力过大（微信闪退）。降到 3，牺牲一些速度换稳定。
+ */
+private const val SCAN_CONCURRENCY = 3
 
 @Composable
 fun DexResolver(
@@ -109,9 +125,28 @@ fun DexResolver(
         return try {
             progressChannel.send(ScanProgress.Start(displayName))
 
-            item.resolveAllDex(dexKit)
+            // 逐项超时：DexKit 是 native 调用，挂住时不抛异常也不返回，
+            // 没有这层保护整个适配会永远停在当前进度上。
+            val ok = withTimeoutOrNull(ITEM_TIMEOUT_MS) {
+                item.resolveAllDex(dexKit)
 
-            DexCacheManager.saveItemCache(item)
+                DexCacheManager.saveItemCache(item)
+
+                // 保存后复检：若校验仍不通过（如部分委托未解析出任何结果），如实上报失败，
+                // 而不是显示「成功」后下次启动又弹「需要更新 DEX 缓存」的死循环
+                if (!DexCacheManager.isItemCacheValid(item)) {
+                    val unresolvedKeys = item.dexDelegates
+                        .filter { it.getDescriptorString().isNullOrEmpty() }
+                        .joinToString(", ") { it.key }
+                    throw IllegalStateException(
+                        "适配结果不完整, 未解析: ${unresolvedKeys.ifEmpty { "(未知)" }}"
+                    )
+                }
+                true
+            }
+            if (ok != true) {
+                throw IllegalStateException("适配超时 (${ITEM_TIMEOUT_MS / 1000}s), 已跳过该项")
+            }
             progressChannel.send(ScanProgress.Complete(displayName))
             ScanResult.Success(displayName)
         } catch (e: Exception) {
@@ -143,7 +178,7 @@ fun DexResolver(
                             )
                         }
                     }
-                    .buffer(8)
+                    .buffer(SCAN_CONCURRENCY)
                     .map { it.await() }
                     .toList()
 
