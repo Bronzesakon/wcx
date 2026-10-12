@@ -107,12 +107,9 @@ object AutoCacheImages : ClickableFeature(),
         // 自己发出的图片本身就在本地, 无需缓存
         if (values.getAsInteger("isSend") == 1) return
 
-        val talker = values.getAsString("talker") ?: run {
-            WeLogger.w(TAG, "image insert without talker, skip")
-            return
-        }
+        val talker = values.getAsString("talker")
         if (!passesListFilter(talker)) {
-            WeLogger.d(TAG, "image insert: talker $talker filtered out, skip")
+            WeLogger.d(TAG, "image insert: talker=$talker filtered out (or unresolved with active filter), skip")
             return
         }
 
@@ -170,12 +167,8 @@ object AutoCacheImages : ClickableFeature(),
 
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
-            ?: run {
-                WeLogger.w(TAG, "image msg $msgSvrId: cannot resolve talker, skip")
-                return
-            }
         if (!passesListFilter(talker)) {
-            WeLogger.d(TAG, "image msg $msgSvrId: talker $talker filtered out, skip")
+            WeLogger.d(TAG, "image msg $msgSvrId: talker=$talker filtered out (or unresolved with active filter), skip")
             return
         }
 
@@ -223,15 +216,34 @@ object AutoCacheImages : ClickableFeature(),
     private fun startCompensation() {
         scope.launch {
             delay(30_000)
+            var dbFailStreak = 0
             while (isActive) {
-                scanRecentMessages()
+                val scanned = scanRecentMessages()
                 retryPending()
-                delay(SCAN_INTERVAL_MS)
+                // db 未就绪 (重置 dex 缓存后的重适配窗口内 getStorage hook 不触发) 时
+                // 逐步加快重试, 最短 ~15s 一轮; 就绪后回到正常周期
+                dbFailStreak = if (scanned) 0 else dbFailStreak + 1
+                val interval = if (dbFailStreak > 0) {
+                    minOf(15_000L * dbFailStreak, SCAN_INTERVAL_MS)
+                } else {
+                    SCAN_INTERVAL_MS
+                }
+                delay(interval)
             }
         }
     }
 
-    private suspend fun scanRecentMessages() {
+    /** @return false 表示本轮因 db 未就绪/查询失败没有扫描, 调用方应加快重试。 */
+    private suspend fun scanRecentMessages(): Boolean {
+        if (!WeDatabaseApi.isReady) {
+            // hook 安装时微信可能早已调用过 getStorage(), hookAfter 永不触发;
+            // 按需主动初始化, 仍失败则本轮跳过 (重适配窗口), 稍后重试。
+            WeDatabaseApi.ensureDatabase()
+            if (!WeDatabaseApi.isReady) {
+                WeLogger.w(TAG, "compensation scan skipped: database not ready yet, will retry sooner")
+                return false
+            }
+        }
         val since = System.currentTimeMillis() - SCAN_WINDOW_MS
         val svrIds = try {
             WeDatabaseApi.rawQuery(
@@ -246,7 +258,7 @@ object AutoCacheImages : ClickableFeature(),
             }
         } catch (e: Exception) {
             WeLogger.e(TAG, "compensation scan query failed", e)
-            return
+            return false
         }
         WeLogger.i(TAG, "compensation scan: ${svrIds.size} recent image message(s) since $since")
         var launched = 0
@@ -258,6 +270,7 @@ object AutoCacheImages : ClickableFeature(),
             cacheWithRetry(svrId, "scan")
         }
         WeLogger.i(TAG, "compensation scan done: launched $launched/${svrIds.size}")
+        return true
     }
 
     private fun retryPending() {
@@ -273,12 +286,16 @@ object AutoCacheImages : ClickableFeature(),
         }
     }
 
-    private fun passesListFilter(talker: String): Boolean {
-        return if (useWhitelist) {
-            talker in whitelist
-        } else {
-            talker !in blacklist
-        }
+    /**
+     * 名单过滤; [talker] 为 null (事件未携带且反查失败, 如 db 未就绪) 时:
+     * 未配置名单直接放行 —— talker 本就只用于名单过滤, 不该因拿不到它就把消息丢掉;
+     * 已配置名单则保守跳过, 由补偿轮在 db 就绪后重新扫到。
+     */
+    private fun passesListFilter(talker: String?): Boolean {
+        val filterActive = if (useWhitelist) whitelist.isNotEmpty() else blacklist.isNotEmpty()
+        if (!filterActive) return true
+        if (talker == null) return false
+        return if (useWhitelist) talker in whitelist else talker !in blacklist
     }
 
     override fun onClick(context: ComponentActivity) {

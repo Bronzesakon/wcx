@@ -104,7 +104,7 @@ jobs:
       - name: Read version from build.gradle.kts
         id: version
         # 版本号单一数据源, 与 ci.yml 完全一致 —— 两个工作流必须发布同一个 tag,
-        # 否则会出现「应用内显示 v277 / Releases 页面却是别的版本」的不一致。
+        # 否则会出现「应用内显示 v278 / Releases 页面却是别的版本」的不一致。
         run: |
           VERSION_CODE=$(grep -oE 'versionCode[[:space:]]*=[[:space:]]*[0-9]+' app/build.gradle.kts | grep -oE '[0-9]+$')
           echo "tag=v${VERSION_CODE}" >> "$GITHUB_OUTPUT"
@@ -144,7 +144,24 @@ jobs:
 
             基线为上游 v273，保留本仓库自建功能 + 联系人选择器改进。
 
-            ### 本版修复（v277）
+            ### 本版修复（v278）
+
+            - **重置 dex 缓存后自动缓存扫描整轮失败**（设备日志实锤，主微信/分身均复现）：
+              手动重置适配信息会触发全量重适配，该窗口内 `WeDatabaseApi` 的
+              getStorage hook 尚未安装，或安装时微信早已调用过 getStorage
+              （hookAfter 永不触发），`db` 一直处于未初始化状态，
+              补偿扫描连续报 `lateinit property db has not been initialized` 整轮报废，
+              期间收到的文件/图片全部漏下载；
+              现新增 **ensureDatabase() 按需初始化**：首次真正需要数据库时主动调用
+              getStorage 补取 db，rawQuery/delete/executeQuery 入口统一兜底
+            - **扫描失败快速重试**：db 未就绪时不再死等 3 分钟，按失败轮次逐步
+              加快（最短约 15s 一轮），就绪后自动回到 180s 正常周期
+            - **talker 反查失败不再丢消息**：talker 本就只用于黑白名单过滤，
+              未配置名单时即使事件未携带该列、反查失败也照常缓存；
+              已配置名单时才保守跳过，由补偿轮在 db 就绪后补扫
+              （修复日志中 `cannot resolve talker, skip` 一类误丢）
+
+            ### 上一版（v277）
 
             - **自动缓存文件 / 自动缓存图片仍有机率漏下载**（v276 补偿扫描不彻底）：
               - 补偿扫描从「只扫一次」改为**每 3 分钟持续扫描**：v276 只在开启后扫一轮，
