@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyRow
@@ -169,6 +171,12 @@ fun BaseContactSelector(
     val context = LocalContext.current
     val localizedContext = LocalContext.current
     val currentLocalizedContext = rememberUpdatedState(localizedContext)
+    // 筛选 chip / 标题 / 搜索框统一小号字。FilterChip 的 label 默认继承 bodyMedium,
+    // 这里把三行 chip (类型 / 标签 / 全选) 全部钉死 labelSmall (12sp), 标题 14sp,
+    // 搜索框用 13sp 的 TextStyle 覆盖 bodyMedium。
+    val chipTextStyle = MaterialTheme.typography.labelSmall
+    val titleStyle = MaterialTheme.typography.titleSmall
+    val searchTextStyle = MaterialTheme.typography.titleSmall.copy(fontSize = 13.sp)
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
     val alphabet = remember { listOf(SELECTED_SECTION_KEY) + ('A'..'Z').map { it.toString() } + "#" }
@@ -502,7 +510,7 @@ fun BaseContactSelector(
             .fillMaxWidth()
             .fillMaxHeight(),
         fullScreen = fullScreen,
-        title = { Text(title) },
+        title = { Text(title, style = titleStyle) },
         text = {
             Column(modifier = Modifier.fillMaxSize()) {
                 Row(
@@ -516,7 +524,8 @@ fun BaseContactSelector(
                         value = searchQuery,
                         onValueChange = onSearchQueryChange,
                         modifier = Modifier.weight(1f),
-                        placeholder = { Text("搜索昵称或备注") },
+                        placeholder = { Text("搜索昵称/备注/拼音首字母", style = searchTextStyle) },
+                        textStyle = searchTextStyle,
                         leadingIcon = {
                             Icon(
                                 MaterialSymbols.Outlined.Search,
@@ -562,6 +571,7 @@ fun BaseContactSelector(
                                         label = {
                                             Text(
                                                 "%1\$s (%2\$d)".format(displayName, count),
+                                                style = chipTextStyle,
                                             )
                                         },
                                         leadingIcon = {
@@ -616,7 +626,7 @@ fun BaseContactSelector(
                                                 selectedAggregationId = null
                                                 selectedGroupingId = null
                                             },
-                                            label = { Text(filterMode.nameRes, style = MaterialTheme.typography.labelSmall) },
+                                            label = { Text(filterMode.nameRes, style = chipTextStyle) },
                                             leadingIcon = {
                                                 Icon(
                                                     imageVector = filterMode.icon,
@@ -638,7 +648,7 @@ fun BaseContactSelector(
                                             FilterChip(
                                                 selected = isSelected,
                                                 onClick = { selectedLabelName = null },
-                                                label = { Text("不限", style = MaterialTheme.typography.labelSmall) },
+                                                label = { Text("不限", style = chipTextStyle) },
                                                 modifier = Modifier.height(28.dp)
                                             )
                                         }
@@ -650,7 +660,7 @@ fun BaseContactSelector(
                                                 selected = isSelected,
                                                 onClick = { selectedLabelName = if (isSelected) null else label.labelName },
                                                 label = {
-                                                    Text("%1\$s (%2\$d)".format(label.labelName, labelCount))
+                                                    Text("%1\$s (%2\$d)".format(label.labelName, labelCount), style = chipTextStyle)
                                                 },
                                                 modifier = Modifier.height(28.dp)
                                             )
@@ -679,7 +689,7 @@ fun BaseContactSelector(
                                                         selectedGroupingId = null
                                                     }
                                                 },
-                                                label = { Text("不限", style = MaterialTheme.typography.labelSmall) },
+                                                label = { Text("不限", style = chipTextStyle) },
                                                 modifier = Modifier.height(28.dp)
                                             )
                                         }
@@ -696,7 +706,7 @@ fun BaseContactSelector(
                                                         selectedGroupingId = if (isSelected) null else option.id
                                                     }
                                                 },
-                                                label = { Text("%1\$s (%2\$d)".format(option.name, count)) },
+                                                label = { Text("%1\$s (%2\$d)".format(option.name, count), style = chipTextStyle) },
                                                 modifier = Modifier.height(28.dp)
                                             )
                                         }
@@ -718,7 +728,7 @@ fun BaseContactSelector(
                                 FilterChip(
                                     selected = sortMode == mode,
                                     onClick = { switchSortMode(mode) },
-                                    label = { Text(displayName) },
+                                    label = { Text(displayName, style = chipTextStyle) },
                                     leadingIcon = {
                                         Icon(
                                             imageVector = mode.icon,
@@ -759,7 +769,7 @@ fun BaseContactSelector(
                             FilterChip(
                                 selected = false,
                                 onClick = { it(displayedContacts) },
-                                label = { Text("全选") },
+                                label = { Text("全选", style = chipTextStyle) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = MaterialSymbols.Outlined.Select_all,
@@ -773,7 +783,7 @@ fun BaseContactSelector(
                             FilterChip(
                                 selected = false,
                                 onClick = { it(displayedContacts) },
-                                label = { Text("全不选") },
+                                label = { Text("全不选", style = chipTextStyle) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = MaterialSymbols.Outlined.Deselect,
@@ -787,7 +797,7 @@ fun BaseContactSelector(
                             FilterChip(
                                 selected = false,
                                 onClick = { it(displayedContacts) },
-                                label = { Text("反选") },
+                                label = { Text("反选", style = chipTextStyle) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = MaterialSymbols.Outlined.Compare_arrows,
