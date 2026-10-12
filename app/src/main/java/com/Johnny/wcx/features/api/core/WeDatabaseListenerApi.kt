@@ -34,6 +34,29 @@ object WeDatabaseListenerApi : ApiFeature() {
         fun allowInsert(table: String, values: ContentValues): Boolean
     }
 
+    /**
+     * 从 update 事件提取被更新行的 msgId。
+     *
+     * update hook 触发时 (hookBefore) 微信尚未写库, 且 [android.content.ContentValues]
+     * 只含被更新的列 —— 主键 msgId 与不变列 (type/msgSvrId) 通常不在其中,
+     * 只能借助 whereClause ("msgId=?") + whereArgs 反推。
+     * 提取顺序: values 自带 msgid 列 → whereClause 指向 msgId 时取 whereArgs 首个可解析数字。
+     */
+    fun extractMsgIdFromUpdate(
+        values: ContentValues,
+        whereClause: String?,
+        whereArgs: Array<String>?
+    ): Long? {
+        values.getAsLong("msgid")?.takeIf { it > 0L }?.let { return it }
+        values.getAsLong("msgId")?.takeIf { it > 0L }?.let { return it }
+        val clause = whereClause?.replace(" ", "")?.lowercase() ?: return null
+        if (!clause.contains("msgid")) return null
+        whereArgs?.forEach { arg ->
+            arg?.toLongOrNull()?.takeIf { it > 0L }?.let { return it }
+        }
+        return null
+    }
+
     private const val TAG = "WeDatabaseListenerApi"
 
     private val insertListeners = CopyOnWriteArrayList<IInsertListener>()

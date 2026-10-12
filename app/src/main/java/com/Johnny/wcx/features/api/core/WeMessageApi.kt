@@ -2097,6 +2097,65 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     }
 
     /**
+     * 按本地 msgId 缓存文件, 可附带 update 事件带来的新 content。
+     *
+     * 供数据库 update 钩子 (hookBefore, 微信尚未写库) 使用: 此刻按 msgId 查库拿到的是旧行,
+     * 但 msgSvrId/talker/type/isSend/createTime 均为不随 content 更新而变的稳定列, 旧值即新值;
+     * content 若随本次 update 变化 (如"对方上传中"占位 → 完整 appmsg XML), 必须以 [freshContent] 为准,
+     * 否则会用旧 content 触发下载必然失败。
+     *
+     * @param msgId 本地 msgId (message 表主键)
+     * @param freshContent update 事件 ContentValues 中携带的新 content; 为 null 时使用库中 content
+     * @return 缓存后文件在微信内部的绝对路径, 失败返回 null
+     */
+    fun cacheFileByMsgId(msgId: Long, freshContent: String? = null): String? {
+        return try {
+            if (msgId <= 0L) return null
+            val row = WeDatabaseApi.rawQuery(
+                "SELECT msgSvrId, talker, type, status, createTime, isSend, content FROM message WHERE msgId=?",
+                arrayOf<Any>(msgId)
+            ).use { cursor ->
+                if (!cursor.moveToFirst()) null else MessageRow(cursor)
+            } ?: run {
+                WeLogger.w(TAG, "cacheFileByMsgId: no message row for msgId=$msgId")
+                return null
+            }
+            if (row.isSend == 1) return null
+
+            val content = freshContent?.takeIf { it.isNotBlank() } ?: row.content
+            if (content.isNullOrBlank()) {
+                WeLogger.e(TAG, "cacheFileByMsgId: content is empty (msgId=$msgId), cannot trigger download")
+                return null
+            }
+
+            val values = ContentValues().apply {
+                put("msgid", msgId)
+                put("msgSvrId", row.msgSvrId)
+                put("type", row.type)
+                put("status", row.status)
+                put("createTime", row.createTime)
+                put("talker", row.talker)
+                put("isSend", row.isSend)
+                put("content", content)
+            }
+            cacheFile(convertMsgInfoInstanceFromContentValues(values))
+        } catch (e: Exception) {
+            WeLogger.e(TAG, "cacheFileByMsgId failed (msgId=$msgId)", e)
+            null
+        }
+    }
+
+    private class MessageRow(cursor: Cursor) {
+        val msgSvrId: Long = cursor.getLong(cursor.getColumnIndexOrThrow("msgSvrId"))
+        val talker: String = cursor.getString(cursor.getColumnIndexOrThrow("talker")) ?: ""
+        val type: Int = cursor.getInt(cursor.getColumnIndexOrThrow("type"))
+        val status: Int = cursor.getInt(cursor.getColumnIndexOrThrow("status"))
+        val createTime: Long = cursor.getLong(cursor.getColumnIndexOrThrow("createTime"))
+        val isSend: Int = cursor.getInt(cursor.getColumnIndexOrThrow("isSend"))
+        val content: String? = cursor.getString(cursor.getColumnIndexOrThrow("content"))
+    }
+
+    /**
      * 缓存文件 (直接使用已有的 msgInfo 实例)。
      *
      * 优先走此重载: 聊天里长按弹出的菜单已经持有微信正在渲染的、字段完整的 msgInfo 实例,
