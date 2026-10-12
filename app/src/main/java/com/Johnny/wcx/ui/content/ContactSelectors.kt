@@ -181,6 +181,10 @@ fun BaseContactSelector(
     val coroutineScope = rememberCoroutineScope()
     val alphabet = remember { listOf(SELECTED_SECTION_KEY) + ('A'..'Z').map { it.toString() } + "#" }
 
+    // 多选已选数量: selectionKey 变化即重算, 展示在「全选/全不选/反选」行右侧
+    // (原来把数量塞进确定按钮 "确定 (" 的格式串漏了 %d, 按钮只显示一个残缺括号)
+    val selectedCount = remember(selectionKey, allContacts) { allContacts.count { isSelected(it) } }
+
     // 打开选择器时在后台线程重建搜索索引: searchBlobCache 是跨会话的静态缓存,
     // 用户改了备注之后如果一直沿用旧 blob 会搜不到; 但每次按键在主线程做 ICU 转写
     // 又会卡, 所以进页面就预先算好填满缓存, 输入时直接命中。
@@ -806,6 +810,16 @@ fun BaseContactSelector(
                                 modifier = Modifier.height(28.dp)
                             )
                         }
+
+                        // 已选数量靠右显示, 不再挤占确定按钮 (原实现按钮文字被截断成 "确定 (")
+                        Spacer(modifier = Modifier.weight(1f))
+                        Text(
+                            text = "已选 $selectedCount",
+                            style = chipTextStyle,
+                            maxLines = 1,
+                            softWrap = false,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
 
@@ -1038,7 +1052,7 @@ fun ContactsSelector(
         onSearchQueryChange = { searchQuery = it },
         filteredContacts = filteredContacts,
         allContacts = contacts,
-        confirmButtonText = "确定 (".format(selectedWxIds.size),
+        confirmButtonText = "确定",
         confirmButtonEnabled = true,
         onDismiss = onDismiss,
         onConfirm = { onConfirm(selectedWxIds) },

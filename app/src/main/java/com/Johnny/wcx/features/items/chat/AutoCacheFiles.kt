@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 @Feature(name = "自动缓存文件", categories = ["聊天"], description = "监听接收到的文件消息, 在对方上传完成后自动触发微信内部下载将其缓存到本地")
 object AutoCacheFiles : ClickableFeature(),
@@ -69,6 +70,13 @@ object AutoCacheFiles : ClickableFeature(),
     /** 同时进行的下载任务上限, 防止消息密集时把微信 CDN 队列挤爆。 */
     private val downloadSemaphore = Semaphore(3)
 
+    /**
+     * 诊断计数器: 被廉价预筛跳过的 update 事件数。
+     * D 级日志在 release 构建会被 WeLogger 直接丢弃 (见 WeLogger.enqueue),
+     * 高频分流改用计数, 每轮补偿扫描汇总输出, 保证"事件来过但被跳过"可见。
+     */
+    private val prefilteredUpdateEvents = AtomicLong(0)
+
     private var useWhitelist by WePrefs.prefOption("autocache_files_use_whitelist", false)
     private var whitelist by WePrefs.prefOption("autocache_files_whitelist", emptySet())
     private var blacklist by WePrefs.prefOption("autocache_files_blacklist", emptySet())
@@ -79,7 +87,8 @@ object AutoCacheFiles : ClickableFeature(),
         WeLogger.i(
             TAG,
             "enabled: listening message insert/update; compensation scan every ${SCAN_INTERVAL_MS / 1000}s " +
-                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round)"
+                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round); " +
+                "list filter: ${describeListFilter()}"
         )
         startCompensation()
     }
@@ -130,6 +139,7 @@ object AutoCacheFiles : ClickableFeature(),
         if (fromUpdate && freshContent == null && values.getAsLong("msgSvrId") == null) {
             val knownMsgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs)
             if (knownMsgId == null || knownMsgId !in pendingSvrIds.values) {
+                prefilteredUpdateEvents.incrementAndGet()
                 WeLogger.d(TAG, "update event without content/msgSvrId skipped (msgId=$knownMsgId)")
                 return
             }
@@ -142,11 +152,11 @@ object AutoCacheFiles : ClickableFeature(),
                 return
             }
             val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: run {
-                WeLogger.d(TAG, "update event: cannot extract msgId, skip")
+                WeLogger.i(TAG, "update event: cannot extract msgId from whereClause, skip")
                 return
             }
             val svrId = WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: run {
-                WeLogger.d(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
+                WeLogger.i(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
                 return
             }
             // 已知的 pending 消息: 用事件里的 msgId 刷新映射, 补偿轮按最新 msgId 重试
@@ -154,7 +164,7 @@ object AutoCacheFiles : ClickableFeature(),
             svrId
         }
         if (msgSvrId == 0L) {
-            WeLogger.d(TAG, "msgSvrId=0 event skipped")
+            WeLogger.w(TAG, "msgSvrId=0 event skipped (table=$table, fromUpdate=$fromUpdate)")
             return
         }
         if (msgSvrId in doneSvrIds) return
@@ -162,7 +172,7 @@ object AutoCacheFiles : ClickableFeature(),
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
         if (!passesListFilter(talker)) {
-            WeLogger.d(TAG, "file msg $msgSvrId: talker=$talker filtered out (or unresolved with active filter), skip")
+            WeLogger.i(TAG, "file msg $msgSvrId: talker=$talker blocked by ${describeListFilter()}, skip")
             return
         }
 
@@ -192,7 +202,7 @@ object AutoCacheFiles : ClickableFeature(),
             // update 未携带新 content: 只跟进 insert 时已标记 pending 的消息
             // (廉价预筛已放行到这里), 避免对无关列的更新也触发查库/下载。
             if (!pendingSvrIds.containsKey(msgSvrId)) {
-                WeLogger.d(TAG, "file msg $msgSvrId: update without content and not pending, skip")
+                WeLogger.i(TAG, "file msg $msgSvrId: update without content and not pending, skip")
                 return
             }
         } else {
@@ -249,6 +259,14 @@ object AutoCacheFiles : ClickableFeature(),
                 }
             }
         }
+    }
+
+    /** 名单过滤当前配置的文字描述, 用于日志判断消息是否被名单挡下。 */
+    private fun describeListFilter(): String = when {
+        useWhitelist && whitelist.isNotEmpty() -> "whitelist(${whitelist.size} contacts)"
+        !useWhitelist && blacklist.isNotEmpty() -> "blacklist(${blacklist.size} contacts)"
+        useWhitelist -> "whitelist(empty)"
+        else -> "blacklist(empty)"
     }
 
     /**
@@ -335,17 +353,27 @@ object AutoCacheFiles : ClickableFeature(),
         WeLogger.i(TAG, "compensation scan: ${rows.size} recent file message(s) since $since")
         var launched = 0
         rows.forEach { (msgId, svrId, talker) ->
-            if (svrId == 0L) return@forEach
-            if (svrId in doneSvrIds) return@forEach
+            if (svrId == 0L) {
+                WeLogger.i(TAG, "compensation scan: skip msgId=$msgId (msgSvrId=0, 尚未同步的消息行)")
+                return@forEach
+            }
+            if (svrId in doneSvrIds) {
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId (already cached)")
+                return@forEach
+            }
             if (!passesListFilter(talker)) {
-                WeLogger.d(TAG, "compensation scan: msgSvrId=$svrId talker=$talker filtered out")
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId talker=$talker (blocked by ${describeListFilter()})")
                 return@forEach
             }
             pendingSvrIds[svrId] = msgId
             launched++
             launchCache(svrId, "scan") { WeMessageApi.cacheFileByMsgId(msgId) }
         }
-        WeLogger.i(TAG, "compensation scan done: launched $launched/${rows.size}")
+        WeLogger.i(
+            TAG,
+            "compensation scan done: launched $launched/${rows.size}, " +
+                "pre-filtered update events since last scan: ${prefilteredUpdateEvents.getAndSet(0)}"
+        )
         return true
     }
 
@@ -405,6 +433,24 @@ object AutoCacheFiles : ClickableFeature(),
                             },
                             supportingContent = { Text("点击选择联系人") },
                             headlineContent = { Text(if (useWhitelistState) "配置白名单" else "配置黑名单") }
+                        )
+                        ListItem(
+                            modifier = Modifier.clickable {
+                                // 配错名单 (如误把常用联系人加进黑名单) 时可一键恢复,
+                                // 不必进选择器逐个取消; 名单变更需重启微信生效。
+                                val had = if (useWhitelistState) {
+                                    val nonEmpty = whitelist.isNotEmpty()
+                                    whitelist = emptySet()
+                                    nonEmpty
+                                } else {
+                                    val nonEmpty = blacklist.isNotEmpty()
+                                    blacklist = emptySet()
+                                    nonEmpty
+                                }
+                                showToast(if (had) "已清空名单, 重启微信以使更改生效" else "名单本就是空的")
+                            },
+                            supportingContent = { Text("名单内的联系人不会被自动缓存, 清空后恢复全部缓存") },
+                            headlineContent = { Text(if (useWhitelistState) "清空白名单" else "清空黑名单") }
                         )
                     }
                 },

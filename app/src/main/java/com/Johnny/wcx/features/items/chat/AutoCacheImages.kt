@@ -36,6 +36,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 @Feature(name = "自动缓存图片", categories = ["聊天"], description = "监听接收到的图片消息, 自动触发微信从 CDN 下载, 将原图缓存到本地")
 object AutoCacheImages : ClickableFeature(),
@@ -71,6 +72,13 @@ object AutoCacheImages : ClickableFeature(),
     /** 同时进行的下载任务上限, 防止消息密集时把微信 CDN 队列挤爆。 */
     private val downloadSemaphore = Semaphore(3)
 
+    /**
+     * 诊断计数器: 与自动缓存无关的 update 事件数 (type 缺失且非已知 pending)。
+     * D 级日志在 release 构建会被 WeLogger 直接丢弃 (见 WeLogger.enqueue),
+     * 高频分流改用计数, 每轮补偿扫描汇总输出, 保证"事件来过但被跳过"可见。
+     */
+    private val unrelatedUpdateEvents = AtomicLong(0)
+
     private var useWhitelist by WePrefs.prefOption("autocache_images_use_whitelist", false)
     private var whitelist by WePrefs.prefOption("autocache_images_whitelist", emptySet())
     private var blacklist by WePrefs.prefOption("autocache_images_blacklist", emptySet())
@@ -81,7 +89,8 @@ object AutoCacheImages : ClickableFeature(),
         WeLogger.i(
             TAG,
             "enabled: listening message insert/update; compensation scan every ${SCAN_INTERVAL_MS / 1000}s " +
-                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round)"
+                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round); " +
+                "list filter: ${describeListFilter()}"
         )
         startCompensation()
     }
@@ -99,7 +108,7 @@ object AutoCacheImages : ClickableFeature(),
 
         val type = values.getAsInteger("type")
         if (type == null) {
-            WeLogger.d(TAG, "insert event without type column, skip")
+            WeLogger.w(TAG, "insert event without type column, skip")
             return
         }
         if (type != MessageType.IMAGE.code) return
@@ -109,7 +118,7 @@ object AutoCacheImages : ClickableFeature(),
 
         val talker = values.getAsString("talker")
         if (!passesListFilter(talker)) {
-            WeLogger.d(TAG, "image insert: talker=$talker filtered out (or unresolved with active filter), skip")
+            WeLogger.i(TAG, "image insert: talker=$talker blocked by ${describeListFilter()}, skip")
             return
         }
 
@@ -118,7 +127,7 @@ object AutoCacheImages : ClickableFeature(),
             return
         }
         if (msgSvrId == 0L) {
-            WeLogger.d(TAG, "image insert with msgSvrId=0, skip")
+            WeLogger.w(TAG, "image insert with msgSvrId=0, skip")
             return
         }
         if (msgSvrId in doneSvrIds) return
@@ -145,22 +154,23 @@ object AutoCacheImages : ClickableFeature(),
 
         val msgSvrId = values.getAsLong("msgSvrId") ?: run {
             val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: run {
-                WeLogger.d(TAG, "update event: cannot extract msgId, skip")
+                WeLogger.i(TAG, "update event: cannot extract msgId from whereClause, skip")
                 return
             }
             WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: run {
-                WeLogger.d(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
+                WeLogger.i(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
                 return
             }
         }
         if (msgSvrId == 0L) {
-            WeLogger.d(TAG, "update event with msgSvrId=0, skip")
+            WeLogger.w(TAG, "update event with msgSvrId=0, skip")
             return
         }
         if (msgSvrId in doneSvrIds) return
 
         // type 缺失且非已知 pending: 与自动缓存无关的 message 更新, 跳过
         if (type == null && msgSvrId !in pendingSvrIds) {
+            unrelatedUpdateEvents.incrementAndGet()
             WeLogger.d(TAG, "update event for unrelated msgSvrId=$msgSvrId, skip")
             return
         }
@@ -168,7 +178,7 @@ object AutoCacheImages : ClickableFeature(),
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
         if (!passesListFilter(talker)) {
-            WeLogger.d(TAG, "image msg $msgSvrId: talker=$talker filtered out (or unresolved with active filter), skip")
+            WeLogger.i(TAG, "image msg $msgSvrId: talker=$talker blocked by ${describeListFilter()}, skip")
             return
         }
 
@@ -245,14 +255,19 @@ object AutoCacheImages : ClickableFeature(),
             }
         }
         val since = System.currentTimeMillis() - SCAN_WINDOW_MS
-        val svrIds = try {
+        val rows = try {
             WeDatabaseApi.rawQuery(
-                "SELECT msgSvrId FROM message WHERE type=? AND isSend=0 AND createTime>? ORDER BY createTime DESC LIMIT ?",
+                "SELECT msgSvrId, talker FROM message WHERE type=? AND isSend=0 AND createTime>? ORDER BY createTime DESC LIMIT ?",
                 arrayOf<Any>(MessageType.IMAGE.code, since, SCAN_LIMIT)
             ).use { cursor ->
-                buildList<Long> {
+                buildList<Pair<Long, String>> {
                     while (cursor.moveToNext()) {
-                        add(cursor.getLong(cursor.getColumnIndexOrThrow("msgSvrId")))
+                        add(
+                            Pair(
+                                cursor.getLong(cursor.getColumnIndexOrThrow("msgSvrId")),
+                                cursor.getString(cursor.getColumnIndexOrThrow("talker")) ?: ""
+                            )
+                        )
                     }
                 }
             }
@@ -260,16 +275,31 @@ object AutoCacheImages : ClickableFeature(),
             WeLogger.e(TAG, "compensation scan query failed", e)
             return false
         }
-        WeLogger.i(TAG, "compensation scan: ${svrIds.size} recent image message(s) since $since")
+        WeLogger.i(TAG, "compensation scan: ${rows.size} recent image message(s) since $since")
         var launched = 0
-        svrIds.forEach { svrId ->
-            if (svrId == 0L) return@forEach
-            if (svrId in doneSvrIds) return@forEach
+        rows.forEach { (svrId, talker) ->
+            if (svrId == 0L) {
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=0 row (尚未同步的消息行)")
+                return@forEach
+            }
+            if (svrId in doneSvrIds) {
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId (already cached)")
+                return@forEach
+            }
+            // 与事件路径保持一致: 扫描也要过名单 (此前扫描不过名单, 会绕过用户配置)
+            if (!passesListFilter(talker)) {
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId talker=$talker (blocked by ${describeListFilter()})")
+                return@forEach
+            }
             pendingSvrIds.add(svrId)
             launched++
             cacheWithRetry(svrId, "scan")
         }
-        WeLogger.i(TAG, "compensation scan done: launched $launched/${svrIds.size}")
+        WeLogger.i(
+            TAG,
+            "compensation scan done: launched $launched/${rows.size}, " +
+                "unrelated update events since last scan: ${unrelatedUpdateEvents.getAndSet(0)}"
+        )
         return true
     }
 
@@ -284,6 +314,14 @@ object AutoCacheImages : ClickableFeature(),
             }
             cacheWithRetry(svrId, "retry")
         }
+    }
+
+    /** 名单过滤当前配置的文字描述, 用于日志判断消息是否被名单挡下。 */
+    private fun describeListFilter(): String = when {
+        useWhitelist && whitelist.isNotEmpty() -> "whitelist(${whitelist.size} contacts)"
+        !useWhitelist && blacklist.isNotEmpty() -> "blacklist(${blacklist.size} contacts)"
+        useWhitelist -> "whitelist(empty)"
+        else -> "blacklist(empty)"
     }
 
     /**
@@ -336,6 +374,24 @@ object AutoCacheImages : ClickableFeature(),
                             },
                             supportingContent = { Text("点击选择联系人") },
                             headlineContent = { Text(if (useWhitelistState) "配置白名单" else "配置黑名单") }
+                        )
+                        ListItem(
+                            modifier = Modifier.clickable {
+                                // 配错名单 (如误把常用联系人加进黑名单) 时可一键恢复,
+                                // 不必进选择器逐个取消; 名单变更需重启微信生效。
+                                val had = if (useWhitelistState) {
+                                    val nonEmpty = whitelist.isNotEmpty()
+                                    whitelist = emptySet()
+                                    nonEmpty
+                                } else {
+                                    val nonEmpty = blacklist.isNotEmpty()
+                                    blacklist = emptySet()
+                                    nonEmpty
+                                }
+                                showToast(if (had) "已清空名单, 重启微信以使更改生效" else "名单本就是空的")
+                            },
+                            supportingContent = { Text("名单内的联系人不会被自动缓存, 清空后恢复全部缓存") },
+                            headlineContent = { Text(if (useWhitelistState) "清空白名单" else "清空黑名单") }
                         )
                     }
                 },
