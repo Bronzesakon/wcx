@@ -51,6 +51,13 @@ object AutoCacheFiles : ClickableFeature(),
     /** 补偿扫描单轮条数上限, 避免开瞬间发起过多下载任务。 */
     private const val SCAN_LIMIT = 300
 
+    /**
+     * 补偿扫描周期: insert/update 事件可能双双错过 (监听器注册晚于消息落库、
+     * 功能开启时消息早已落库、微信内部走非标准 SQL 路径等), 必须持续扫描兜底,
+     * 只扫一次会在"开启瞬间之后到达/错过的消息"上留下永久空洞。
+     */
+    private const val SCAN_INTERVAL_MS = 180_000L
+
     /** 已成功缓存的 msgSvrId, 不再处理。 */
     private val doneSvrIds = ConcurrentHashMap.newKeySet<Long>()
 
@@ -69,6 +76,11 @@ object AutoCacheFiles : ClickableFeature(),
     override fun onEnable() {
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         WeDatabaseListenerApi.addListener(this)
+        WeLogger.i(
+            TAG,
+            "enabled: listening message insert/update; compensation scan every ${SCAN_INTERVAL_MS / 1000}s " +
+                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round)"
+        )
         startCompensation()
     }
 
@@ -77,6 +89,7 @@ object AutoCacheFiles : ClickableFeature(),
         scope.cancel()
         doneSvrIds.clear()
         pendingSvrIds.clear()
+        WeLogger.i(TAG, "disabled: listener removed, compensation stopped")
     }
 
     // 文件消息刚到达时可能是"对方上传中"占位; 对方传完后微信会就地更新该行的 content,
@@ -109,23 +122,54 @@ object AutoCacheFiles : ClickableFeature(),
         // 自己发出的文件本身就在本地, 无需缓存
         if (values.getAsInteger("isSend") == 1) return
 
+        val freshContent = values.getAsString("content")
+
+        // update 事件廉价预筛: message 表的更新极其频繁 (status/flag/已读等),
+        // 既不带新 content 又不带 msgSvrId 时, 仅当该 msgId 已登记 pending
+        // (insert 时见过的文件消息) 才值得深究, 避免每条更新都去查库。
+        if (fromUpdate && freshContent == null && values.getAsLong("msgSvrId") == null) {
+            val knownMsgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs)
+            if (knownMsgId == null || knownMsgId !in pendingSvrIds.values) {
+                WeLogger.d(TAG, "update event without content/msgSvrId skipped (msgId=$knownMsgId)")
+                return
+            }
+        }
+
         val msgSvrId = values.getAsLong("msgSvrId") ?: run {
             // update 事件常缺 msgSvrId, 经 whereClause 提取 msgId 后反查
-            if (!fromUpdate) return
-            val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: return
-            val svrId = WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: return
+            if (!fromUpdate) {
+                WeLogger.w(TAG, "insert event without msgSvrId, skip")
+                return
+            }
+            val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: run {
+                WeLogger.d(TAG, "update event: cannot extract msgId, skip")
+                return
+            }
+            val svrId = WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: run {
+                WeLogger.d(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
+                return
+            }
             // 已知的 pending 消息: 用事件里的 msgId 刷新映射, 补偿轮按最新 msgId 重试
             if (pendingSvrIds.containsKey(svrId)) pendingSvrIds[svrId] = msgId
             svrId
         }
-        if (msgSvrId == 0L || msgSvrId in doneSvrIds) return
+        if (msgSvrId == 0L) {
+            WeLogger.d(TAG, "msgSvrId=0 event skipped")
+            return
+        }
+        if (msgSvrId in doneSvrIds) return
 
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
-            ?: return
-        if (!passesListFilter(talker)) return
+            ?: run {
+                WeLogger.w(TAG, "file msg $msgSvrId: cannot resolve talker, skip")
+                return
+            }
+        if (!passesListFilter(talker)) {
+            WeLogger.d(TAG, "file msg $msgSvrId: talker $talker filtered out, skip")
+            return
+        }
 
-        val freshContent = values.getAsString("content")
         if (freshContent != null) {
             val file = try {
                 MessageInfo.FileMessage(freshContent)
@@ -140,18 +184,25 @@ object AutoCacheFiles : ClickableFeature(),
                     pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
                     return
                 }
-                // 未知的 appmsg 类型, 保守跳过
+                // 未知/暂不可下载的 appmsg 类型: 同样记 pending, 由补偿轮持续重试
+                // (对方上传完成/类型就绪后 content 会更新, 补偿轮按 msgId 重新查库即拿到新值)
                 !file.isDownloadable -> {
-                    WeLogger.d(TAG, "file msg $msgSvrId: not downloadable yet (appmsgType=${file.appMsgType}), skip")
+                    WeLogger.i(TAG, "file msg $msgSvrId: not downloadable yet (appmsgType=${file.appMsgType}), deferring")
+                    pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
                     return
                 }
             }
         } else if (fromUpdate) {
-            // update 未携带新 content: 只跟进 insert 时已标记 pending 的消息,
-            // 避免对 message 表无关列的更新也触发查库/下载。
-            if (!pendingSvrIds.containsKey(msgSvrId)) return
+            // update 未携带新 content: 只跟进 insert 时已标记 pending 的消息
+            // (廉价预筛已放行到这里), 避免对无关列的更新也触发查库/下载。
+            if (!pendingSvrIds.containsKey(msgSvrId)) {
+                WeLogger.d(TAG, "file msg $msgSvrId: update without content and not pending, skip")
+                return
+            }
         } else {
-            // insert 却没有 content, 无法解析 appmsg
+            // insert 却没有 content, 无法解析 appmsg; 记 pending 让补偿轮按 msgId 路径重试
+            WeLogger.w(TAG, "file msg $msgSvrId: insert without content, defer to compensation")
+            pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
             return
         }
 
@@ -166,12 +217,12 @@ object AutoCacheFiles : ClickableFeature(),
             }
             pendingSvrIds[msgSvrId] = msgId
             WeLogger.i(TAG, "file msg $msgSvrId ready via update (msgId=$msgId), auto caching")
-            launchCache(msgSvrId) { WeMessageApi.cacheFileByMsgId(msgId, freshContent) }
+            launchCache(msgSvrId, "update") { WeMessageApi.cacheFileByMsgId(msgId, freshContent) }
         } else {
             // insert 事件的 values 即完整行, 直接转换, 无需再查库
             if (!pendingSvrIds.containsKey(msgSvrId)) pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
             WeLogger.i(TAG, "file msg $msgSvrId ready on insert, auto caching")
-            launchCache(msgSvrId) {
+            launchCache(msgSvrId, "insert") {
                 try {
                     val instance = WeMessageApi.convertMsgInfoInstanceFromContentValues(values)
                     WeMessageApi.cacheFile(instance)
@@ -184,21 +235,21 @@ object AutoCacheFiles : ClickableFeature(),
     }
 
     /** 统一发起缓存; 成功记入 done, 失败保留 pending 等待后续事件/补偿轮重试。 */
-    private fun launchCache(msgSvrId: Long, block: suspend () -> String?) {
+    private fun launchCache(msgSvrId: Long, via: String, block: suspend () -> String?) {
         scope.launch {
             downloadSemaphore.withPermit {
                 val path = try {
                     block()
                 } catch (e: Exception) {
-                    WeLogger.e(TAG, "cache task crashed for msgSvrId=$msgSvrId", e)
+                    WeLogger.e(TAG, "cache task crashed for msgSvrId=$msgSvrId (via $via)", e)
                     null
                 }
                 if (path != null) {
                     doneSvrIds.add(msgSvrId)
                     pendingSvrIds.remove(msgSvrId)
-                    WeLogger.i(TAG, "cached file to $path")
+                    WeLogger.i(TAG, "cached file msgSvrId=$msgSvrId via $via -> $path")
                 } else {
-                    WeLogger.e(TAG, "failed to auto-cache file msgSvrId=$msgSvrId, will retry on later events")
+                    WeLogger.e(TAG, "failed to auto-cache file msgSvrId=$msgSvrId via $via, will retry on later events")
                 }
             }
         }
@@ -223,16 +274,18 @@ object AutoCacheFiles : ClickableFeature(),
     }
 
     /**
-     * 补偿机制: insert/update 事件可能双双错过 (监听器注册晚于消息落库、微信内部走非标准
-     * SQL 路径更新、触发时 CDN 尚未就绪等)。开启后先延迟扫描近期消息, 之后定期重试 pending。
+     * 补偿机制: insert/update 事件可能双双错过 (监听器注册晚于消息落库、功能开启时
+     * 消息早已落库、微信内部走非标准 SQL 路径更新、触发时 CDN 尚未就绪等)。
+     * 开启后先延迟扫描一轮, 之后每 [SCAN_INTERVAL_MS] 持续扫描 + 重试 pending,
+     * 保证任何时刻错过的消息都能在下一轮被补上。
      */
     private fun startCompensation() {
         scope.launch {
             delay(30_000)
-            scanRecentMessages()
             while (isActive) {
-                delay(180_000)
+                scanRecentMessages()
                 retryPending()
+                delay(SCAN_INTERVAL_MS)
             }
         }
     }
@@ -257,16 +310,23 @@ object AutoCacheFiles : ClickableFeature(),
                 }
             }
         } catch (e: Exception) {
-            WeLogger.e(TAG, "scanRecentMessages query failed", e)
+            WeLogger.e(TAG, "compensation scan query failed", e)
             return
         }
         WeLogger.i(TAG, "compensation scan: ${rows.size} recent file message(s) since $since")
+        var launched = 0
         rows.forEach { (msgId, svrId, talker) ->
-            if (svrId == 0L || svrId in doneSvrIds) return@forEach
-            if (!passesListFilter(talker)) return@forEach
+            if (svrId == 0L) return@forEach
+            if (svrId in doneSvrIds) return@forEach
+            if (!passesListFilter(talker)) {
+                WeLogger.d(TAG, "compensation scan: msgSvrId=$svrId talker=$talker filtered out")
+                return@forEach
+            }
             pendingSvrIds[svrId] = msgId
-            launchCache(svrId) { WeMessageApi.cacheFileByMsgId(msgId) }
+            launched++
+            launchCache(svrId, "scan") { WeMessageApi.cacheFileByMsgId(msgId) }
         }
+        WeLogger.i(TAG, "compensation scan done: launched $launched/${rows.size}")
     }
 
     private fun retryPending() {
@@ -283,7 +343,7 @@ object AutoCacheFiles : ClickableFeature(),
                 pendingSvrIds.remove(svrId)
                 return@forEach
             }
-            launchCache(svrId) { WeMessageApi.cacheFileByMsgId(msgId) }
+            launchCache(svrId, "retry") { WeMessageApi.cacheFileByMsgId(msgId) }
         }
     }
 

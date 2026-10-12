@@ -53,6 +53,13 @@ object AutoCacheImages : ClickableFeature(),
     /** 补偿扫描单轮条数上限, 避免开瞬间发起过多下载任务。 */
     private const val SCAN_LIMIT = 300
 
+    /**
+     * 补偿扫描周期: insert/update 事件可能双双错过 (监听器注册晚于消息落库、
+     * 功能开启时消息早已落库、ImgInfo2 行写入过晚等), 必须持续扫描兜底,
+     * 只扫一次会在"开启瞬间之后到达/错过的消息"上留下永久空洞。
+     */
+    private const val SCAN_INTERVAL_MS = 180_000L
+
     /** 已成功缓存的 msgSvrId, 不再处理。 */
     private val doneSvrIds = ConcurrentHashMap.newKeySet<Long>()
 
@@ -71,6 +78,11 @@ object AutoCacheImages : ClickableFeature(),
     override fun onEnable() {
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         WeDatabaseListenerApi.addListener(this)
+        WeLogger.i(
+            TAG,
+            "enabled: listening message insert/update; compensation scan every ${SCAN_INTERVAL_MS / 1000}s " +
+                "(window ${SCAN_WINDOW_MS / 3600000}h, limit $SCAN_LIMIT per round)"
+        )
         startCompensation()
     }
 
@@ -79,27 +91,45 @@ object AutoCacheImages : ClickableFeature(),
         scope.cancel()
         doneSvrIds.clear()
         pendingSvrIds.clear()
+        WeLogger.i(TAG, "disabled: listener removed, compensation stopped")
     }
 
     override fun onInsert(table: String, values: ContentValues) {
         if (table != "message") return
 
-        val type = values.getAsInteger("type") ?: return
+        val type = values.getAsInteger("type")
+        if (type == null) {
+            WeLogger.d(TAG, "insert event without type column, skip")
+            return
+        }
         if (type != MessageType.IMAGE.code) return
 
         // 自己发出的图片本身就在本地, 无需缓存
         if (values.getAsInteger("isSend") == 1) return
 
-        val talker = values.getAsString("talker") ?: return
-        if (!passesListFilter(talker)) return
+        val talker = values.getAsString("talker") ?: run {
+            WeLogger.w(TAG, "image insert without talker, skip")
+            return
+        }
+        if (!passesListFilter(talker)) {
+            WeLogger.d(TAG, "image insert: talker $talker filtered out, skip")
+            return
+        }
 
-        val msgSvrId = values.getAsLong("msgSvrId") ?: return
-        if (msgSvrId == 0L || msgSvrId in doneSvrIds) return
+        val msgSvrId = values.getAsLong("msgSvrId") ?: run {
+            WeLogger.w(TAG, "image insert without msgSvrId, skip")
+            return
+        }
+        if (msgSvrId == 0L) {
+            WeLogger.d(TAG, "image insert with msgSvrId=0, skip")
+            return
+        }
+        if (msgSvrId in doneSvrIds) return
 
         // insert 时刻 ImgInfo2 行可能尚未写入, 记入 pending 并带重试地触发缓存
         WeLogger.i(TAG, "detected image message; msgSvrId=$msgSvrId, auto caching")
         pendingSvrIds.add(msgSvrId)
-        cacheWithRetry(msgSvrId)
+        cacheWithRetry(msgSvrId, "insert")
     }
 
     override fun onUpdate(
@@ -117,21 +147,40 @@ object AutoCacheImages : ClickableFeature(),
         if (type != null && type != MessageType.IMAGE.code) return
 
         val msgSvrId = values.getAsLong("msgSvrId") ?: run {
-            val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: return
-            WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: return
+            val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs) ?: run {
+                WeLogger.d(TAG, "update event: cannot extract msgId, skip")
+                return
+            }
+            WeMessageApi.getMsgSvrIdByMsgId(msgId) ?: run {
+                WeLogger.d(TAG, "update event: no msgSvrId for msgId=$msgId, skip")
+                return
+            }
         }
-        if (msgSvrId == 0L || msgSvrId in doneSvrIds) return
+        if (msgSvrId == 0L) {
+            WeLogger.d(TAG, "update event with msgSvrId=0, skip")
+            return
+        }
+        if (msgSvrId in doneSvrIds) return
 
         // type 缺失且非已知 pending: 与自动缓存无关的 message 更新, 跳过
-        if (type == null && msgSvrId !in pendingSvrIds) return
+        if (type == null && msgSvrId !in pendingSvrIds) {
+            WeLogger.d(TAG, "update event for unrelated msgSvrId=$msgSvrId, skip")
+            return
+        }
 
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
-            ?: return
-        if (!passesListFilter(talker)) return
+            ?: run {
+                WeLogger.w(TAG, "image msg $msgSvrId: cannot resolve talker, skip")
+                return
+            }
+        if (!passesListFilter(talker)) {
+            WeLogger.d(TAG, "image msg $msgSvrId: talker $talker filtered out, skip")
+            return
+        }
 
         WeLogger.i(TAG, "image msg $msgSvrId update event, retry caching")
-        cacheWithRetry(msgSvrId)
+        cacheWithRetry(msgSvrId, "update")
     }
 
     /**
@@ -139,43 +188,45 @@ object AutoCacheImages : ClickableFeature(),
      * 且 CDN 未必就绪, 单次 [WeMessageApi.cacheImage] 失败很常见。
      * 立即重试一次 + 两次延迟重试覆盖"行未写/未就绪", 仍失败则留在 pending 等 update 事件/补偿轮。
      */
-    private fun cacheWithRetry(msgSvrId: Long) {
+    private fun cacheWithRetry(msgSvrId: Long, via: String) {
         scope.launch {
             downloadSemaphore.withPermit {
                 for (attempt in 1..MAX_ATTEMPTS) {
                     val path = try {
                         WeMessageApi.cacheImage(msgSvrId)
                     } catch (e: Exception) {
-                        WeLogger.e(TAG, "cacheImage crashed for msgSvrId=$msgSvrId (attempt $attempt)", e)
+                        WeLogger.e(TAG, "cacheImage crashed for msgSvrId=$msgSvrId (attempt $attempt, via $via)", e)
                         null
                     }
                     if (path != null) {
                         doneSvrIds.add(msgSvrId)
                         pendingSvrIds.remove(msgSvrId)
-                        WeLogger.i(TAG, "cached image to $path")
+                        WeLogger.i(TAG, "cached image msgSvrId=$msgSvrId via $via -> $path")
                         return@withPermit
                     }
                     if (attempt < MAX_ATTEMPTS) {
-                        WeLogger.w(TAG, "cacheImage attempt $attempt failed for msgSvrId=$msgSvrId, retrying")
+                        WeLogger.w(TAG, "cacheImage attempt $attempt failed for msgSvrId=$msgSvrId (via $via), retrying")
                         delay(if (attempt == 1) 3_000 else 8_000)
                     }
                 }
-                WeLogger.e(TAG, "failed to auto-cache image msgSvrId=$msgSvrId after $MAX_ATTEMPTS attempts, will retry on later events")
+                WeLogger.e(TAG, "failed to auto-cache image msgSvrId=$msgSvrId via $via after $MAX_ATTEMPTS attempts, will retry on later events")
             }
         }
     }
 
     /**
-     * 补偿机制: insert/update 事件可能双双错过 (监听器注册晚于消息落库、微信内部走非标准
-     * SQL 路径更新、触发时 CDN 尚未就绪等)。开启后先延迟扫描近期消息, 之后定期重试 pending。
+     * 补偿机制: insert/update 事件可能双双错过 (监听器注册晚于消息落库、功能开启时
+     * 消息早已落库、ImgInfo2 行写入过晚、触发时 CDN 尚未就绪等)。
+     * 开启后先延迟扫描一轮, 之后每 [SCAN_INTERVAL_MS] 持续扫描 + 重试 pending,
+     * 保证任何时刻错过的消息都能在下一轮被补上。
      */
     private fun startCompensation() {
         scope.launch {
             delay(30_000)
-            scanRecentMessages()
             while (isActive) {
-                delay(180_000)
+                scanRecentMessages()
                 retryPending()
+                delay(SCAN_INTERVAL_MS)
             }
         }
     }
@@ -194,15 +245,19 @@ object AutoCacheImages : ClickableFeature(),
                 }
             }
         } catch (e: Exception) {
-            WeLogger.e(TAG, "scanRecentMessages query failed", e)
+            WeLogger.e(TAG, "compensation scan query failed", e)
             return
         }
         WeLogger.i(TAG, "compensation scan: ${svrIds.size} recent image message(s) since $since")
+        var launched = 0
         svrIds.forEach { svrId ->
-            if (svrId == 0L || svrId in doneSvrIds) return@forEach
+            if (svrId == 0L) return@forEach
+            if (svrId in doneSvrIds) return@forEach
             pendingSvrIds.add(svrId)
-            cacheWithRetry(svrId)
+            launched++
+            cacheWithRetry(svrId, "scan")
         }
+        WeLogger.i(TAG, "compensation scan done: launched $launched/${svrIds.size}")
     }
 
     private fun retryPending() {
@@ -214,7 +269,7 @@ object AutoCacheImages : ClickableFeature(),
                 pendingSvrIds.remove(svrId)
                 return@forEach
             }
-            cacheWithRetry(svrId)
+            cacheWithRetry(svrId, "retry")
         }
     }
 
