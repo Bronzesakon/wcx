@@ -125,15 +125,18 @@ private data class ContactFilterOption(
     val wxIds: Set<String>,
 )
 
-enum class SortMode(val icon: ImageVector) {
-    ALPHABETICAL(MaterialSymbols.Outlined.Sort_by_alpha),
-    LAST_MESSAGE_TIME(MaterialSymbols.Outlined.Schedule);
+/**
+ * 排序方式: 默认按「最近聊天」(最近消息时间) 排序, 对应 chip 排在最前;
+ * 第二项是 A-Z 拼音/字母序。[reversed] 为 true 时方向反转
+ * (最近→最旧 / Z-A), chip 文案随之变化。
+ */
+enum class SortMode(val icon: ImageVector, val title: String) {
+    RECENT(MaterialSymbols.Outlined.Schedule, "最近"),
+    ALPHABETICAL(MaterialSymbols.Outlined.Sort_by_alpha, "A-Z");
 
-    fun displayNameRes(reversed: Boolean): String = when (this) {
-        ALPHABETICAL -> if (reversed) "Z–A"
-        else "A–Z"
-        LAST_MESSAGE_TIME -> if (reversed) "旧-新"
-        else "新-旧"
+    fun displayName(reversed: Boolean): String = when (this) {
+        RECENT -> if (reversed) "最旧" else "最近"
+        ALPHABETICAL -> if (reversed) "Z–A" else "A–Z"
     }
 }
 
@@ -154,7 +157,7 @@ fun BaseContactSelector(
     showConfirmButton: Boolean = true,
     dismissButtonText: String? = null,
     avatarModelProvider: ((IWeContact) -> Any)? = { it.avatarUrl },
-    subtitleProvider: ((IWeContact) -> String)? = { it.wxId },
+    subtitleProvider: ((IWeContact) -> String)? = null,
     leadingControl: @Composable (LazyItemScope.(IWeContact) -> Unit)? = null,
     trailingControl: @Composable (LazyItemScope.(IWeContact) -> Unit)? = null,
     onItemClick: (IWeContact) -> Unit,
@@ -310,41 +313,24 @@ fun BaseContactSelector(
 
     var filtersExpanded by remember { mutableStateOf(true) }
 
-    var sortMode by remember { mutableStateOf(SortMode.ALPHABETICAL) }
+    var sortMode by remember { mutableStateOf(SortMode.RECENT) }
     var sortReversed by remember { mutableStateOf(false) }
     var lastMessageTimes by remember { mutableStateOf<Map<String, Long>?>(null) }
-    var isSortLoading by remember { mutableStateOf(false) }
+
+    // 默认按最近聊天排序: 打开时后台拉取各会话最近消息时间, 拉取成功后列表按时间重排。
+    // 数据库不可用时静默保持 RECENT 分组 (没有时间的联系人兜底为 Long.MIN_VALUE, 展示顺序稳定),
+    // 不弹 toast 打断筛选流。
+    LaunchedEffect(Unit) {
+        val times = withContext(Dispatchers.IO) {
+            if (WeDatabaseApi.isReady) WeDatabaseApi.getLastMessageTimes() else null
+        }
+        if (times != null) lastMessageTimes = times
+    }
 
     fun switchSortMode(target: SortMode) {
-        if (target == sortMode || isSortLoading) return
-        if (target == SortMode.ALPHABETICAL) {
-            sortMode = SortMode.ALPHABETICAL
-            return
-        }
-        // 切换到按最近消息时间排序
-        if (lastMessageTimes != null) {
-            sortMode = SortMode.LAST_MESSAGE_TIME
-            return
-        }
-        isSortLoading = true
-        coroutineScope.launch {
-            val times = withContext(Dispatchers.IO) {
-                if (WeDatabaseApi.isReady) WeDatabaseApi.getLastMessageTimes() else null
-            }
-            // getLastMessageTimes() 内部吞掉异常后返回空表, 所以空结果也当作失败:
-            // 否则会静默按"所有会话时间相同"排出一个随意的顺序, 而且缓存住之后再也不会重试。
-            if (times.isNullOrEmpty()) {
-                val currentResources = currentLocalizedContext.value
-                showToast(
-                    context,
-                    "数据库尚未初始化, 无法按时间排序!",
-                )
-            } else {
-                lastMessageTimes = times
-                sortMode = SortMode.LAST_MESSAGE_TIME
-            }
-            isSortLoading = false
-        }
+        if (target == sortMode) return
+        sortMode = target
+        sortReversed = false
     }
 
     val typeCounts = remember(filteredContacts, friendWxIds, groupWxIds, officialAccountWxIds) {
@@ -470,7 +456,7 @@ fun BaseContactSelector(
     }
 
     val groupedContacts = remember(displayedContacts, initialCache, selectionKey, sortMode, sortReversed, lastMessageTimes) {
-        if (sortMode == SortMode.LAST_MESSAGE_TIME) {
+        if (sortMode == SortMode.RECENT) {
             val times = lastMessageTimes ?: emptyMap()
             val sorted = if (sortReversed) {
                 displayedContacts.sortedBy { times[it.wxId] ?: Long.MIN_VALUE }
@@ -530,7 +516,7 @@ fun BaseContactSelector(
                         value = searchQuery,
                         onValueChange = onSearchQueryChange,
                         modifier = Modifier.weight(1f),
-                        placeholder = { Text("搜索昵称或微信号") },
+                        placeholder = { Text("搜索昵称或备注") },
                         leadingIcon = {
                             Icon(
                                 MaterialSymbols.Outlined.Search,
@@ -728,32 +714,23 @@ fun BaseContactSelector(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             SortMode.entries.forEach { mode ->
-                                val displayName = mode.displayNameRes(sortReversed)
+                                val displayName = mode.displayName(sortReversed)
                                 FilterChip(
                                     selected = sortMode == mode,
-                                    enabled = !isSortLoading,
                                     onClick = { switchSortMode(mode) },
                                     label = { Text(displayName) },
                                     leadingIcon = {
-                                        if (isSortLoading && mode == SortMode.LAST_MESSAGE_TIME) {
-                                            CircularProgressIndicator(
-                                                modifier = Modifier.size(16.dp),
-                                                strokeWidth = 2.dp
-                                            )
-                                        } else {
-                                            Icon(
-                                                imageVector = mode.icon,
-                                                contentDescription = displayName,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
+                                        Icon(
+                                            imageVector = mode.icon,
+                                            contentDescription = displayName,
+                                            modifier = Modifier.size(16.dp)
+                                        )
                                     }
                                 )
                             }
 
                             FilterChip(
                                 selected = sortReversed,
-                                enabled = !isSortLoading,
                                 onClick = { sortReversed = !sortReversed },
                                 label = {
                                     Icon(
@@ -903,7 +880,9 @@ fun BaseContactSelector(
                                                 style = MaterialTheme.typography.bodyLarge
                                             )
                                             Text(
-                                                text = subtitleProvider?.invoke(contact) ?: contact.wxId,
+                                                text = subtitleProvider?.invoke(contact)
+                                                    ?: (if (contact is WeContact) contact.nickname else null)?.takeIf { it.isNotBlank() }
+                                                    ?: "",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
@@ -1178,9 +1157,8 @@ private fun buildSearchBlob(contact: IWeContact): String {
     sb.append(name).append(' ')
     sb.append(toPinyin(name)).append(' ')
     sb.append(pinyinInitials(name)).append(' ')
-    // wxId / 自定义微信号只作精确查找兜底, 界面不展示。
-    sb.append(contact.wxId).append(' ')
-    if (contact is WeContact) {
+    // 微信 wxid 不再参与搜索/筛选 (界面也不展示), 仅对自定义微信号做精确兜底。
+    if (contact is WeContact && contact.customWxId.isNotBlank()) {
         sb.append(contact.customWxId).append(' ')
     }
     return sb.toString().lowercase()

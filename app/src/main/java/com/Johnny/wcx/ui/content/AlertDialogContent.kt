@@ -39,8 +39,12 @@ fun AlertDialogContent(
             if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
         )
     ) {
+        // 非全屏（浮动 Dialog）时按内容自适应高度，避免内容少时把面板撑到接近全屏；
+        // 全屏模式（联系人选择器）仍撑满。
         Column(
-            modifier = Modifier.fillMaxSize().padding(20.dp),
+            modifier = Modifier
+                .then(if (fullScreen) Modifier.fillMaxSize() else Modifier)
+                .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Row(
@@ -73,7 +77,10 @@ fun AlertDialogContent(
 
                 Box(
                     modifier = Modifier
-                        .then(if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().heightIn(max = 400.dp))
+                        .then(
+                            if (fullScreen) Modifier.fillMaxSize()
+                            else Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 400.dp)
+                        )
                 ) {
                     CompositionLocalProvider(
                         LocalTextStyle provides bodyStyle,
