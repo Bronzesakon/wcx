@@ -172,8 +172,8 @@ fun BaseContactSelector(
     val localizedContext = LocalContext.current
     val currentLocalizedContext = rememberUpdatedState(localizedContext)
     // 筛选 chip / 标题 / 搜索框统一小号字。FilterChip 的 label 默认继承 bodyMedium,
-    // 这里把三行 chip (类型 / 标签 / 全选) 全部钉死 labelSmall (12sp), 标题 14sp,
-    // 搜索框用 13sp 的 TextStyle 覆盖 bodyMedium。
+    // 这里把 chip 行 (类型+标签合并行 / 排序 / 全选) 全部钉死 labelSmall (12sp),
+    // 标题 14sp, 搜索框用 13sp 的 TextStyle 覆盖 bodyMedium; chip 高度统一 28dp。
     val chipTextStyle = MaterialTheme.typography.labelSmall
     val titleStyle = MaterialTheme.typography.titleSmall
     val searchTextStyle = MaterialTheme.typography.titleSmall.copy(fontSize = 13.sp)
@@ -552,61 +552,55 @@ fun BaseContactSelector(
                     exit = shrinkVertically() + fadeOut()
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
-                        if (showTypeFilterRow) {
+                        // 类型筛选与「标签/归拢/分组」筛选合并为同一行横向滚动 (组间竖线分隔),
+                        // 比原来两行堆叠省一整行的高度; 所有 chip 统一 28dp 高、12sp 字。
+                        if (showTypeFilterRow || availableFilterModes.size > 1 || hasFilterModeOptions) {
                             LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
                                 contentPadding = PaddingValues(horizontal = 4.dp),
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(bottom = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                items(availableTypes) { type ->
-                                    val isSelected = selectedType == type
-                                    val count = typeCounts[type] ?: 0
-                                    val displayName = type.displayNameRes
-                                    FilterChip(
-                                        selected = isSelected,
-                                        onClick = { selectedType = type },
-                                        label = {
-                                            Text(
-                                                "%1\$s (%2\$d)".format(displayName, count),
-                                                style = chipTextStyle,
-                                            )
-                                        },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = when (type) {
-                                                    FilterType.ALL -> MaterialSymbols.Outlined.Search
-                                                    FilterType.FRIENDS -> MaterialSymbols.Outlined.Person
-                                                    FilterType.GROUPS -> MaterialSymbols.Outlined.Groups
-                                                    FilterType.OFFICIAL_ACCOUNTS -> MaterialSymbols.Outlined.Chat
-                                                    FilterType.OTHERS -> MaterialSymbols.Outlined.Tag
-                                                },
-                                                contentDescription = displayName,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    )
+                                if (showTypeFilterRow) {
+                                    items(availableTypes) { type ->
+                                        val isSelected = selectedType == type
+                                        val count = typeCounts[type] ?: 0
+                                        val displayName = type.displayNameRes
+                                        FilterChip(
+                                            selected = isSelected,
+                                            onClick = { selectedType = type },
+                                            label = {
+                                                Text(
+                                                    "%1\$s (%2\$d)".format(displayName, count),
+                                                    style = chipTextStyle,
+                                                )
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = when (type) {
+                                                        FilterType.ALL -> MaterialSymbols.Outlined.Search
+                                                        FilterType.FRIENDS -> MaterialSymbols.Outlined.Person
+                                                        FilterType.GROUPS -> MaterialSymbols.Outlined.Groups
+                                                        FilterType.OFFICIAL_ACCOUNTS -> MaterialSymbols.Outlined.Chat
+                                                        FilterType.OTHERS -> MaterialSymbols.Outlined.Tag
+                                                    },
+                                                    contentDescription = displayName,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            },
+                                            modifier = Modifier.height(28.dp)
+                                        )
+                                    }
                                 }
-                            }
-                        }
 
-                        if (availableFilterModes.size > 1 || hasFilterModeOptions) {
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                contentPadding = PaddingValues(horizontal = 4.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
                                 if (showFilterDivider) {
                                     item {
                                         Box(
                                             modifier = Modifier
                                                 .width(1.dp)
-                                                .height(16.dp)
+                                                .height(20.dp)
                                                 .background(MaterialTheme.colorScheme.outlineVariant)
                                         )
                                     }
@@ -716,7 +710,7 @@ fun BaseContactSelector(
                         }
 
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 4.dp)
@@ -735,7 +729,8 @@ fun BaseContactSelector(
                                             contentDescription = displayName,
                                             modifier = Modifier.size(16.dp)
                                         )
-                                    }
+                                    },
+                                    modifier = Modifier.height(28.dp)
                                 )
                             }
 
@@ -748,7 +743,8 @@ fun BaseContactSelector(
                                         contentDescription = "切换排序方向",
                                         modifier = Modifier.size(16.dp)
                                     )
-                                }
+                                },
+                                modifier = Modifier.height(28.dp)
                             )
                         }
 
@@ -758,7 +754,7 @@ fun BaseContactSelector(
                 // 全选 / 全不选 / 反选常驻显示, 不被「折叠筛选」收起。
                 if (onSelectAll != null || onDeselectAll != null || onInvertSelection != null) {
                     Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 4.dp)
@@ -776,7 +772,8 @@ fun BaseContactSelector(
                                         contentDescription = "全选",
                                         modifier = Modifier.size(16.dp)
                                     )
-                                }
+                                },
+                                modifier = Modifier.height(28.dp)
                             )
                         }
                         onDeselectAll?.let {
@@ -790,7 +787,8 @@ fun BaseContactSelector(
                                         contentDescription = "全不选",
                                         modifier = Modifier.size(16.dp)
                                     )
-                                }
+                                },
+                                modifier = Modifier.height(28.dp)
                             )
                         }
                         onInvertSelection?.let {
@@ -804,7 +802,8 @@ fun BaseContactSelector(
                                         contentDescription = "反选",
                                         modifier = Modifier.size(16.dp)
                                     )
-                                }
+                                },
+                                modifier = Modifier.height(28.dp)
                             )
                         }
                     }

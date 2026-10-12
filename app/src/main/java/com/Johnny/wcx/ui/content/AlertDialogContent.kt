@@ -78,7 +78,9 @@ fun AlertDialogContent(
                 Box(
                     modifier = Modifier
                         .then(
-                            if (fullScreen) Modifier.fillMaxSize()
+                            // 全屏时内容区只占「剩余」高度 (weight), 把底部按钮行的位置留出来;
+                            // 原来用 fillMaxSize() 会把按钮行挤成 0 高度, 用户看不到确定/取消。
+                            if (fullScreen) Modifier.fillMaxWidth().weight(1f)
                             else Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 400.dp)
                         )
                 ) {
