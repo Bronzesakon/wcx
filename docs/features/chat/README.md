@@ -8,7 +8,7 @@
 - [阻止消息撤回 1](anti-message-recall-1.md) — 阻止对方撤回消息, 无撤回提示
 - [聊天输入栏增强](chat-input-bar-enhancements.md) — 长按发送/加号打开菜单 (发送 XML 卡片消息、@所有人) ; 长按语音按钮选择 AMR/MP3 文件发送为语音
 - [聊天工具栏](chat-toolbar.md) — 在输入框上方将加号菜单中的功能以芯片形式展示, 方便快速使用
-- [自动查看原图/原视频](auto-view-original-media.md) — 打开图片/视频时自动点击「查看原图 / 查看原视频」
+- [自动查看原图/原视频](auto-view-original-media.md) — 打开图片/视频时无感加载原图/原视频（不显示「查看原图」按钮）
 - [自动语音转文字](auto-speech-to-text.md) — 自动将语音消息转为文字显示
 - [显示消息时间](display-message-send-time.md) — 在消息旁显示精确发送时间, 可点击格式
 - [对话分组](conversation-grouping.md) — 在主页顶部添加「全部/未读/群聊/好友/公众号」Tab 栏, 快速筛选对话

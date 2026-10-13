@@ -3,6 +3,8 @@ package com.Johnny.wcx.features.items.chat
 import android.app.Activity
 import android.os.SystemClock
 import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.widget.TextView
 import com.Johnny.wcx.dexkit.abc.IResolveDex
 import com.Johnny.wcx.dexkit.dsl.dexMethod
@@ -18,32 +20,33 @@ import java.util.Collections
 import java.util.WeakHashMap
 
 /**
- * 打开聊天里的图片 / 视频时, 自动点击「查看原图 / 查看原视频」按钮, 直接看原画质。
+ * 打开聊天里的图片 / 视频时**无感**加载原画质 —— 不显示「查看原图 / 查看原视频」按钮，
+ * 页面一出现就把原图 / 原视频拉下来。
  *
- * 旧实现只 hook 了 `ImageGalleryUI` 的两个方法 (`setImageHdImgBtnVisibility` /
- * `checkNeedShowOriginVideoBtn`), 并在 hook 里枚举 thisObject 的 **Button 类型字段**,
- * 文字命中「查看原图 / 查看原视频」就 `performClick()`。设备实测「查看原视频」不生效,
- * 而旧实现没有任何日志, 无从判断卡在哪一环。反查微信 8.0.76 安装包后确认:
+ * 演进过程（每一步都由设备实测与安装包反查驱动）：
+ *  1. 最早只 hook `ImageGalleryUI` 的两个方法并枚举 **Button 类型字段**点击 ——
+ *     无日志、无声失效（`setImageHdImgBtnVisibility` 在 8.0.76 的 dex 里**根本不存在**；
+ *     `checkNeedShowOriginVideoBtn` 只是一条日志文案，见下）；
+ *  2. v283 改为「生命周期轮询视图树找文案命中「查看原图/查看原视频」的控件并点击」——
+ *     功能可用了（设备日志出现 `已自动点击「查看原图」: 查看原图 1MB (Button)`），
+ *     但按钮会**先显示出来再被点掉**（轮询间隔 600ms），用户能明显看到这一步；
+ *  3. v284（本版）改为 **OnPreDrawListener 帧级拦截**：在每一帧绘制之前扫描，
+ *     命中后**先 GONE 再 performClick**，按钮一帧都不会被画出来，视觉上就是
+ *     「打开图片直接清晰 / 打开视频直接原画」，并且已处理的控件会持续保持隐藏
+ *     （微信下载中会重新显示按钮，这里会再次压掉）。
  *
- *  - `checkNeedShowOriginVideoBtn` 在 dex 里只是**日志文案**
- *    (`checkNeedShowOriginVideoBtn: msg is expired`), 并不是稳定的可 hook 方法名;
- *    且从命名看它只负责**判断**是否需要显示按钮, 真正的 setVisibility 在调用方 ——
- *    hookAfter 时按钮很可能还是 GONE, 旧代码那句 `if (imgBtn.isVisible)` 直接跳过;
- *  - 「查看原视频」文案来自**字符串资源** (中文 `查看原视频`, 英文 View Full Video),
- *    不在 dex 里, 无法按字符串定位控件, 且运行时带体积后缀 (「查看原视频 64MB」);
- *  - `ImageGalleryUI` 类名**未混淆**, 自身声明了 `onCreate` / `onResume`。
- *
- * 因此改为**不依赖按钮类型、也不依赖单个 dex 方法**:
- *  - 从 `ImageGalleryUI` 的 onCreate / onResume 起一个轻量轮询, 直接在视图树里找
- *    「可见且文案命中关键字」的 TextView (Button 也是 TextView 子类), 点击它
- *    (或它最近的可点击祖先);
- *  - 原先定位到的两个 dex 方法仍然 hook, 作为「按钮状态刚更新」的额外续期信号;
- *  - 轮询在页面销毁 / 超时 / 功能关闭时停止; 同一控件 + 同一文案只点一次。
+ * 反查结论（微信 8.0.76.3141，classes3.dex / classes10.dex）：
+ *  - `ImageGalleryUI` 类名未混淆、自身声明 `onCreate` / `onResume`，生命周期 hook 可靠；
+ *  - 按钮运行时是 `android.widget.Button`，文案来自字符串资源
+ *    （中文「查看原图」「查看原视频」，英文 View Full Video / Full Image），
+ *    运行时带体积后缀（「查看原视频 64MB」），所以只能**按渲染文本**定位；
+ *  - 点击「查看原图 / 查看原视频」不会弹网络确认框（资源里无「非 WLAN」类文案），
+ *    因此静默自动加载不会打断用户。
  */
 @Feature(
     name = "自动查看原图/原视频",
     categories = ["聊天"],
-    description = "打开聊天里的图片 / 视频时自动点击「查看原图 / 查看原视频」，直接看原画质"
+    description = "打开聊天里的图片 / 视频时无感加载原图 / 原视频：不显示「查看原图 / 查看原视频」按钮，自动拉取原画质"
 )
 object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
 
@@ -61,32 +64,47 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
 
     /** 按钮文案关键字 (中英双语兜底)。 */
     private val KEYWORDS = listOf(
-        "查看原图", "查看原视频",
-        "Full Image", "Original quality",
+        "查看原图", "查看原视频", "看原视频",
+        "View Full Video", "Full Image", "Original quality",
     )
 
-    private const val INITIAL_DELAY_MS = 200L
-    private const val WATCH_INTERVAL_MS = 600L
+    private const val INITIAL_DELAY_MS = 60L
+
+    /** 兜底轮询间隔。正常路径由 OnPreDrawListener 逐帧驱动, 这条只是防「页面静止不重绘」。 */
+    private const val FALLBACK_INTERVAL_MS = 500L
 
     /**
-     * 单次起轮询后的最长观察时长。图片/视频页内左右滑动**不会**重走 onResume,
-     * 所以窗口要足够长, 覆盖「打开页面后过一阵才划到视频」的情况;
-     * 每次 onResume / 按钮状态更新会重新续期。
+     * 单次起观察后的最长时长。图片/视频页内左右滑动**不会**重走 onResume,
+     * 窗口要足够长以覆盖「打开页面后过一阵才划到视频」的情况; onResume 会重新续期。
      */
-    private const val WATCH_TIMEOUT_MS = 180_000L
+    private const val WATCH_TIMEOUT_MS = 300_000L
 
-    /** Activity -> 轮询截止时间 (uptimeMillis)。命中全部结束 / 超时 / 页面销毁后移除。 */
-    private val deadlines: MutableMap<Activity, Long> =
+    /** Activity -> 页面观察器。Activity 销毁 / 超时后移除。 */
+    private val watchers: MutableMap<Activity, PageWatcher> =
         Collections.synchronizedMap(WeakHashMap())
-
-    /**
-     * 已点过的按钮 (view 身份 + 文案)。轮询窗口内按钮可能长期可见 (下载中),
-     * 用这个避免反复点击; 换到另一个视频时文案/控件不同, 仍会正常点击。
-     */
-    private val clicked = Collections.synchronizedSet(HashSet<String>())
 
     private val methodSetImageHdImgBtnVisibility by dexMethod()
     private val methodCheckNeedShowOriginVideoBtn by dexMethod()
+
+    /**
+     * 单个图片/视频页的观察器。
+     *
+     * [suppressed] 记录**曾经命中过关键字**的控件（按身份）：之后微信把它们重新显示
+     * （下载中会改文案再 setVisibility）时无条件压回 GONE，保证用户始终看不到这个按钮。
+     * [clicked] 按「控件身份 + 文案」去重：同一个控件换到下一个视频时文案会变
+     * （设备日志：64MB → 19MB → 2MB 各自触发过一次点击），必须允许再次点击。
+     */
+    private class PageWatcher(val activity: Activity, val decor: ViewGroup) {
+        val suppressed: MutableSet<Int> = Collections.synchronizedSet(HashSet())
+        val clicked: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
+        @Volatile
+        var deadline: Long = SystemClock.uptimeMillis() + WATCH_TIMEOUT_MS
+
+        var observer: ViewTreeObserver? = null
+        var preDraw: ViewTreeObserver.OnPreDrawListener? = null
+        var fallback: Runnable? = null
+    }
 
     /** 改名后沿用旧 key 的开关状态, 用户在新名下拨动过开关后以新 key 为准。 */
     override val defaultEnabled: Boolean
@@ -104,7 +122,8 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
         }
 
     override fun resolveDex(dexKit: DexKitBridge) {
-        // 图片: 优先 setHdImageActionDownloadable, 回退 setImageHdImgBtnVisibility
+        // 图片：这两个方法名在 8.0.76 上未必存在（`setImageHdImgBtnVisibility` 已确认不存在），
+        // 定位不到就走纯 UI 观察路径，不影响功能。
         runCatching {
             val imageResults = dexKit.findMethod {
                 matcher {
@@ -122,7 +141,6 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
             imageResults.firstOrNull()?.let { methodSetImageHdImgBtnVisibility.setDescriptor(it) }
         }.onFailure { WeLogger.w(TAG, "定位图片原图按钮方法失败: ${it.message}") }
 
-        // 视频: checkNeedShowOriginVideoBtn。allowFailure = true, 多结果时取首个而不是抛异常
         runCatching {
             methodCheckNeedShowOriginVideoBtn.find(dexKit, allowFailure = true) {
                 matcher {
@@ -136,21 +154,21 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
     override fun onEnable() {
         installGalleryLifecycleHook()
         installOriginStateHooks()
-        WeLogger.i(TAG, "enabled: 打开图片 / 视频时自动点击「查看原图 / 查看原视频」")
+        WeLogger.i(TAG, "enabled: 图片 / 视频页无感加载原图与原视频")
     }
 
     override fun onDisable() {
-        deadlines.clear()
-        clicked.clear()
+        val snapshot = synchronized(watchers) { watchers.values.toList() }
+        snapshot.forEach { stop(it) }
+        watchers.clear()
     }
 
     // ─────────────────────────────── 触发入口 ───────────────────────────────
 
-    /** 主入口: 图片 / 视频查看页的 Activity 生命周期。 */
     private fun installGalleryLifecycleHook() {
         val clazz = runCatching { GALLERY_UI_CLASS.toClass() }.getOrNull()
         if (clazz == null) {
-            WeLogger.w(TAG, "未找到 $GALLERY_UI_CLASS, 仅依赖 dex 方法触发轮询")
+            WeLogger.w(TAG, "未找到 $GALLERY_UI_CLASS, 仅依赖 dex 方法触发")
             return
         }
 
@@ -163,7 +181,7 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
             }.getOrNull() ?: return@forEach
 
             method.hookAfter {
-                // 若命中的是父类实现 (如 Activity.onCreate), 会收到全部 Activity 的回调, 需按类名过滤
+                // 命中父类实现时会收到全部 Activity 的回调, 需按类名过滤
                 val activity = thisObject as? Activity ?: return@hookAfter
                 if (activity.javaClass.name != GALLERY_UI_CLASS) return@hookAfter
                 armWatcher(activity)
@@ -173,15 +191,15 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
         if (hooked > 0) {
             WeLogger.i(TAG, "已 hook $GALLERY_UI_CLASS 的 $hooked 个生命周期方法")
         } else {
-            WeLogger.w(TAG, "未能 hook $GALLERY_UI_CLASS 的生命周期方法, 仅依赖 dex 方法触发轮询")
+            WeLogger.w(TAG, "未能 hook $GALLERY_UI_CLASS 的生命周期方法, 仅依赖 dex 方法触发")
         }
     }
 
-    /** 原有两个 dex 方法仍 hook, 作为「按钮状态刚更新」的额外续期信号。 */
+    /** 原有两个 dex 方法仍 hook：它们被调用说明按钮状态刚更新, 顺手续期观察窗口。 */
     private fun installOriginStateHooks() {
         listOf(methodSetImageHdImgBtnVisibility, methodCheckNeedShowOriginVideoBtn).forEach { method ->
             if (method.isPlaceholder) {
-                WeLogger.w(TAG, "${method.key} 未定位到, 跳过 (仅靠生命周期轮询)")
+                WeLogger.w(TAG, "${method.key} 未定位到, 跳过 (仅靠 UI 观察)")
                 return@forEach
             }
             method.hookAfter {
@@ -191,57 +209,119 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
         }
     }
 
-    // ─────────────────────────────── 轮询与点击 ───────────────────────────────
+    // ─────────────────────────────── 页面观察 ───────────────────────────────
 
-    /** 起（或续期）一个轮询任务; 同一页面只跑一个任务。 */
+    /** 起（或续期）页面观察器; 同一 Activity 只跑一个。 */
     private fun armWatcher(activity: Activity) {
-        val decor = activity.window?.decorView ?: return
-        val deadline = SystemClock.uptimeMillis() + WATCH_TIMEOUT_MS
-        // put 返回非 null 说明已有任务在跑, 这里只续期
-        if (deadlines.put(activity, deadline) != null) return
-        decor.postDelayed(watchTask(activity, decor), INITIAL_DELAY_MS)
+        val decor = activity.window?.decorView as? ViewGroup ?: return
+
+        synchronized(watchers) {
+            val existing = watchers[activity]
+            if (existing != null) {
+                existing.deadline = SystemClock.uptimeMillis() + WATCH_TIMEOUT_MS
+                return
+            }
+        }
+
+        val watcher = PageWatcher(activity, decor)
+        val observer = decor.viewTreeObserver
+        val preDraw = ViewTreeObserver.OnPreDrawListener {
+            processFrame(watcher)
+            true
+        }
+        val fallback = object : Runnable {
+            override fun run() {
+                if (processFrame(watcher)) {
+                    decor.postDelayed(this, FALLBACK_INTERVAL_MS)
+                }
+            }
+        }
+
+        watcher.observer = observer
+        watcher.preDraw = preDraw
+        watcher.fallback = fallback
+        watchers[activity] = watcher
+
+        // 逐帧驱动: 按钮在被绘出之前就被拦下 —— 这是「无感」的关键
+        observer.addOnPreDrawListener(preDraw)
+        decor.postDelayed(fallback, INITIAL_DELAY_MS)
+        WeLogger.i(TAG, "开始观察图片/视频页 (${activity.javaClass.simpleName})")
     }
 
-    private fun watchTask(activity: Activity, decor: View): Runnable = object : Runnable {
-        override fun run() {
-            try {
-                val deadline = deadlines[activity] ?: return // 已停止 (页面销毁 / 关闭功能)
-                if (activity.isFinishing || activity.isDestroyed) {
-                    deadlines.remove(activity)
-                    return
-                }
-
-                clickOriginButton(decor)
-
-                if (SystemClock.uptimeMillis() >= deadline) {
-                    deadlines.remove(activity)
-                    return
-                }
-                decor.postDelayed(this, WATCH_INTERVAL_MS)
-            } catch (t: Throwable) {
-                deadlines.remove(activity)
-                WeLogger.w(TAG, "原图/原视频轮询异常: ${t.message}")
-            }
+    /**
+     * 处理一帧 / 一次兜底轮询。
+     * @return 是否继续（false 表示观察已结束）
+     */
+    private fun processFrame(watcher: PageWatcher): Boolean {
+        if (!isAlive(watcher)) {
+            stop(watcher)
+            return false
+        }
+        return try {
+            suppressOriginButtons(watcher)
+            true
+        } catch (t: Throwable) {
+            WeLogger.w(TAG, "原图/原视频观察异常: ${t.message}")
+            true
         }
     }
 
-    /** 在视图树里找可见且文案命中关键字的 TextView, 点击它（或最近的可点击祖先）。 */
-    private fun clickOriginButton(root: View) {
-        for (view in root.allViews) {
+    private fun isAlive(watcher: PageWatcher): Boolean {
+        val activity = watcher.activity
+        if (activity.isFinishing || activity.isDestroyed) return false
+        return SystemClock.uptimeMillis() < watcher.deadline
+    }
+
+    private fun stop(watcher: PageWatcher) {
+        watchers.remove(watcher.activity)
+        runCatching {
+            watcher.preDraw?.let { watcher.observer?.removeOnPreDrawListener(it) }
+        }
+        runCatching {
+            watcher.fallback?.let { watcher.decor.removeCallbacks(it) }
+        }
+        watcher.suppressed.clear()
+        watcher.clicked.clear()
+    }
+
+    /**
+     * 在视图树里找「查看原图 / 查看原视频」按钮：
+     *  - 命中且首次发现 → **先隐藏（GONE）再点击**，按钮不会被绘制出来；
+     *  - 命中但已点过（文案不同 → 换到下一个视频）→ 隐藏后再次点击；
+     *  - 曾经命中过的控件（不论当前文案）→ 只要又显示出来就再压回 GONE。
+     */
+    private fun suppressOriginButtons(watcher: PageWatcher) {
+        for (view in watcher.decor.allViews) {
             val textView = view as? TextView ?: continue
-            if (!textView.isShown) continue
+            val target = clickTarget(textView)
+            val id = System.identityHashCode(target)
+            val alreadySuppressed = id in watcher.suppressed
+
+            // 曾经命中过的控件: 无条件保持隐藏 (微信下载中会改文案再显示)
+            if (alreadySuppressed && target.visibility != View.GONE) {
+                target.visibility = View.GONE
+            }
+
             val text = textView.text?.toString()?.trim().orEmpty()
             if (text.isEmpty()) continue
 
             val keyword = KEYWORDS.firstOrNull { text.contains(it, ignoreCase = true) } ?: continue
 
-            // 同一个控件 + 同一段文案只点一次 (按钮下载期间会一直可见)
-            val key = "${System.identityHashCode(textView)}|$text"
-            if (!clicked.add(key)) continue
-            if (clicked.size > 128) clicked.clear()
+            // 首次发现要求按钮是真的显示着 (避免误伤不可见区域里残留的文案)
+            if (!alreadySuppressed && !textView.isShown) continue
+            if (!alreadySuppressed && !target.isShown) continue
 
-            clickTarget(textView).performClick()
-            WeLogger.i(TAG, "已自动点击「$keyword」: $text (${textView.javaClass.simpleName})")
+            // 先隐藏: preDraw 阶段设 GONE 后, 本帧 draw 就会跳过它 —— 用户看不到任何「查看原图」
+            if (target.visibility != View.GONE) target.visibility = View.GONE
+            watcher.suppressed.add(id)
+            if (watcher.suppressed.size > 128) watcher.suppressed.clear()
+
+            val key = "$id|$text"
+            if (!watcher.clicked.add(key)) continue
+            if (watcher.clicked.size > 256) watcher.clicked.clear()
+
+            target.performClick()
+            WeLogger.i(TAG, "无感加载「$keyword」: $text (${textView.javaClass.simpleName})")
         }
     }
 

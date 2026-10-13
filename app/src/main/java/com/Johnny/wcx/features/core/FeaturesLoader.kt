@@ -2,6 +2,7 @@ package com.Johnny.wcx.features.core
 
 import com.tencent.mm.ui.LauncherUI
 import com.Johnny.wcx.constants.Preferences
+import com.Johnny.wcx.dexkit.DexAdaptTask
 import com.Johnny.wcx.dexkit.abc.IResolveDex
 import com.Johnny.wcx.dexkit.cache.DexCacheManager
 import com.Johnny.wcx.features.api.ui.WeSettingsInjector
@@ -13,7 +14,6 @@ import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.android.showToast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -134,8 +134,17 @@ object FeaturesLoader {
             WeLogger.e(TAG, "版本兼容性检测异常", e)
         }
 
-        WeLogger.i(TAG, "launching background coroutine to repair ${brokenItems.size} items")
+        // 1) 先把适配任务起在后台 —— 不依赖任何 Activity / 对话框。
+        //    v284 起适配是「进程级后台任务 + 可选进度窗口」的结构：
+        //    拿不到 LauncherUI、用户关掉进度框、微信切到后台，扫描都照常进行。
+        DexAdaptTask.start(brokenItems)
+        WeLogger.i(
+            TAG,
+            "launched background dex-adapt task for ${brokenItems.size} items " +
+                    "(independent of any UI; closing the dialog / backgrounding WeChat keeps it running)"
+        )
 
+        // 2) 再尝试挂一个进度对话框 —— 它只是观察者，失败也不影响适配
         CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
             var activity = LauncherUI.getInstance()
             var waited = 0L
@@ -146,7 +155,7 @@ object FeaturesLoader {
             }
 
             if (activity == null) {
-                WeLogger.w(TAG, "no LauncherUI available for dex-repair dialog; skipping")
+                WeLogger.w(TAG, "no LauncherUI for dex progress dialog; adaptation already running in background, not cancelled")
                 return@launch
             }
 
@@ -156,7 +165,6 @@ object FeaturesLoader {
                     DexResolver(
                         boundActivity,
                         brokenItems,
-                        MainScope(),
                         onDismiss
                     )
                 }
