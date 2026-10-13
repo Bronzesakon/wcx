@@ -144,7 +144,33 @@ jobs:
 
             基线为上游 v273，保留本仓库自建功能 + 联系人选择器改进。
 
-            ### 本版修复（v282）
+            ### 本版新增/修复（v283）
+
+            - **「自动查看原图」重做为「自动查看原图/原视频」，实测可自动点击
+              「查看原视频」**：原实现只 hook `ImageGalleryUI` 的
+              `setImageHdImgBtnVisibility` / `checkNeedShowOriginVideoBtn`，
+              并在 hook 里枚举 **Button 类型字段**判断文案后 performClick。
+              反查微信 8.0.76 安装包确认此路不通：`checkNeedShowOriginVideoBtn`
+              在 dex 里只是一条**日志文案**（`...: msg is expired`），并非稳定的
+              可 hook 方法名，且从命名看它只负责「判断是否需要显示」，真正的
+              setVisibility 在调用方——hookAfter 时按钮往往仍是 GONE，
+              旧代码那句 `if (imgBtn.isVisible)` 直接跳过；「查看原视频」文案
+              来自字符串资源（不在 dex 里），运行时还带体积后缀
+              （「查看原视频 64MB」）。现改为不依赖按钮类型与具体 dex 方法：
+              从 `ImageGalleryUI`（类名未混淆，自身声明 onCreate/onResume）的
+              生命周期起轻量轮询，在视图树里找「可见且文案命中关键字」的
+              TextView（Button 也是 TextView 子类）并点击它或最近的可点击祖先；
+              原有两个 dex 方法仍 hook，作为按钮状态更新的额外续期信号
+            - 轮询窗口 3 分钟并随 onResume / 按钮状态更新续期（页内左右滑动不重走
+              onResume，窗口太短会漏），同一控件+同一文案只点一次避免下载期间反复
+              点击；窗口内切到别的视频仍会正常点击
+            - 功能改名沿用旧开关：`defaultEnabled` 回退读取旧名「自动查看原图」的
+              状态，老用户升级后保持原有的开启/关闭选择（v281→v282 已踩过更名
+              重置开关的坑）；启动日志打印开关判定与新/旧 key 存在情况
+            - 命中与启动状态均有 I 级日志（tag `AutoViewOriginalMedia`），
+              下次可一眼分辨「开关没开 / 生命周期 hook 没装上 / 视图树没找到按钮」
+
+            ### 上一版（v282）
 
             - **修复「完整显示备注名」在 v281 更名后被静默关闭**（设备日志实锤）：
               功能的开关状态是以**功能名**为 key 持久化的
