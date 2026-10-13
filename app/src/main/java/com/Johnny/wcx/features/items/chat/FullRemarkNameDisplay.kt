@@ -28,20 +28,57 @@ import java.util.WeakHashMap
 /**
  * 让三处微信原生界面的「名字」完整显示, 过长时自动换行而不是截断成「...」:
  *
- *  1. 微信主界面「微信」标签页 —— 会话列表行的名字 (微信约 14 字后截断)
- *  2. 微信主界面「通讯录」标签页 —— 联系人行的名字 (约 16 字后截断)
- *  3. 好友聊天页 —— 顶部标题栏的名字 (约 8+8 字后截断)
+ *  1. 微信主界面「微信」标签页 —— 会话列表行的名字
+ *  2. 微信主界面「通讯录」标签页 —— 联系人行的名字
+ *  3. 好友聊天页 —— 顶部标题栏的名字
  *
  * 微信这三处显示的「名字」优先取**备注名** (未设备注时退化为昵称), 因此功能命名为
  * 「完整显示备注名」。
  *
- * 截断分两种, 处理方式不同 (8.0.76 设备日志实锤):
- *  - **渲染级截断** (会话列表 / 通讯录): TextView 的 singleLine + ellipsize,
+ * 截断分两种, 处理方式不同:
+ *  - **渲染级截断** (会话列表 / 通讯录): TextView 的 singleLine / maxLines / ellipsize,
  *    text 本身仍是完整的 —— 放开单行/省略号/写死高度即可完整显示。
  *  - **代码级截断** (聊天页标题): 微信在 setText 之前就把字符串改成了
  *    「头部...尾部」—— 注意是三个 ASCII 点, 不是 Android 原生 ellipsize 的
  *    单字符「…」, 说明文本自身已残缺, 放开 TextView 无效。需挂 TextWatcher,
  *    发现省略号后用备注名 (rcontact.conRemark → nickname) 还原完整文本。
+ *
+ * ## 8.0.76.3141 安装包反查实锤 (2026-10-13, 布局已混淆, 靠资源 id 定位)
+ *
+ *  - 会话行 (微信标签页): `MvvmConversationAdapter` (Lfh5/w0) inflate `layout/e45`
+ *    (另有 a2v/a2w 两个历史变体), 行根是 `ConversationFolderItemView` (只覆写
+ *    onMeasure), 标题是 **`com.tencent.mm.ui.base.NoMeasuredTextView`**,
+ *    `tag="nickname_tv"`, `id=0x7f094c8f`, 字号 17dp (摘要 14dp / 时间 12dp),
+ *    宽度 match_parent、高度 wrap_content、行最小高度 72dp。
+ *  - 通讯录行: `MicroMsg.Mvvm.AddressItemConvert` (Lah5/f) 只有 4 个方法:
+ *    `c(RecyclerView): View` (inflate `layout/de`)、
+ *    `d(RecyclerView, View): ViewHolder` (即 convertViewHolder)、
+ *    `h(holder, item, ...)` (即 onBindViewHolder)、`i(RecyclerView, holder, Int)`。
+ *    名字是 `TableRow` 内的 `TextView id=0x7f094c8f`, 17dp,
+ *    `maxLines=1 + ellipsize=end`, 宽 wrap_content、高 match_parent,
+ *    外层的名字行容器是固定 56dp (`dimen/dj`); 17dp 两行约 40dp, 56dp 装得下。
+ *
+ * ## 备注名为什么原来不换行 (2026-10-13 逐条实锤)
+ *
+ *  1. **会话行卡的不是单行属性, 是高度**。style `0x7f110235` (style/j3) 里写死
+ *     `singleLine=true + ellipsize=end`; `setSingleLine(true)` 被 NoMeasuredTextView
+ *     覆写成 `setLines(1)` → 它自己的 `.r` 字段 = 1, 而 `getDesiredHeight()` 拿 `.r`
+ *     当**行数**算高度 (`layout.getLineTop(.r)`) → 视图被量成只有一行高, 第二行直接
+ *     被裁掉; 同时 `.h`(ellipsize) = END 让内部 Layout 打上省略号。
+ *     放开必须同时做三件事: `setSingleLine(false)` (→ `.r = MAX`, 高度回来)、
+ *     `maxLines = MAX`、`ellipsize = null` (→ `.h = null`, 去掉省略号)。
+ *  2. **两个列表的绑定时机都不可靠, 所以定位标题不能依赖文本**。
+ *     会话行走 MvvmList 框架异步绑定; 通讯录行的 `d(RecyclerView, convertView)`
+ *     是在**视图刚 inflate、文本还没 setText** 时调的 (文本在随后的 `h(...)` 里才写)。
+ *     旧实现用「行内字号最大**且有文字**的 TextView」找标题 → 这两个时机下永远取到
+ *     null, 于是备注名一次都没被放开过。现在改为 **tag → 资源 id → 字号最大** 三级定位,
+ *     只要有控件就能找到, 与绑定时机无关。
+ *  3. `NoMeasuredTextView` 覆写了 `setSingleLine / setLines / setMaxLines / setEllipsize`
+ *     **且不调 super**, 标准 getter 读不到真实值 (`getMaxLines` 没被覆写, 返回的是
+ *     TextView 自己的 mMaxLines)。唯一可靠的是 **`getEllipsize()` 被覆写**, 读的就是
+ *     `.h` —— 所以「原来是不是单行」用它判断, 还原时也用它。
+ *  4. 因为 (3), 只改 setter 还不够: 微信可能在任何时机把单行写回去, 所以额外钩住这四个
+ *     setter, 参数代表「单行」时立刻再放开一次。`setText` 故意不钩 (会互相触发)。
  *
  * 关闭功能时会把放开过的 TextView 逐一还原成原状态 (列表行是复用 View 的,
  * 不还原的话关掉开关后行里仍是多行), 并摘掉 TextWatcher。
@@ -89,6 +126,51 @@ object FullRemarkNameDisplay : SwitchFeature(),
 
     /** 记住的会话显示名 / 备注名查询缓存的上限。 */
     private const val NAME_CACHE_LIMIT = 128
+
+    /** 会话行标题在布局里写死的 tag (a2v / a2w / e45 三个变体都是它)。 */
+    private const val NICKNAME_TAG = "nickname_tv"
+
+    /**
+     * 会话行标题与通讯录名字**共用**的资源 id (8.0.76 实测 `0x7f094c8f`)。
+     * 通讯录行的名字 TextView 上没有任何 tag, 只能靠资源 id 定位; 会话行用它兜底。
+     */
+    private const val ID_ROW_TITLE = 0x7f094c8f
+
+    /**
+     * 会话行标题控件的类名。8.0.76 未混淆, 用**写死的类名**定位 (与 ChattingUIFragment
+     * 同款做法), 不新增 dex 委托 —— 避免改动 dex 缓存键导致用户升级后要重新适配。
+     */
+    private const val NO_MEASURED_TEXT_VIEW = "com.tencent.mm.ui.base.NoMeasuredTextView"
+
+    /** setLines / setMaxLines 的参数落在这个区间时, 视为「被写回单行」。 */
+    private const val MAX_SINGLE_LINE_LINES = 4
+
+    /**
+     * 需要「防回退」的 setter: 方法名 → 参数是否代表单行。
+     *
+     * `NoMeasuredTextView` 把这四个 setter **全部覆写进自己的字段且不调 super**,
+     * 所以微信在任何时机 (布局 style / 复用时的重新绑定) 写回单行, 都会经过这里;
+     * 钩住它们就与绑定时机彻底解耦。`setText` 故意不钩 —— 会与放开动作互相触发。
+     */
+    private val TITLE_SETTERS = listOf(
+        "setSingleLine" to true,
+        "setLines" to true,
+        "setMaxLines" to true,
+        "setEllipsize" to false,
+    )
+
+    /** 诊断日志的入口名。 */
+    private const val SITE_CONVERSATION = "微信标签页-会话行"
+    private const val SITE_ADDRESS = "通讯录-联系人行"
+
+    /** 已经放开过的行视图, 免得每次 onBind 都重新遍历一遍行内控件。 */
+    private val processedRows = WeakHashMap<View, Boolean>()
+
+    /** 每个入口只打一次「行标题已放开」诊断日志, 免得滚动时刷屏。 */
+    private val loggedSites: MutableSet<String> = Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** applyUnwrap 内部会调用微信覆写过的 setter, 需要防住观察器重入导致的无限递归。 */
+    private val unwrapping = ThreadLocal.withInitial { false }
 
     /** 放开前的原始状态，供关闭功能时还原。 */
     private class TruncationState(
@@ -159,8 +241,10 @@ object FullRemarkNameDisplay : SwitchFeature(),
         noBarLogged = false
         rowRestoreLogged = false
         lastFailedRestoreText = null
+        loggedSites.clear()
         WeConversationListViewApi.addListener(this)
         installAddressHook()
+        installConversationTitleGuard()
         installChatTitleHook()
         installTalkerCapture()
         WeLogger.i(TAG, "enabled: 会话列表 / 通讯录 / 聊天页标题的备注名完整显示")
@@ -181,6 +265,8 @@ object FullRemarkNameDisplay : SwitchFeature(),
         released.clear()
         restorers.forEach { (tv, watcher) -> tv.removeTextChangedListener(watcher) }
         restorers.clear()
+        processedRows.clear()
+        loggedSites.clear()
         currentTalker = null
         rememberedNames.clear()
         displayNameCache.clear()
@@ -198,8 +284,12 @@ object FullRemarkNameDisplay : SwitchFeature(),
         conversation: Any,
         context: WeConversationListViewApi.BindContext,
     ) {
-        val title = findRowTitle(row as? ViewGroup ?: return) ?: return
-        release(title)
+        // 1) 放开单行截断。会话行标题的单行属性来自布局 style (style/j3: singleLine=true
+        //    + ellipsize=end), 按 tag=nickname_tv 定位, 不依赖文本是否已绑定。
+        unwrapRowTitle(row, SITE_CONVERSATION) { conversationTitle(it) }
+
+        // 2) 代码级截断: 行文本自身已是「头部...尾部」时用备注名还原
+        val title = conversationTitle(row) ?: return
         val text = title.text?.toString() ?: return
         val username = runCatching {
             conversation.reflekt()
@@ -212,7 +302,6 @@ object FullRemarkNameDisplay : SwitchFeature(),
             rememberName(username, text)
             return
         }
-        // 代码级截断: 行文本自身已残缺, 用备注名直接还原
         val full = restoreIfTruncated(text, displayNameOf(username)) ?: return
         title.setText(full)
         rememberName(username, full)
@@ -236,12 +325,62 @@ object FullRemarkNameDisplay : SwitchFeature(),
                 .firstMethod {
                     parameters("androidx.recyclerview.widget.RecyclerView", View::class.java)
                 }.hookAfter {
-                    val item = args.getOrNull(1) as? ViewGroup ?: return@hookAfter
-                    releaseNicknameIn(item)
+                    // 该方法是 convertViewHolder(recyclerView, convertView): 参数名在 8.0.76
+                    // 的 dex 里就叫 "convertView", 返回 `po5.s0`(RecyclerView 的 ViewHolder),
+                    // 而 args[1] 与返回值的 itemView 是同一个行视图 —— 所以这里两种取法都行,
+                    // 拿 itemView 更直观。注意此刻**文本还没 setText**(文本在随后的
+                    // AddressItemConvert.h(...) 里才写), 所以定位标题绝不能依赖文字。
+                    val item = itemViewOf(result) ?: (args.getOrNull(1) as? View) ?: return@hookAfter
+                    unwrapRowTitle(item, SITE_ADDRESS) { addressTitle(it) }
                 }
         }.onFailure {
             WeLogger.w(TAG, "通讯录行 hook 安装失败，备注名保持原样", it)
         }
+    }
+
+    /**
+     * 会话行标题的「防回退」加固: 标题是微信自绘的 `NoMeasuredTextView`, 它把
+     * `setSingleLine / setLines / setMaxLines / setEllipsize` 全部覆写进自己的字段、
+     * **不调 super**, 所以只要微信在任何时机(布局 style、复用时的重新绑定、异步刷新)
+     * 把它写回单行, 这里就立刻放开一次 —— 与绑定时机的耦合被彻底切断。
+     *
+     * 类名在 8.0.76 未混淆, 用 **写死的类名** 定位(与 ChattingUIFragment 同款做法),
+     * 不新增 dex 委托 —— 避免改动 dex 缓存键导致用户升级后需要重新适配。
+     */
+    private fun installConversationTitleGuard() {
+        val clazz = runCatching { NO_MEASURED_TEXT_VIEW.toClass() }.getOrElse {
+            WeLogger.w(TAG, "$NO_MEASURED_TEXT_VIEW 未找到，会话行标题仅靠每行绑定放开")
+            return
+        }
+        var hooked = 0
+        for ((methodName, checkArgument) in TITLE_SETTERS) {
+            // setSingleLine / setLines 在 TextView 里各有多个重载, 逐个钩才不漏
+            val methods = runCatching { clazz.reflekt().methods { name = methodName } }.getOrNull()
+                ?: continue
+            for (method in methods) {
+                runCatching {
+                    method.hookAfter {
+                        // checkArgument=true: 参数是行数或布尔, 只有「单行」才需要放开
+                        // checkArgument=false: 参数是 TruncateAt, 非 null 就是又加了省略号
+                        val value = args.getOrNull(0)
+                        val turnsSingleLine = if (checkArgument) {
+                            value == true || (value is Int && value in 1..MAX_SINGLE_LINE_LINES)
+                        } else {
+                            value != null
+                        }
+                        if (turnsSingleLine) guardConversationTitle(thisObject)
+                    }
+                }.onSuccess { hooked++ }
+            }
+        }
+        WeLogger.i(TAG, "会话行标题加固: 已 hook $hooked 个 $NO_MEASURED_TEXT_VIEW 方法")
+    }
+
+    /** 只有会话行标题(tag=nickname_tv)才需要防回退; 其余 NoMeasuredTextView 直接跳过。 */
+    private fun guardConversationTitle(target: Any?) {
+        val tv = target as? TextView ?: return
+        if (tv.tag != NICKNAME_TAG) return
+        applyToTitle(SITE_CONVERSATION, tv)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -411,23 +550,97 @@ object FullRemarkNameDisplay : SwitchFeature(),
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * 在一行（会话行 / 通讯录行）里找名字 TextView：字号最大且有文字的 TextView。
-     * 会话行里标题是最大字号，摘要、时间、未读数都更小，能稳定区分。
+     * 会话行 (微信标签页) 的名字控件: 布局 `e45` 里写死 `tag="nickname_tv"`。
+     * **与文本是否已绑定无关** —— 这是旧实现失败的关键 (旧代码要求 TextView 已有文字,
+     * 而绑定可能异步发生, 于是永远取不到标题)。
      */
-    private fun findRowTitle(root: ViewGroup): TextView? {
-        var title: TextView? = null
+    private fun conversationTitle(root: View): TextView? =
+        runCatching { root.findViewWithTag<View>(NICKNAME_TAG) as? TextView }.getOrNull()
+            ?: addressTitle(root)
+
+    /**
+     * 通讯录行的名字控件: 布局 `de` 里没有任何 tag, 用与会话行标题**共用**的资源 id
+     * `0x7f094c8f` 定位, 取不到再退化为字号最大的有字 TextView。
+     */
+    private fun addressTitle(root: View): TextView? =
+        runCatching { root.findViewById<TextView>(ID_ROW_TITLE) }.getOrNull() ?: rowTitle(root)
+
+    /**
+     * 兜底: 行里字号最大的有字 TextView (两个列表里名字都是 17dp, 摘要 14dp / 时间 12dp)。
+     * 只在 tag / 资源 id 都失配 (微信改布局) 时才用得上, 所以要求有文字避免误伤。
+     */
+    private fun rowTitle(root: View): TextView? {
+        var best: TextView? = null
         forEachTextView(root) { tv ->
             if (tv.text.isNullOrBlank()) return@forEachTextView
-            if (title == null || tv.textSize > title!!.textSize) title = tv
+            val current = best
+            if (current == null || tv.textSize > current.textSize) best = tv
         }
-        return title
+        return best
     }
 
-    private fun releaseNicknameIn(root: ViewGroup) {
-        findRowTitle(root)?.let { release(it) }
+    /**
+     * 从 ViewHolder 里取 itemView (字段名固定, 定义在 `androidx.recyclerview.widget.ViewHolder`)。
+     * 通讯录的 `convertViewHolder(recyclerView, convertView)` 返回的就是它, 行视图从这儿拿。
+     */
+    private fun itemViewOf(holder: Any?): View? {
+        if (holder == null) return null
+        return runCatching {
+            holder.reflekt().firstFieldOrNull { name = "itemView"; superclass() }?.get() as? View
+        }.getOrNull() ?: runCatching {
+            holder.javaClass.getField("itemView").get(holder) as? View
+        }.getOrNull()
     }
 
-    private inline fun forEachTextView(root: View, action: (TextView) -> Unit) {
+    /**
+     * 放开一行里名字控件的单行截断。定位标题只看控件本身 (tag / 资源 id), 不看文本,
+     * 所以无论是 getView 的哪个时机被调到都能命中。
+     */
+    private fun unwrapRowTitle(root: View, site: String, findTitle: (View) -> TextView?) {
+        if (processedRows.containsKey(root)) return
+        val title = findTitle(root) ?: return
+        processedRows[root] = true
+        applyToTitle(site, title)
+    }
+
+    /**
+     * 真正放开一处名字控件, 并打一条一次性诊断日志 (每个入口只打一条, 滚动不刷屏)。
+     *
+     * `unwrapping` 是重入闸: 放开动作会调用微信覆写过的 setter, 而 setter 又被我们
+     * 钩住做防回退, 没有它就会自己触发自己。
+     */
+    private fun applyToTitle(site: String, tv: TextView) {
+        if (unwrapping.get() == true) return
+        unwrapping.set(true)
+        try {
+            recordOriginal(tv)
+            applyUnwrap(tv)
+            // 微信把 Layout 缓存在自己的字段里, 已经量过的行不会自动按新属性重排;
+            // 重设一次同样的文本 + requestLayout 把它顶回测量流程 (首帧时文本还是空的, 跳过)。
+            val text = tv.text
+            if (!text.isNullOrBlank()) runCatching { tv.setText(text) }
+            runCatching { tv.requestLayout() }
+        } finally {
+            unwrapping.set(false)
+        }
+        if (loggedSites.add(site)) {
+            WeLogger.i(
+                TAG,
+                "行标题已放开 ($site): ${tv.javaClass.simpleName} tag=${tv.tag} " +
+                    "字号=${tv.textSize} maxLines=${tv.maxLines} ellipsize=${tv.ellipsize} " +
+                    "高=${describeHeight(tv)}"
+            )
+        }
+    }
+
+    private fun describeHeight(tv: TextView): String = when (val h = tv.layoutParams?.height) {
+        null -> "无"
+        ViewGroup.LayoutParams.MATCH_PARENT -> "match_parent"
+        ViewGroup.LayoutParams.WRAP_CONTENT -> "wrap_content"
+        else -> "${h}px"
+    }
+
+    private fun forEachTextView(root: View, action: (TextView) -> Unit) {
         val queue = ArrayDeque<View>()
         queue.add(root)
         while (queue.isNotEmpty()) {
@@ -439,18 +652,34 @@ object FullRemarkNameDisplay : SwitchFeature(),
 
     /** 放开单个 TextView 的单行截断；记下原状态，关闭功能时还原。 */
     private fun release(tv: TextView) {
-        if (released.containsKey(tv)) return
-        val lp = tv.layoutParams
-        released[tv] = TruncationState(
-            maxLines = tv.maxLines,
-            singleLine = tv.isSingleLine,
-            ellipsize = tv.ellipsize,
-            height = lp?.height ?: 0,
-        )
+        recordOriginal(tv)
         applyUnwrap(tv)
     }
 
+    /**
+     * 记下放开前的原始状态 (只记第一次), 关闭功能时按它还原。
+     *
+     * `NoMeasuredTextView` 把单行属性存进自己的字段且不调 super, 所以标准 getter 读不到
+     * 真实值 —— 但它覆写的 `getEllipsize()` 读的就是布局里设的 ellipsize (会话行 style
+     * 里是 end), 用它判断「原来是不是单行」才准。不这样处理的话, 关掉开关后会话行会
+     * 停在多行状态 (还原成 singleLine=false)。
+     */
+    private fun recordOriginal(tv: TextView) {
+        if (released.containsKey(tv)) return
+        val lp = tv.layoutParams
+        val noMeasured = tv.javaClass.name == NO_MEASURED_TEXT_VIEW
+        val wasSingleLine = if (noMeasured) tv.ellipsize != null else tv.isSingleLine
+        released[tv] = TruncationState(
+            maxLines = if (noMeasured && wasSingleLine) 1 else tv.maxLines,
+            singleLine = wasSingleLine,
+            ellipsize = tv.ellipsize,
+            height = lp?.height ?: 0,
+        )
+    }
+
     private fun applyUnwrap(tv: TextView) {
+        // 顺序有讲究: setSingleLine(false) 在 NoMeasuredTextView 里被实现成
+        // setMaxLines(0x7fffffff) → 写它的行数字段 .r, 高度 (getDesiredHeight) 才会跟着放开。
         tv.setSingleLine(false)
         tv.maxLines = Int.MAX_VALUE
         tv.ellipsize = null

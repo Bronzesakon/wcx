@@ -144,7 +144,46 @@ jobs:
 
             基线为上游 v273，保留本仓库自建功能 + 联系人选择器改进。
 
-            ### 本版新增/修复（v284）
+            ### 本版新增/修复（v285）
+
+            - **备注名多行显示修复：通讯录与微信标签页（会话列表）不再被截断**：
+              聊天页标题此前已修好，这两处仍显示「…」。反查微信 8.0.76 安装包后
+              确认两处根因各不相同：
+              - **定位失败根因**：旧实现按「行内文字最长的 TextView」找标题，且
+                要求文字非空。而通讯录取标题用的 `AddressItemConvert.d(recyclerView,
+                view)` 是在 **inflate 之后、setText 之前** 被调用的，此刻行内所有
+                TextView 都还没文字 → 永远取到 null，hook 从头到尾没生效过。
+                现改为三级定位：`tag="nickname_tv"` → 资源 id `0x7f094c8f` →
+                字号最大的 TextView，不再依赖文字是否已填入
+              - **换行失败根因**：会话行标题控件是 `com.tencent.mm.ui.base.NoMeasuredTextView`，
+                它把 `setSingleLine(true)` 转成 `setLines(1)`，而它的
+                `getDesiredHeight()` 把内部字段当 **行数** 去算高度
+                （`layout.getLineTop(行数)`）—— 所以「只把 ellipsize 去掉」不够，
+                行高仍会被算成一行。现按顺序 `setSingleLine(false)` →
+                `maxLines = Int.MAX_VALUE` → `ellipsize = null`，并把被写死的高度
+                改回 `WRAP_CONTENT`
+              - 放开后再重设一次同文本并 `requestLayout()`，避免命中已缓存/已量过的
+                布局导致不重排；用重入闸防止「放开动作」反过来触发自身的 setter
+                守卫造成递归
+              - 关掉开关可完整还原：`NoMeasuredTextView` 的 `isSingleLine` /
+                `maxLines` 读到的都是假值，改用 `ellipsize != null` 判断，
+                并把 `maxLines` 强制回 1
+
+            - **新功能「后台自动加载原图 / 原视频」（设置 → 聊天 开启）**：
+              消息一落库就在后台把原图与原画质视频拉下来，**不需要点开图片/视频页**，
+              点开时已经是原画质
+              - 触发源：数据库 insert/update 事件（新消息即时触发）+ 开启后回看最近
+                6 小时的媒体消息做补偿扫描，之后每 5 分钟重扫未成功项
+              - 失败重试 3 次（5s / 10s 退避），并发上限 2，成功项与失败项分开记账，
+                不会对同一条消息反复下载
+              - 原图复用已验证通道 `cacheImage(msgSvrId)`（有 `hdImgId` 时优先下原图行）；
+                原视频复刻微信 UI 层的 CDN 链路（`gallery.f` 下载任务 → `il4.l` 会话 →
+                `p()` 执行），所有类名 / 字段 / 构造器签名均用 `dexdump` 逐条核验
+              - 同时挂了两处**探针**（hook 微信自己的 `gallery.f` / `gallery.g` 构造器）：
+                当你在微信里手动点「查看原视频」时，日志会打印微信侧真实传入的参数，
+                可用于校准复刻配方
+
+            ### 上一版（v284）
 
             - **「查看原图 / 查看原视频」改为无感加载：按钮不再显示，打开即原画质**：
               v283 的做法是「轮询视图树 → 找到按钮 → performClick」，设备日志
