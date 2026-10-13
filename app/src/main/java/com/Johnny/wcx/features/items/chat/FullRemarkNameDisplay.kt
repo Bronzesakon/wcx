@@ -16,6 +16,7 @@ import com.Johnny.wcx.features.api.core.WeDatabaseApi
 import com.Johnny.wcx.features.api.ui.WeConversationListViewApi
 import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.features.core.SwitchFeature
+import com.Johnny.wcx.preferences.WePrefs
 import com.Johnny.wcx.ui.utils.findViewWhich
 import com.Johnny.wcx.utils.WeLogger
 import dev.ujhhgtg.reflekt.reflekt
@@ -55,6 +56,36 @@ object FullRemarkNameDisplay : SwitchFeature(),
     WeConversationListViewApi.IBindViewListener {
 
     private const val TAG = "FullRemarkNameDisplay"
+
+    /**
+     * 更名前的功能名。开关状态以**功能名**为 key 持久化 ([SwitchFeature.startup] 用
+     * `WePrefs.getBoolOrDef(name, ...)`), 所以 v281 把功能从「完整显示昵称」改名成
+     * 「完整显示备注名」时, 老用户已开启的开关会静默回落到默认值 false —— 设备日志实锤:
+     * v281 启动后本功能一条日志都没有 (连 onEnable 都没打), 而其它已开启功能都有 enable 日志。
+     * 这里把旧 key 的状态作为默认值沿用, 用户在新名下拨动过开关后新 key 立即生效。
+     */
+    private const val LEGACY_NAME = "完整显示昵称"
+
+    /**
+     * 开关的默认值: 更名前开启过的老用户沿用旧 key 的状态, 避免改名把开关重置掉。
+     * (只在用户从未在新名下拨动过开关时起作用。)
+     */
+    override val defaultEnabled: Boolean
+        get() = runCatching { WePrefs.getBoolOrDef(LEGACY_NAME, false) }.getOrDefault(false)
+
+    /**
+     * 每次启动把开关的判定结果与两个 key 的存在情况打进日志, 便于下次一眼看出
+     * 「是没开」还是「开了但 hook 没生效」。
+     */
+    override val shouldEnableOnStartup: Boolean
+        get() = _isEnabled.also { on ->
+            val newKey = runCatching { WePrefs.containsKey(name) }.getOrDefault(false)
+            val oldKey = runCatching { WePrefs.containsKey(LEGACY_NAME) }.getOrDefault(false)
+            WeLogger.i(
+                TAG,
+                "startup: 开关=$on (新key '$name' 存在=$newKey, 旧key '$LEGACY_NAME' 存在=$oldKey)"
+            )
+        }
 
     /** 记住的会话显示名 / 备注名查询缓存的上限。 */
     private const val NAME_CACHE_LIMIT = 128
@@ -121,7 +152,13 @@ object FullRemarkNameDisplay : SwitchFeature(),
     /** 还原失败按文本去重, 免得同一标题反复刷诊断日志。 */
     private var lastFailedRestoreText: String? = null
 
+    /** 操作栏定位失败只打一次日志。 */
+    private var noBarLogged = false
+
     override fun onEnable() {
+        noBarLogged = false
+        rowRestoreLogged = false
+        lastFailedRestoreText = null
         WeConversationListViewApi.addListener(this)
         installAddressHook()
         installChatTitleHook()
@@ -147,6 +184,8 @@ object FullRemarkNameDisplay : SwitchFeature(),
         currentTalker = null
         rememberedNames.clear()
         displayNameCache.clear()
+        lastFailedRestoreText = null
+        noBarLogged = false
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -226,6 +265,9 @@ object FullRemarkNameDisplay : SwitchFeature(),
                     captureTalkerFromHost(contentView.context)
                     // 标题栏在 dealContentView 返回后才填完, post 一帧再取
                     contentView.post { releaseChatTitleBar(contentView) }
+                    // 标题数据是异步取回的 (会话资料未就绪时先空后填), 再补两次迟到的检查
+                    contentView.postDelayed({ releaseChatTitleBar(contentView) }, 500)
+                    contentView.postDelayed({ releaseChatTitleBar(contentView) }, 1500)
                 }
         }.onFailure {
             WeLogger.w(TAG, "聊天页标题 hook 安装失败，标题备注名保持原样", it)
@@ -297,7 +339,10 @@ object FullRemarkNameDisplay : SwitchFeature(),
      */
     private fun releaseChatTitleBar(contentView: ViewGroup) {
         val bar = chatActionBarRoot(contentView) ?: run {
-            WeLogger.w(TAG, "聊天页操作栏未定位，标题备注名保持原样")
+            if (!noBarLogged) {
+                noBarLogged = true
+                WeLogger.w(TAG, "聊天页操作栏未定位，标题备注名保持原样；${describeChatLayout(contentView)}")
+            }
             return
         }
         var processed = 0
@@ -316,9 +361,20 @@ object FullRemarkNameDisplay : SwitchFeature(),
             }
         }
         if (processed > 0) {
-            WeLogger.i(TAG, "聊天页操作栏处理 $processed 个 TextView (${bar.javaClass.name})")
+            WeLogger.i(TAG, "聊天页操作栏处理 $processed 个 TextView, 操作栏容器=${bar.javaClass.name}")
         }
     }
+
+    /** 定位不到操作栏时的诊断信息: ChattingUILayout 第一层子视图的类名。 */
+    private fun describeChatLayout(contentView: ViewGroup): String = runCatching {
+        val layout = contentView.findViewWhich<View> {
+            it.javaClass.name == "com.tencent.mm.pluginsdk.ui.chat.ChattingUILayout"
+        } as? ViewGroup ?: return@runCatching "未找到 ChattingUILayout"
+        val names = (0 until layout.childCount).joinToString(", ") { i ->
+            layout.getChildAt(i).javaClass.simpleName
+        }
+        "ChattingUILayout 子视图: [$names]"
+    }.getOrElse { "无法遍历聊天页布局: $it" }
 
     /**
      * 定位聊天页操作栏容器: 优先 ChattingUILayout 的第一个子视图 (与主题功能同款定位,
