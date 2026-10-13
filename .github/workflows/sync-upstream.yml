@@ -104,7 +104,7 @@ jobs:
       - name: Read version from build.gradle.kts
         id: version
         # 版本号单一数据源, 与 ci.yml 完全一致 —— 两个工作流必须发布同一个 tag,
-        # 否则会出现「应用内显示 v280 / Releases 页面却是别的版本」的不一致。
+        # 否则会出现「应用内显示 v281 / Releases 页面却是别的版本」的不一致。
         run: |
           VERSION_CODE=$(grep -oE 'versionCode[[:space:]]*=[[:space:]]*[0-9]+' app/build.gradle.kts | grep -oE '[0-9]+$')
           echo "tag=v${VERSION_CODE}" >> "$GITHUB_OUTPUT"
@@ -144,7 +144,27 @@ jobs:
 
             基线为上游 v273，保留本仓库自建功能 + 联系人选择器改进。
 
-            ### 本版修复（v280）
+            ### 本版修复（v281）
+
+            - **「完整显示昵称」更名为「完整显示备注名」，并修复聊天页标题仍被截断**：
+              微信这三处显示的「名字」优先取备注名（未设备注才退化昵称），
+              原名与实不符；设备截图实锤聊天页标题仍是「头部9字...尾部8字」——
+              注意是三个 ASCII 点而非 Android 原生 ellipsize 的单字符「…」，
+              说明**标题文本自身已被微信在代码里截断**，放开 singleLine/ellipsize
+              这类渲染级手段完全无效（v275 的聊天标题处理因此从未真正生效）。
+              现改为：标题栏挂 TextWatcher，检测到中部省略号时用备注名
+              （rcontact.conRemark → nickname）还原完整文本并放开换行；
+              还原前以「头尾吻合 + 完整名更长」双校验，杜绝误伤含「...」的正常文本
+            - 聊天页 hook 加固：dealContentView（内容视图三种形态兼容）+
+              onResume 双入口，聊天对象经 ChattingContext.getTalker /
+              Activity intent(Chat_User) / 会话列表 field_username 三源捕获，
+              不再因 hook 装晚或标题后配置而漏掉
+            - 会话列表行同样补齐代码级截断还原（行文本含「...」时按备注名还原），
+              渲染级截断（会话列表/通讯录）沿用既有的单行放开方案
+            - 全链路 I 级日志：标题还原成功/失败（含 truncated 原文与 talker）、
+              操作栏处理条目数均可查，失败时给出诊断信息
+
+            ### 上一版（v280）
 
             - **文件/图片"假缓存"：日志显示缓存成功，微信里始终显示未下载**
               （设备日志实锤，本次漏下载的真正根因）：
