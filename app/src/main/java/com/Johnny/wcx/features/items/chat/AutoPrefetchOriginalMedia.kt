@@ -44,24 +44,49 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 微信的「查看原视频」是 **UI 层自己造的 CDN 任务**, 没有模型层入口, 因此这里按
  * 8.0.76 安装包反查结果**复刻微信自己那条链路** (classes3/4/12.dex)。精简后的原始逻辑
- * (ImageGalleryUI.onClick 的「查看原视频」分支) 是:
+ * (ImageGalleryUI 里 "save origin video" 那个方法) 是:
  *
  * ```java
- * v2 = gallery.n1.s(msg)                     // 静态: 解析视频消息 -> v21.v2
- * j3 = v21.j3.h.d(v2.h())                    // 按 fileid 取"原视频下载记录"
- * if (j3 == null || j3.d.isEmpty()) skip;     // 没有原视频信息就不做
+ * if (!gallery.o1.N(msg)) skip;                 // 静态: 是不是可下载原视频的消息
+ * v2 = gallery.n1.t(msg)                        // 静态: 现场解析视频消息 -> v21.v2 (并写缓存)
+ * j3 = v21.j3.h.d(v2.h())                       // VideoParseInfo.parse(消息内容 XML) -> 原视频记录
+ * if (j3 == null || j3.d.isEmpty()) skip;        // 没有原视频信息就不做
  * c  = new rl4.c(System.currentTimeMillis());
- * g  = new gallery.g(msg, v2, c, j3);        // 下载回调 (实现 il4.q)
- * f  = new gallery.f(msg, v2.e(), true);     // 下载任务 (实现 rl4.a), v2.e() 是 CDN 地址
- * l  = new il4.l(g);                         // CDN 会话
+ * g  = new gallery.g(msg, v2, c, j3);           // 下载回调 (实现 il4.q)
+ * f  = new gallery.f(msg, v2.e(), true);        // 下载任务 (实现 rl4.a), v2.e() 是 CDN 地址
+ * l  = new il4.l(g);                            // CDN 会话
  * l.a(f);
- * l.m = <gallery.n1>;                        // 进度回调 (il4.u), 仅 UI 场景需要
- * l.p();                                     // 执行
+ * l.m = <gallery.n1 实例>;                       // 进度回调 (il4.u), 仅 UI 场景需要
+ * l.p();                                        // 执行
  * ```
  *
  * 复刻时**保留微信自己的前置条件** (`j3 != null && j3.d` 非空 = 这条消息确实带原视频),
  * 避免对普通视频乱发下载任务; `l.m` 在后台没有 `n1` 实例, 用一个动态代理占位,
  * 只为避免进度回调时空指针。
+ *
+ * ### v287: v285/v286 为什么在设备上"不点开视频就不下载"
+ *
+ * 反汇编 8.0.76 (classes12.dex) 后确认两处硬伤, 都是**静默失败**——
+ * 失败时日志只打"该视频没有原视频信息", 看起来像"这条视频本来就没有原片":
+ *
+ *  1. **注册表找错类**: 原来读 `v21.i3.h` 这个静态字段, 但 `v21.i3` 就是
+ *     `MicroMsg.VideoParseInfo` 本身 (只有 a/b/c/d/e 五个解析方法, **没有任何字段**)。
+ *     真正的单例是 **`v21.j3.h`(static final, 类型 v21.i3)**, 两个解析缓存
+ *     `v21/j3;->i` / `->j` 也在 `v21.j3` 上。所以旧代码 `getDeclaredField("h")`
+ *     直接抛 NoSuchFieldException → 整个配方解析失败 → 记一次"链路不可用"后
+ *     **当成已处理**, 再也不重试。
+ *  2. **视频信息走了只读缓存**: 原来用 `gallery.n1.s(msg)`, 它内部只是
+ *     `v21.d3.h(msg.y0())` 查 gallery 的缓存 —— 用户没打开过视频页时缓存是空的,
+ *     返回 null。微信自己能用是因为页面加载时先调了 **`gallery.n1.t(msg)`**
+ *     (日志 tag `MicroMsg.Imagegallery.handler.video` 的 "insert video info:"):
+ *     它现场 `h35/d.fromXml(消息内容)` 解析出 `v21.v2` (url/长度/md5), 写
+ *     `com.tencent.mm.storage.f9.Ta(msgId, msg, true)` 落库, 再塞进缓存。
+ *     **后台提前拉原视频必须走 `t`**, 这才是"自动查看原视频"的等价动作。
+ *
+ * 另外 `v21.i3.d(key)` 的 key 是**消息内容 XML** (`v2.h()` = `e9.j()`,
+ * 内部 `aa.d(xml, "msg", null)` 解析, 取 `.msg.videomsg.$.cdnrawvideourl` 等),
+ * 不是 fileid; 记录里 `d` = cdnrawvideourl、`f` = cdnrawvideoaeskey、
+ * `b` = isplaceholder、`g` = rawlength。
  *
  * 这些类名是**混淆名** (il4 / v21 / rl4 这类短包名), 微信改版后会整体失效 —— 所以
  * 每一环都有独立日志说明卡在哪里; 并且装了**探针**: 微信自己走一次原视频下载
@@ -399,8 +424,20 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         /** CDN 会话: 构造参数是下载回调接口, 有 a(任务) / p() 执行 / m 进度回调。 */
         private const val CDN_SESSION = "il4.l"
 
-        /** 原视频下载记录: 静态字段 h 是注册表, d(String) 按 fileid 查记录, 记录里的 d 是地址。 */
-        private const val VIDEO_REGISTRY = "v21.i3"
+        /**
+         * 原视频信息解析器 (真身 `MicroMsg.VideoParseInfo`): 实例方法 `d(String)`
+         * 按**消息内容 XML** 解析出原视频 CDN 记录 (cdnrawvideourl / aeskey / rawlength)。
+         */
+        private const val VIDEO_PARSER = "v21.i3"
+
+        /**
+         * 解析器单例的宿主: 静态字段 `h`(类型 v21.i3) 就是解析器实例,
+         * `i` / `j` 是它内部的两个解析缓存。**别把 h 当成 v21.i3 自己的字段** ——
+         * v21.i3 一个字段都没有 (v287 踩过)。
+         */
+        private const val VIDEO_RECORD_HOLDER = "v21.j3"
+
+        /** 原视频下载记录: d = cdnrawvideourl, f = aeskey, b = isplaceholder, g = rawlength。 */
         private const val VIDEO_RECORD = "v21.j3"
 
         /** 下载计时对象, 构造参数是 long。 */
@@ -417,7 +454,10 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
         private class Recipe(
             val checkVideo: Method,
-            val parseVideoInfo: Method,
+            /** `n1.t(MsgInfo)`: 现场解析视频消息并写缓存 (微信自己先走它)。 */
+            val buildVideoInfo: Method,
+            /** `n1.s(MsgInfo)`: 只读 gallery 缓存, 作为兜底。 */
+            val cachedVideoInfo: Method,
             val lookupRecord: Method,
             val registry: Any,
             val recordUrl: Field,
@@ -459,24 +499,33 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                 return true
             }
 
-            // 2) 解析视频消息 -> v21.v2
-            val videoInfo = runCatching { r.parseVideoInfo.invoke(null, msgInfo) }.getOrNull()
+            // 2) 现场解析视频消息 -> v21.v2
+            //    必须走 n1.t (insert video info): n1.s 只读 gallery 的缓存,
+            //    用户没打开过视频页时缓存是空的 → v285/v286 就是这样静默失败的。
+            val videoInfo = runCatching { r.buildVideoInfo.invoke(null, msgInfo) }.getOrNull()
+                ?: runCatching { r.cachedVideoInfo.invoke(null, msgInfo) }.getOrNull()
             if (videoInfo == null) {
-                WeLogger.w(TAG, "视频信息解析失败 (msgSvrId=$msgSvrId), 该消息可能没有可下载的视频")
-                return true
+                // 解析失败 != "没有原视频" (可能 msg 还没就绪), 交还给重试 / 补偿扫描
+                WeLogger.w(TAG, "视频信息解析失败 (msgSvrId=$msgSvrId), 稍后重试")
+                return false
             }
             val key = runCatching { r.videoInfoKey.invoke(videoInfo) as? String }.getOrNull()
             val url = runCatching { r.videoInfoUrl.invoke(videoInfo) as? String }.getOrNull()
-            if (key.isNullOrEmpty() || url.isNullOrEmpty()) {
-                WeLogger.w(TAG, "视频信息缺 fileid/地址 (msgSvrId=$msgSvrId, key=$key), 跳过")
-                return true
+            if (key.isNullOrEmpty()) {
+                WeLogger.w(TAG, "视频信息缺 key (msgSvrId=$msgSvrId), 稍后重试")
+                return false
+            }
+            if (url.isNullOrEmpty()) {
+                // 视频地址 (msg.imgPath) 还没就绪 —— 收视频瞬间常常如此, 交给重试 / 补偿扫描
+                WeLogger.w(TAG, "视频地址尚未就绪 (msgSvrId=$msgSvrId), 稍后重试")
+                return false
             }
 
             // 3) 原视频下载记录 —— 微信自己就是靠它判断"这条消息确实带原视频"
             val record = runCatching { r.lookupRecord.invoke(r.registry, key) }.getOrNull()
             val recordUrl = record?.let { runCatching { r.recordUrl.get(it) as? String }.getOrNull() }
             if (record == null || recordUrl.isNullOrEmpty()) {
-                WeLogger.i(TAG, "该视频没有原视频信息 (msgSvrId=$msgSvrId key=$key), 无需下载")
+                WeLogger.i(TAG, "该视频没有原视频信息 (msgSvrId=$msgSvrId key=${key.take(48)}), 无需下载")
                 return true
             }
 
@@ -556,28 +605,34 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             val helper = need(GALLERY_VIDEO_HELPER)
             val checkCls = need(GALLERY_VIDEO_CHECK)
             val sessionCls = need(CDN_SESSION)
-            val registryCls = need(VIDEO_REGISTRY)
+            val parserCls = need(VIDEO_PARSER)
+            val holderCls = need(VIDEO_RECORD_HOLDER)
             val recordCls = need(VIDEO_RECORD)
             val timeCls = need(CDN_TIME)
 
             val checkVideo = staticMethod(checkCls, "N", 1)
-            val parseVideoInfo = staticMethod(helper, "s", 1)
-            val videoInfoCls = parseVideoInfo.returnType
+            // n1.t = 现场解析 (insert video info); n1.s = 只读缓存, 兜底用
+            val buildVideoInfo = staticMethodOrNull(helper, "t", 1)
+                ?: error("$GALLERY_VIDEO_HELPER.t(MsgInfo) 不存在")
+            val cachedVideoInfo = staticMethodOrNull(helper, "s", 1)
+                ?: error("$GALLERY_VIDEO_HELPER.s(MsgInfo) 不存在")
+            val videoInfoCls = buildVideoInfo.returnType
 
-            val registry = registryCls.getDeclaredField("h").apply { isAccessible = true }.get(null)
-                ?: error("$VIDEO_REGISTRY.h 为 null")
-            val lookupRecord = declaredMethod(registryCls, "d", String::class.java)
-                ?: error("$VIDEO_REGISTRY.d(String) 不存在")
+            // 解析器单例挂在 v21.j3 上 (静态字段 h), 不在 v21.i3 自己身上
+            val registry = holderCls.getDeclaredField("h").apply { isAccessible = true }.get(null)
+                ?: error("$VIDEO_RECORD_HOLDER.h 为 null")
+            val lookupRecord = declaredMethod(parserCls, "d", String::class.java)
+                ?: error("$VIDEO_PARSER.d(String) 不存在")
             val recordUrl = declaredField(recordCls, "d", String::class.java)
                 ?: error("$VIDEO_RECORD.d (String) 不存在")
 
-            // v2.e() 是 CDN 地址 (下载任务第 2 个参数), v2.h() 是下载记录的 key (fileid)
+            // v2.e() 是 CDN 地址 (下载任务第 2 个参数), v2.h() 是下载记录的 key (消息内容 XML)
             val videoInfoUrl = declaredMethod(videoInfoCls, "e")
                 ?: error("${videoInfoCls.name}.e() 不存在")
             val videoInfoKey = declaredMethod(videoInfoCls, "h")
                 ?: error("${videoInfoCls.name}.h() 不存在")
 
-            val msgInfoCls = parseVideoInfo.parameterTypes[0]
+            val msgInfoCls = buildVideoInfo.parameterTypes[0]
             val callbackCls = need(TASK_CALLBACK)
             val callbackInterface = callbackCls.interfaces.firstOrNull()
                 ?: error("$TASK_CALLBACK 没有实现下载回调接口")
@@ -608,7 +663,8 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
             return Recipe(
                 checkVideo = checkVideo,
-                parseVideoInfo = parseVideoInfo,
+                buildVideoInfo = buildVideoInfo,
+                cachedVideoInfo = cachedVideoInfo,
                 lookupRecord = lookupRecord,
                 registry = registry,
                 recordUrl = recordUrl,
@@ -628,12 +684,15 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         private fun need(className: String): Class<*> = resolve(className) ?: error("类不存在: $className")
 
         private fun staticMethod(clazz: Class<*>, name: String, paramCount: Int): Method =
+            staticMethodOrNull(clazz, name, paramCount)
+                ?: error("${clazz.name} 里找不到静态方法 $name/$paramCount")
+
+        private fun staticMethodOrNull(clazz: Class<*>, name: String, paramCount: Int): Method? =
             clazz.declaredMethods
                 .firstOrNull {
                     it.name == name && it.parameterCount == paramCount && Modifier.isStatic(it.modifiers)
                 }
                 ?.apply { isAccessible = true }
-                ?: error("${clazz.name} 里找不到静态方法 $name/$paramCount")
 
         private fun declaredMethod(
             clazz: Class<*>,
