@@ -1,5 +1,11 @@
 name: CI
 
+# v287 补注: 本工作流也会发布 Release (tag = v<versionCode>), 与 sync-upstream.yml 同 tag。
+# 两处必须用同一套密钥签名, 否则先跑的那次被后跑的覆盖, 用户拿到的包签名飘忽、装不上。
+# 密钥: 仓库 Secret WEKIT_KEYSTORE_BASE64 (正式签名库); 密码/别名缺失时回落 wcx-store-pass / wcx
+# (与 sync-upstream.yml 一致)。Secret 缺失时才生成临时 CI 密钥库 (CN=WCX CI), 那种包
+# 与正式签名的旧版本不能互相覆盖安装。
+
 # Trigger CI rebuild for v125 returnType fixes
 on:
   push:
@@ -117,9 +123,9 @@ jobs:
           CRED_FILE="$RUNNER_TEMP/keystore-creds.env"
 
           # ── Decode project keystore from GitHub Secrets ──────────────────
-          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+          if [ -n "${{ secrets.WEKIT_KEYSTORE_BASE64 }}" ]; then
             echo "::group::Decoding project keystore from Secrets"
-            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$KS_FILE"
+            echo "${{ secrets.WEKIT_KEYSTORE_BASE64 }}" | base64 -d > "$KS_FILE"
             KS_SIZE=$(stat -c%s "$KS_FILE" 2>/dev/null || echo 0)
             echo "Keystore file size: ${KS_SIZE} bytes"
 
@@ -133,8 +139,8 @@ jobs:
             for STORE_TYPE in PKCS12 JKS; do
               if keytool -list -keystore "$KS_FILE" \
                    -storetype "$STORE_TYPE" \
-                   -storepass "${{ secrets.STORE_PASSWORD }}" \
-                   -alias "${{ secrets.KEY_ALIAS }}" >/dev/null 2>&1; then
+                   -storepass "${{ secrets.WEKIT_KEYSTORE_PASSWORD || 'wcx-store-pass' }}" \
+                   -alias "${{ secrets.WEKIT_KEY_ALIAS || 'wcx' }}" >/dev/null 2>&1; then
                 echo "Keystore loaded successfully (type=${STORE_TYPE})"
                 KS_LOADED=true
                 break
@@ -143,12 +149,12 @@ jobs:
 
             if [ "$KS_LOADED" = true ]; then
               echo "Using project keystore from GitHub Secrets."
-              echo "KS_PASS=${{ secrets.STORE_PASSWORD }}" > "$CRED_FILE"
-              echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> "$CRED_FILE"
-              echo "KEY_PASS=${{ secrets.KEY_PASSWORD }}" >> "$CRED_FILE"
+              echo "KS_PASS=${{ secrets.WEKIT_KEYSTORE_PASSWORD || 'wcx-store-pass' }}" > "$CRED_FILE"
+              echo "KEY_ALIAS=${{ secrets.WEKIT_KEY_ALIAS || 'wcx' }}" >> "$CRED_FILE"
+              echo "KEY_PASS=${{ secrets.WEKIT_KEY_PASSWORD || 'wcx-store-pass' }}" >> "$CRED_FILE"
               keytool -list -keystore "$KS_FILE" \
-                -storepass "${{ secrets.STORE_PASSWORD }}" \
-                -alias "${{ secrets.KEY_ALIAS }}" 2>&1 | head -5
+                -storepass "${{ secrets.WEKIT_KEYSTORE_PASSWORD || 'wcx-store-pass' }}" \
+                -alias "${{ secrets.WEKIT_KEY_ALIAS || 'wcx' }}" 2>&1 | head -5
               echo "::endgroup::"
               exit 0
             fi
@@ -340,18 +346,10 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: WCX ${{ steps.version.outputs.tag }}
-          body: |
-            ## WCX ${{ steps.version.outputs.tag }}
-
-            正式发行版本
-
-            提交 SHA: `${{ steps.version.outputs.hash }}`
-
-            ${{ steps.changelog.outputs.changelog }}
-
-            ### 📦 下载
-            - 下方 Assets 中下载对应架构的 APK
-            - update.json 供模块内置更新器使用
+          # 发行说明单一来源: 与 sync-upstream.yml 同一个文件。
+          # 两个工作流发布同一个 tag, 说明必须一致, 否则用户看到的 Release 页面
+          # 取决于「哪一个跑得晚」。
+          body_path: .github/RELEASE_NOTES.md
           files: |
             artifacts/*.apk
             artifacts/update.json
