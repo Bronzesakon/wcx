@@ -44,6 +44,10 @@ object ProcessPriority {
     /** 当前是否处于提升状态。 */
     val isRaised: Boolean get() = raised
 
+    /** hidden-API 豁免是否已试过 (只试一次即可, 对整个进程生效)。 */
+    @Volatile
+    private var exemptionsApplied = false
+
     /** 把当前进程标记为前台。@return 是否真的生效（false = 反射不可用，行为不变）。 */
     @Synchronized
     fun raise(): Boolean {
@@ -77,7 +81,13 @@ object ProcessPriority {
 
     private fun setProcessForeground(foreground: Boolean): Boolean {
         return try {
-            // IActivityManager: 隐藏 API, LSPosed 环境下宿主进程已做 hidden-api 豁免
+            // 【v292】v291 在这里稳定失败: 设备日志每次都打
+            // "IActivityManager 上没有 setProcessForeground"。
+            // 不是方法不存在 —— 是 Android 9+ 的 hidden-API 过滤: 黑名单方法根本不会
+            // 出现在 Class.getMethods() / getDeclaredMethod() 的返回里, 反射看到的是一个
+            // "没有这个方法"的类。所以必须先解除豁免, 再反射。
+            applyHiddenApiExemptions()
+
             val am = Class.forName("android.app.ActivityManager")
                 .getDeclaredMethod("getService")
                 .apply { isAccessible = true }
@@ -92,10 +102,18 @@ object ProcessPriority {
                 .apply { isAccessible = true }
                 .invoke(thread) as? IBinder ?: return fail("拿不到 ApplicationThread token")
 
-            // 不同版本签名略有出入, 逐个候选试
+            // 找 Binder 代理自己的方法表 (IActivityManager$Stub$Proxy),
+            // 不反射接口类 —— 接口类在部分版本上是 aidl 编译期产物, 反射拿不全。
             val method = am.javaClass.methods.firstOrNull {
                 it.name == "setProcessForeground" && it.parameterTypes.size >= 3
-            } ?: return fail("IActivityManager 上没有 setProcessForeground")
+            }
+            if (method == null) {
+                val names = am.javaClass.methods.joinToString(", ") { it.name }
+                return fail(
+                    "IActivityManager 上没有 setProcessForeground " +
+                        "(代理类=${am.javaClass.name}, 可见方法: ${names.take(400)})"
+                )
+            }
 
             method.isAccessible = true
             val args = when (method.parameterTypes.size) {
@@ -106,6 +124,29 @@ object ProcessPriority {
             true
         } catch (t: Throwable) {
             fail("${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    /**
+     * 解除本进程的 hidden-API 限制 (Android 9+)。
+     *
+     * `VMRuntime.setHiddenApiExemptions("L")` 是各路 hook 框架通用的老办法。
+     * 新版系统上可能失效, 那时只会拿不到被隐藏的方法 → 反射照旧失败并走兜底,
+     * 不会比不豁免更差。
+     */
+    private fun applyHiddenApiExemptions() {
+        if (exemptionsApplied) return
+        exemptionsApplied = true
+        runCatching {
+            val vmRuntimeCls = Class.forName("dalvik.system.VMRuntime")
+            val runtime = vmRuntimeCls.getDeclaredMethod("getRuntime")
+                .apply { isAccessible = true }
+                .invoke(null)
+            vmRuntimeCls.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+                .apply { isAccessible = true }
+                .invoke(runtime, arrayOf("L"))
+        }.onFailure {
+            WeLogger.d(TAG, "hidden-api 豁免未生效 (${it.javaClass.simpleName}: ${it.message})")
         }
     }
 

@@ -220,23 +220,30 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
      * 【v291】原视频下载写的是**同一个视频文件**: 微信收到视频时自己也在往这个文件里写
      * (普通视频链路), 两个写者并发 → 文件不完整 → 用户点开就是"转圈 / 黑屏播不出"。
      *
-     * 所以发起前必须先确认微信已经把普通视频下完 (见 [OriginVideoDownload.ordinaryVideoReady])。
-     * 只有在拿不到下载状态判据 (表结构变了) 时才退化为这条时间门槛 —— 至少躲开
-     * "消息刚落库、微信正在写"这个最容易撞车的时间窗。
+     * 所以发起前必须先确认微信没有在写这个文件 (见 [OriginVideoDownload.ordinaryVideoReady])。
+     *
+     * 【v292 修正】v291 把它写成了"status < 199 就一律避让", 兜底方向反了 —— 见
+     * [OriginVideoDownload.ordinaryVideoReady] 的注释。现在这条时间门槛只用来判断
+     * "消息是不是刚落库" (微信随时可能启动自动下载), 不再单独决定放行与否。
      */
     private const val VIDEO_SAFE_DELAY_MS = 20_000L
+
+    /** 【v292】"疑似在下"时的二次采样间隔 —— 只有字节数真的在涨才认定微信在下载。 */
+    private const val VIDEO_GROW_PROBE_MS = 1_500L
+
+    /**
+     * 【v292】微信侧暂时没接受我们的下载任务时的重试间隔。
+     *
+     * 这通常意味着"同一个 fileid 的任务已在队列里" (微信自己正在下普通画质), 此时
+     * 不该按 [VIDEO_LAUNCH_COOLDOWN_MS] 那样等满 3 分钟 —— 微信下完我们就该接上。
+     */
+    private const val VIDEO_RETRY_COOLDOWN_MS = 60_000L
 
     /**
      * 同一条视频 (CDN fileid) 两次发起之间的最小间隔。既防与微信自己的任务并发,
      * 也防补偿扫描在同一条消息上反复建任务 (设备日志里出现过 5 次/30 秒的重复发起)。
      */
     private const val VIDEO_LAUNCH_COOLDOWN_MS = 3 * 60_000L
-
-    /**
-     * 视频信息行始终查不到时的放行门槛。表结构若不是我们猜的那样, 老消息也要能拉,
-     * 不能因为判据缺失就永久卡住 (见 [OriginVideoDownload.ordinaryVideoReady])。
-     */
-    private const val VIDEO_ROW_GRACE_MS = 5 * 60_000L
 
     /** 补偿扫描回看窗口。 */
     private const val SCAN_WINDOW_MS = 6 * 60 * 60 * 1000L
@@ -459,7 +466,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
     }
 
     /** 原画质视频: 取完整 MsgInfo, 交给复刻的微信下载链路。 */
-    private fun prefetchOriginVideo(row: Row): Boolean {
+    private suspend fun prefetchOriginVideo(row: Row): Boolean {
         val msgId = if (row.msgId > 0) row.msgId else queryRow(row.msgSvrId)?.msgId ?: 0L
         if (msgId <= 0L) {
             WeLogger.w(TAG, "视频消息没有有效 msgId, 跳过: msgSvrId=${row.msgSvrId}")
@@ -712,73 +719,114 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         }
 
         /**
-         * 微信自己是否已经把这条视频的「普通视频」下完。
-         * @return false = 还没下完 (此刻拉原视频会与微信并发写同一个文件), 稍后重试。
+         * videoinfo2 里"正在下载"的 status 集合。
+         *
+         * 日志实测: `111` = 已入库**待下载** (微信没在传, 它在等用户点开),
+         * `121` = 正在下载 (file 已有部分字节), `199` = 完成。
+         * 这里只当作"值得再采样确认"的嫌疑信号, 结论一律由字节是否增长来下。
          */
-        private fun ordinaryVideoReady(row: Row): Boolean {
-            val age = if (row.createTime > 0L) System.currentTimeMillis() - row.createTime else -1L
-            val table = videoTableOrNull()
+        private val VIDEO_DOWNLOADING_STATUS = setOf(112L, 113L, 120L, 121L, 122L, 123L, 130L, 131L, 198L)
 
-            // 拿不到状态判据 (表结构变了): 只躲开"消息刚落库"这个最容易撞车的时间窗
-            if (table == null) {
-                if (age >= 0 && age < VIDEO_SAFE_DELAY_MS) {
-                    diagnoseOnce(row.msgSvrId) {
-                        "视频状态表不可用, 等微信先落普通视频 (消息落库 ${age}ms < 门槛 " +
-                            "${VIDEO_SAFE_DELAY_MS}ms), 稍后重试"
-                    }
-                    return false
-                }
-                return true
-            }
+        private class VideoProgress(
+            val status: Long?,
+            val total: Long,
+            val offset: Long,
+            val fileSize: Long,
+        ) {
+            /** 已落地的字节数 (CDN 进度与实际文件长度取大者)。 */
+            val bytes: Long get() = maxOf(offset, fileSize)
 
+            /** 有没有"微信确实在传"的正向证据。 */
+            val suspicious: Boolean
+                get() = status in VIDEO_DOWNLOADING_STATUS ||
+                    (total > 0L && ((offset > 0L && offset < total) || (fileSize > 0L && fileSize < total)))
+
+            fun describe(): String = "status=$status, offset=$offset, file=$fileSize/$total"
+        }
+
+        /**
+         * 采样一次视频下载进度。查不到行 / 表结构对不上都返回 null (= 判据不可用)。
+         */
+        private fun sampleVideoProgress(row: Row): VideoProgress? {
+            if (!ensureDatabase()) return null
+            val table = videoTableOrNull() ?: return null
             val keyValue: Any =
-                if (table.keyColumn == "filename") row.imgPath ?: return true else row.msgId
-            if (keyValue is String && keyValue.isEmpty()) return true
+                if (table.keyColumn == "filename") row.imgPath ?: return null else row.msgId
+            if (keyValue is String && keyValue.isEmpty()) return null
 
             val want = listOf("status", "netoffset", "totallen", "filenowsize").filter { it in table.columns }
-            if (want.isEmpty()) return true
+            if (want.isEmpty()) return null
 
-            val values: Map<String, Long?>? = runCatching {
+            return runCatching {
                 WeDatabaseApi.rawQuery(
                     "SELECT ${want.joinToString(", ")} FROM ${table.name} " +
                         "WHERE ${table.keyColumn}=? LIMIT 1",
                     arrayOf<Any>(keyValue)
                 ).use { c ->
-                    if (!c.moveToNext()) {
-                        null
-                    } else {
-                        want.associateWith { col ->
-                            val i = c.getColumnIndex(col)
-                            if (i < 0) null else c.getLong(i)
-                        }
+                    fun long(col: String): Long? {
+                        val i = c.getColumnIndex(col)
+                        if (i < 0) return null
+                        return runCatching { c.getLong(i) }
+                            .getOrNull() ?: runCatching { c.getString(i)?.trim()?.toLongOrNull() }.getOrNull()
                     }
+                    if (!c.moveToNext()) return@use null
+                    VideoProgress(
+                        status = long("status"),
+                        total = long("totallen") ?: 0L,
+                        offset = long("netoffset") ?: 0L,
+                        fileSize = long("filenowsize") ?: 0L,
+                    )
                 }
             }.onFailure {
                 WeLogger.w(TAG, "查询 ${table.name} 失败: ${it.message}")
             }.getOrNull()
+        }
 
-            if (values == null) {
-                // 视频行都还没建 —— 但表结构万一不是我们猜的那样, 老消息就放行, 免得永久卡住
-                if (age > VIDEO_ROW_GRACE_MS) return true
+        /**
+         * 此刻能不能拉原视频 —— 也就是**微信有没有正在写同一个视频文件**。
+         *
+         * @return true = 可以拉 (没有竞争写者); false = 微信正在下普通画质, 稍后重试。
+         *
+         * 【v291 的教训：兜底方向绝不能反】
+         * v291 写的是 "status < 199 就一律避让", 实测被这两种情况打穿:
+         *   · `status=111, offset=0, file=0` —— 微信**根本没开始下**, 它在等用户点开;
+         *   · `status=0,  totallen=0, filenowsize=0` —— 查到空行 / 键没对上。
+         * 关键问题是这两种状态会**一直持续** (不点开就不下), 于是预取被无限期挂起。
+         *
+         * 2026-10-15 设备日志: 同一批视频 5 分钟内被这样拦掉 13 次, 全程只成功发起 1 次;
+         * 而用户点开视频页后微信自己立刻就开始下载 —— 也就是"无感"完全失效。
+         *
+         * 所以改成**正向证据 + 增长确认**:
+         *   1. 先要有"微信确实在传"的证据（CDN offset 有进展 / 文件已写了一部分 / status 在下载中集合）；
+         *   2. 有证据也不直接下结论，隔 [VIDEO_GROW_PROBE_MS] 再采样一次，**只有字节数真的在涨**才避让；
+         *   3. 查不到行 / 状态不明 / 数字不动 → 一律放行。宁可抢跑，也不能把无感预取做成摆设。
+         */
+        private suspend fun ordinaryVideoReady(row: Row): Boolean {
+            val age = if (row.createTime > 0L) System.currentTimeMillis() - row.createTime else -1L
+            // 刚落库: 微信随时可能启动自动下载, 这种时刻一律先采样确认
+            val fresh = age in 0 until VIDEO_SAFE_DELAY_MS
+            val first = sampleVideoProgress(row)
+
+            // 判据说没在传, 也不是刚落库的高风险时刻 → 直接放行
+            if (!fresh && (first == null || !first.suspicious)) return true
+
+            delay(VIDEO_GROW_PROBE_MS)
+            val second = sampleVideoProgress(row)
+            if (second == null) return true
+
+            val growing = second.bytes > (first?.bytes ?: 0L)
+            if (growing) {
                 diagnoseOnce(row.msgSvrId) {
-                    "视频信息行尚未建立 (${table.name}.${table.keyColumn}=$keyValue), 稍后重试"
+                    "微信正在下载普通视频 (${first?.describe()} -> ${second.describe()}), 暂不拉原视频" +
+                        " —— 并发写同一个文件会把视频写坏"
                 }
                 return false
             }
-
-            val status = values["status"]
-            val total = values["totallen"] ?: 0L
-            val offset = values["netoffset"] ?: 0L
-            val fileSize = values["filenowsize"] ?: 0L
-            val done = (status != null && status >= 199L) ||
-                (total > 0L && fileSize >= total && offset >= total)
-            if (!done) {
-                diagnoseOnce(row.msgSvrId) {
-                    "微信仍在下载普通视频 (${table.name}: status=$status, offset=$offset, " +
-                        "file=$fileSize/$total), 暂不拉原视频 —— 并发写同一个文件会把视频写坏"
-                }
-                return false
-            }
+            WeLogger.i(
+                TAG,
+                "普通视频无下载进展 (${first?.describe()} -> ${second.describe()}), 照常拉原视频 " +
+                    "(msgSvrId=${row.msgSvrId})"
+            )
             return true
         }
 
@@ -790,7 +838,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         }
 
         /** @return true 表示这条消息已经有了定论 (已发起 / 确实没有原视频 / 不是视频消息)。 */
-        fun request(msgInfo: Any, row: Row): Boolean {
+        suspend fun request(msgInfo: Any, row: Row): Boolean {
             val r = resolveRecipe()
             if (r == null) {
                 if (!resolveFailureLogged) {
@@ -809,7 +857,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
          * @return true = 有定论 (已发起下载 / 本条确实没有原视频 / 不是视频消息);
          *         false = 信息还不完整 (视频信息未就绪), 交给重试与补偿扫描。
          */
-        private fun start(r: Recipe, msgInfo: Any, row: Row): Boolean {
+        private suspend fun start(r: Recipe, msgInfo: Any, row: Row): Boolean {
             val msgSvrId = row.msgSvrId
 
             // 0) v291: 别和微信抢同一个视频文件
@@ -893,6 +941,13 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             installProgressPlaceholder(r, session)
             if (!fileId.isNullOrEmpty()) lastLaunchAt[fileId] = System.currentTimeMillis()
             val accepted = runCatching { r.sessionRun.invoke(session) as? Boolean }.getOrNull()
+
+            if (accepted != true && !fileId.isNullOrEmpty()) {
+                // 微信没接这个任务, 几乎总是"同一个 fileid 的任务已经在队列里" —— 也就是微信
+                // 自己正在下普通画质。别按长冷却压满 3 分钟, 让它早一点接上。
+                lastLaunchAt[fileId] =
+                    System.currentTimeMillis() - (VIDEO_LAUNCH_COOLDOWN_MS - VIDEO_RETRY_COOLDOWN_MS)
+            }
 
             if (logged.add(msgSvrId)) {
                 WeLogger.i(

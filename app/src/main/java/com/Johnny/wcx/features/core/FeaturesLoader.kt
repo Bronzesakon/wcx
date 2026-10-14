@@ -161,7 +161,8 @@ object FeaturesLoader {
 
             val boundActivity = activity
             withContext(Dispatchers.Main) {
-                showComposeDialog(boundActivity, directlyDismissable = false) {
+                // v292: 允许直接关闭 —— 适配是后台任务, 关窗口不会中断它 (旧实现把两者绑死了)。
+                showComposeDialog(boundActivity, directlyDismissable = true) {
                     DexResolver(
                         boundActivity,
                         brokenItems,

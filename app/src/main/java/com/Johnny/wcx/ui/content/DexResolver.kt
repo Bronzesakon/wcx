@@ -104,8 +104,8 @@ fun DexResolver(
 
             val tipText = when {
                 running ->
-                    "正在后台适配 ${state.completed}/$total。可关闭本窗口, 适配会在后台继续, " +
-                            "完成后重启微信生效"
+                    "正在后台适配 ${state.completed}/$total。点空白处或返回键可关闭本窗口, " +
+                            "适配会在后台继续, 完成后重启微信生效"
 
                 state.finished && failed.isEmpty() ->
                     "适配完成! 所有功能已成功更新 DEX 缓存"
@@ -153,7 +153,10 @@ fun DexResolver(
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
             ) {
                 when {
-                    running -> TextButton(onClick = dismiss) { Text("后台运行") }
+                    // v292: 去掉「后台运行」按钮 —— 适配本来就在后台跑, 这个按钮只会让人以为
+                    // 点了才会切到后台。要关窗口直接点空白处 / 返回键 (见 showComposeDialog
+                    // 的 directlyDismissable), 进度不受影响。
+                    running -> Unit
 
                     state.finished -> {
                         TextButton(onClick = dismiss) { Text("关闭") }
