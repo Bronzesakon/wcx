@@ -32,6 +32,7 @@ import com.Johnny.wcx.dexkit.dsl.dexMethod
 import com.Johnny.wcx.features.api.core.WeMessageApi.cacheFile
 import com.Johnny.wcx.features.api.core.WeMessageApi.downloadFile
 import com.Johnny.wcx.features.api.core.models.MessageInfo
+import com.Johnny.wcx.features.api.core.models.MessageType
 import com.Johnny.wcx.features.api.net.WeNetSceneApi
 import com.Johnny.wcx.features.core.ApiFeature
 import com.Johnny.wcx.features.core.Feature
@@ -2177,6 +2178,18 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             }
             if (row.isSend == 1) return null
 
+            // 只对「文件」消息触发文件下载。本 API 的语义就是"把某条文件消息缓存到本地",
+            // 而事件驱动调用方在 update 缺 type 列时会把链接 / 引用等 appmsg 也送进来 ——
+            // 那些内容走到微信的文件下载链路上必然失败 (见 cacheFile 里的解析校验)。
+            if (row.type != MessageType.FILE.code) {
+                WeLogger.e(
+                    TAG,
+                    "cacheFileByMsgId: msgId=$msgId type=${row.type} 不是文件消息 " +
+                        "(期望 type=${MessageType.FILE.code}), 不触发文件下载"
+                )
+                return null
+            }
+
             val content = freshContent?.takeIf { it.isNotBlank() } ?: row.content
             if (content.isNullOrBlank()) {
                 WeLogger.e(TAG, "cacheFileByMsgId: content is empty (msgId=$msgId), cannot trigger download")
@@ -2240,10 +2253,26 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                 }
             }
 
-            // 内容为空时微信的下载逻辑会解析 appmsg XML 失败并对 null 解引用抛 NPE,
-            // 在此提前拦截, 给出可读的错误而不是把崩溃丢进微信内部。
-            if (mi.content.isBlank()) {
-                WeLogger.e(TAG, "cacheFile: msgInfo content is empty (msgSvrId=${mi.serverId}), cannot trigger download")
+            // 微信侧 a0.o(msg, z) 的第一句就是 AppMessage.parse(content), 解析失败后立刻把
+            // null 当对象用, 抛
+            //   NullPointerException: Attempt to read from field 'int pt0.r.i' on a null object reference
+            //   in method 'android.util.Pair com.tencent.mm.pluginsdk.model.app.a0.o(storage.e9, boolean)'
+            // (8.0.76 反汇编实锤: classes12.dex a0.o 偏移 0x20 即 `iget v1, v7, pt0.r.i`)。
+            // 微信自己的准入条件有两条, 这里照抄:
+            //   1. content 非空 (t8.K0 = isNullOrEmpty);
+            //   2. content 里含 "<msg" (sdk aa.d(content, "msg", "xml") 找不到就让 parse 返回 null);
+            // 再加一条: 必须真的是 appmsg (有 <appmsg><type>) —— 否则不是文件消息。
+            // 不做这个校验的后果是: 每轮补偿扫描都在微信内部刷一条 NPE 堆栈, 且永远不可能成功。
+            val appMsgType = runCatching {
+                if (mi.content.isBlank() || !mi.content.contains("<msg")) null
+                else MessageInfo.FileMessage(mi.content).appMsgType
+            }.getOrNull()
+            if (appMsgType == null) {
+                WeLogger.e(
+                    TAG,
+                    "cacheFile: content 不是可解析的 appmsg 文件消息 (msgSvrId=${mi.serverId}, " +
+                        "len=${mi.content.length}, head=${mi.content.take(120)}), skip"
+                )
                 return null
             }
 

@@ -59,11 +59,34 @@ object AutoCacheFiles : ClickableFeature(),
      */
     private const val SCAN_INTERVAL_MS = 180_000L
 
+    /** 单条消息最多尝试次数 (含补偿轮重试); 超过即结案, 避免永久刷屏。 */
+    private const val MAX_ATTEMPTS = 6
+
+    /** pending 条目的最长存活时间; 超过即结案 (对方上传中也可能永远不会传完)。 */
+    private const val PENDING_TTL_MS = 30 * 60 * 1000L
+
     /** 已成功缓存的 msgSvrId, 不再处理。 */
     private val doneSvrIds = ConcurrentHashMap.newKeySet<Long>()
 
-    /** 尚未成功、值得后续 update 事件/补偿轮重试的 msgSvrId → msgId。 */
-    private val pendingSvrIds = ConcurrentHashMap<Long, Long>()
+    /**
+     * 判定为**无法缓存**而结案的 msgSvrId (不是文件消息 / 反复失败), 不再处理。
+     *
+     * 没有这个集合, 失败条目会被补偿扫描与 pending 重试无限拾起: 设备日志实测
+     * 88 分钟内同 5 条消息被重试 17 轮, 每轮都在微信内部刷一条 NPE 堆栈
+     * (`Attempt to read from field 'int pt0.r.i' on a null object reference`)。
+     */
+    private val settledSvrIds = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 尚未成功、值得后续 update 事件/补偿轮重试的消息: msgSvrId → 追踪记录。 */
+    private val pendingSvrIds = ConcurrentHashMap<Long, Pending>()
+
+    /** pending 条目: 记录最新 msgId 与尝试次数, 以便给出"放弃"的定论而不是无限重试。 */
+    private class Pending(var msgId: Long) {
+        val firstSeenAt = System.currentTimeMillis()
+
+        @Volatile
+        var attempts = 0
+    }
 
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -97,6 +120,7 @@ object AutoCacheFiles : ClickableFeature(),
         WeDatabaseListenerApi.removeListener(this)
         scope.cancel()
         doneSvrIds.clear()
+        settledSvrIds.clear()
         pendingSvrIds.clear()
         WeLogger.i(TAG, "disabled: listener removed, compensation stopped")
     }
@@ -138,7 +162,7 @@ object AutoCacheFiles : ClickableFeature(),
         // (insert 时见过的文件消息) 才值得深究, 避免每条更新都去查库。
         if (fromUpdate && freshContent == null && values.getAsLong("msgSvrId") == null) {
             val knownMsgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs)
-            if (knownMsgId == null || knownMsgId !in pendingSvrIds.values) {
+            if (knownMsgId == null || !isPendingMsgId(knownMsgId)) {
                 prefilteredUpdateEvents.incrementAndGet()
                 WeLogger.d(TAG, "update event without content/msgSvrId skipped (msgId=$knownMsgId)")
                 return
@@ -160,14 +184,14 @@ object AutoCacheFiles : ClickableFeature(),
                 return
             }
             // 已知的 pending 消息: 用事件里的 msgId 刷新映射, 补偿轮按最新 msgId 重试
-            if (pendingSvrIds.containsKey(svrId)) pendingSvrIds[svrId] = msgId
+            pendingSvrIds[svrId]?.msgId = msgId
             svrId
         }
         if (msgSvrId == 0L) {
             WeLogger.w(TAG, "msgSvrId=0 event skipped (table=$table, fromUpdate=$fromUpdate)")
             return
         }
-        if (msgSvrId in doneSvrIds) return
+        if (isFinished(msgSvrId)) return
 
         val talker = values.getAsString("talker")
             ?: WeMessageApi.getTalkerByMsgSvrId(msgSvrId)
@@ -187,14 +211,33 @@ object AutoCacheFiles : ClickableFeature(),
                 // 对方仍在上传, 此刻下载必然失败, 记为 pending 等对方传完后的更新事件
                 file.isSenderUploading -> {
                     WeLogger.i(TAG, "file msg $msgSvrId: sender still uploading (appmsgType=${file.appMsgType}), deferring")
-                    pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
+                    trackPending(msgSvrId, lookupMsgId(msgSvrId))
                     return
                 }
-                // 未知/暂不可下载的 appmsg 类型: 同样记 pending, 由补偿轮持续重试
+                // 不是文件消息: update 事件不带 type 列时会被放进来。
+                // 确凿的非文件 (链接 5 / 转发 19 / 引用 57, 或压根没有 <appmsg> 的视频/语音/
+                // 系统消息) **必须结案而不是记 pending** —— 微信的文件下载链路解析这些内容会
+                // 返回 null 并就地解引用 (NPE), 记 pending 只会让补偿轮每 3 分钟重试一次、
+                // 永远刷屏 (设备日志实测 88 分钟 17 轮 x 5 条)。
+                !file.isFileAppMsg -> {
+                    if (file.appMsgType == null && file.looksLikeAppMsg) {
+                        // 有 <appmsg> 但 <type> 读不出来: 拿不准是不是文件, 交给重试上限兜底
+                        WeLogger.i(TAG, "file msg $msgSvrId: appmsg 的 <type> 不可用, deferring")
+                        trackPending(msgSvrId, lookupMsgId(msgSvrId))
+                    } else {
+                        WeLogger.i(
+                            TAG,
+                            "file msg $msgSvrId 不是文件消息 (appmsgType=${file.appMsgType}), 结案不再重试"
+                        )
+                        settle(msgSvrId, "content 不是文件类 appmsg (appmsgType=${file.appMsgType})")
+                    }
+                    return
+                }
+                // 是文件消息但尚未就绪: 记 pending, 由补偿轮持续重试
                 // (对方上传完成/类型就绪后 content 会更新, 补偿轮按 msgId 重新查库即拿到新值)
                 !file.isDownloadable -> {
                     WeLogger.i(TAG, "file msg $msgSvrId: not downloadable yet (appmsgType=${file.appMsgType}), deferring")
-                    pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
+                    trackPending(msgSvrId, lookupMsgId(msgSvrId))
                     return
                 }
             }
@@ -208,25 +251,25 @@ object AutoCacheFiles : ClickableFeature(),
         } else {
             // insert 却没有 content, 无法解析 appmsg; 记 pending 让补偿轮按 msgId 路径重试
             WeLogger.w(TAG, "file msg $msgSvrId: insert without content, defer to compensation")
-            pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
+            trackPending(msgSvrId, lookupMsgId(msgSvrId))
             return
         }
 
         if (fromUpdate) {
             // update 事件统一经 msgId 路径处理: content 以事件新值为准, 稳定列查库补齐
             val msgId = WeDatabaseListenerApi.extractMsgIdFromUpdate(values, whereClause, whereArgs)
-                ?: pendingSvrIds[msgSvrId]
+                ?: pendingSvrIds[msgSvrId]?.msgId
                 ?: lookupMsgId(msgSvrId)
             if (msgId <= 0L) {
                 WeLogger.w(TAG, "file msg $msgSvrId: cannot resolve msgId for update event, skip")
                 return
             }
-            pendingSvrIds[msgSvrId] = msgId
+            trackPending(msgSvrId, msgId)
             WeLogger.i(TAG, "file msg $msgSvrId ready via update (msgId=$msgId), auto caching")
             launchCache(msgSvrId, "update") { WeMessageApi.cacheFileByMsgId(msgId, freshContent) }
         } else {
             // insert 事件的 values 即完整行, 直接转换, 无需再查库
-            if (!pendingSvrIds.containsKey(msgSvrId)) pendingSvrIds[msgSvrId] = lookupMsgId(msgSvrId)
+            trackPending(msgSvrId, lookupMsgId(msgSvrId))
             WeLogger.i(TAG, "file msg $msgSvrId ready on insert, auto caching")
             launchCache(msgSvrId, "insert") {
                 try {
@@ -240,8 +283,12 @@ object AutoCacheFiles : ClickableFeature(),
         }
     }
 
-    /** 统一发起缓存; 成功记入 done, 失败保留 pending 等待后续事件/补偿轮重试。 */
+    /**
+     * 统一发起缓存; 成功记入 done, 失败保留 pending 等后续事件/补偿轮重试 (次数与存活
+     * 时间都有上限, 见 [giveUpIfExhausted], 不会无限重试)。
+     */
     private fun launchCache(msgSvrId: Long, via: String, block: suspend () -> String?) {
+        pendingSvrIds[msgSvrId]?.let { it.attempts += 1 }
         scope.launch {
             downloadSemaphore.withPermit {
                 val path = try {
@@ -251,11 +298,16 @@ object AutoCacheFiles : ClickableFeature(),
                     null
                 }
                 if (path != null) {
-                    doneSvrIds.add(msgSvrId)
-                    pendingSvrIds.remove(msgSvrId)
+                    markDone(msgSvrId)
                     WeLogger.i(TAG, "cached file msgSvrId=$msgSvrId via $via -> $path")
                 } else {
-                    WeLogger.e(TAG, "failed to auto-cache file msgSvrId=$msgSvrId via $via, will retry on later events")
+                    val attempts = pendingSvrIds[msgSvrId]?.attempts ?: 0
+                    WeLogger.e(
+                        TAG,
+                        "failed to auto-cache file msgSvrId=$msgSvrId via $via " +
+                            "(第 $attempts 次), will retry on later events"
+                    )
+                    giveUpIfExhausted(msgSvrId)
                 }
             }
         }
@@ -289,6 +341,54 @@ object AutoCacheFiles : ClickableFeature(),
             WeLogger.e(TAG, "lookupMsgId failed for msgSvrId=$msgSvrId", e)
             0L
         }
+    }
+
+    /** 登记/刷新一条待重试消息; 已有记录时只更新 msgId (保留尝试次数与首次时间)。 */
+    private fun trackPending(msgSvrId: Long, msgId: Long) {
+        val existing = pendingSvrIds[msgSvrId]
+        if (existing != null) {
+            if (msgId > 0L) existing.msgId = msgId
+        } else {
+            pendingSvrIds[msgSvrId] = Pending(msgId)
+        }
+    }
+
+    /** 该 msgId 是否属于某个待重试消息 (update 事件的廉价预筛用)。 */
+    private fun isPendingMsgId(msgId: Long) = pendingSvrIds.values.any { it.msgId == msgId }
+
+    /** 终态: 成功. */
+    private fun markDone(msgSvrId: Long) {
+        doneSvrIds.add(msgSvrId)
+        pendingSvrIds.remove(msgSvrId)
+    }
+
+    /** 终态: 结案 (不再尝试), 并打出一条"为什么放弃"的定论。 */
+    private fun settle(msgSvrId: Long, reason: String) {
+        pendingSvrIds.remove(msgSvrId)
+        if (settledSvrIds.add(msgSvrId)) WeLogger.w(TAG, "结案 msgSvrId=$msgSvrId: $reason")
+    }
+
+    /** 已到终态 (成功或结案), 任何路径都不应再处理。 */
+    private fun isFinished(msgSvrId: Long) = msgSvrId in doneSvrIds || msgSvrId in settledSvrIds
+
+    /**
+     * @return true 表示已放弃 (尝试次数或存活时间超限), 调用方不应再重试。
+     *
+     * 补偿轮会一直重试 pending, 若某个失败原因无法自愈 (内容不是文件消息 / 对方永远
+     * 不传完), 就会变成每轮刷一条错误的死循环 —— 这里给重试画上句号。
+     */
+    private fun giveUpIfExhausted(msgSvrId: Long): Boolean {
+        val p = pendingSvrIds[msgSvrId] ?: return false
+        val ageMs = System.currentTimeMillis() - p.firstSeenAt
+        if (p.attempts >= MAX_ATTEMPTS || ageMs > PENDING_TTL_MS) {
+            settle(
+                msgSvrId,
+                "尝试 ${p.attempts} 次 / 存活 ${ageMs / 1000}s 仍未成功 " +
+                    "(不是可下载的文件消息, 或对方始终未传完)"
+            )
+            return true
+        }
+        return false
     }
 
     /**
@@ -357,15 +457,15 @@ object AutoCacheFiles : ClickableFeature(),
                 WeLogger.i(TAG, "compensation scan: skip msgId=$msgId (msgSvrId=0, 尚未同步的消息行)")
                 return@forEach
             }
-            if (svrId in doneSvrIds) {
-                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId (already cached)")
+            if (isFinished(svrId)) {
+                WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId (已缓存或已结案)")
                 return@forEach
             }
             if (!passesListFilter(talker)) {
                 WeLogger.i(TAG, "compensation scan: skip msgSvrId=$svrId talker=$talker (blocked by ${describeListFilter()})")
                 return@forEach
             }
-            pendingSvrIds[svrId] = msgId
+            trackPending(svrId, msgId)
             launched++
             launchCache(svrId, "scan") { WeMessageApi.cacheFileByMsgId(msgId) }
         }
@@ -381,17 +481,20 @@ object AutoCacheFiles : ClickableFeature(),
         val snapshot = pendingSvrIds.toMap()
         if (snapshot.isEmpty()) return
         WeLogger.i(TAG, "compensation retry: ${snapshot.size} pending file message(s)")
-        snapshot.forEach { (svrId, msgId) ->
-            if (svrId in doneSvrIds) {
+        snapshot.forEach { (svrId, entry) ->
+            if (isFinished(svrId)) {
                 pendingSvrIds.remove(svrId)
                 return@forEach
             }
-            if (msgId <= 0L) {
+            // 每轮重试前先判"是否该放弃": 重试次数与存活时间都有上限, 否则一个无法自愈的
+            // 失败原因 (内容不是文件消息 / 对方永远不传完) 会变成永久刷屏。
+            if (giveUpIfExhausted(svrId)) return@forEach
+            if (entry.msgId <= 0L) {
                 // 没有 msgId 无法定位行, 放弃 (等下次 insert/update 事件补齐)
                 pendingSvrIds.remove(svrId)
                 return@forEach
             }
-            launchCache(svrId, "retry") { WeMessageApi.cacheFileByMsgId(msgId) }
+            launchCache(svrId, "retry") { WeMessageApi.cacheFileByMsgId(entry.msgId) }
         }
     }
 

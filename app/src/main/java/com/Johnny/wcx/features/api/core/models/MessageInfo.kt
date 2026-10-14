@@ -197,14 +197,37 @@ class MessageInfo(val instance: Any) {
          * appmsg 内层 `<type>`:
          * - 6 / 130: 文件已就绪, 可以下载
          * - 74 / 131: 对方仍在上传中, 此时触发下载必然失败
+         * - null / 其它: **不是文件消息** (链接 5 / 转发 19 / 引用 57 ...)
+         *
+         * 取值失败一律当 null —— 这个字段只用来回答"是不是文件消息", 不该因为
+         * `<type>` 内容异常就抛异常打断调用方。
          */
-        val appMsgType by lazy { xml.getByPath("msg.appmsg.type")?.asInt }
+        val appMsgType: Int? by lazy { runCatching { xml.getByPath("msg.appmsg.type")?.asInt }.getOrNull() }
 
         /** 对方是否仍在上传 (气泡显示"对方上传中")。 */
         val isSenderUploading get() = appMsgType == 74 || appMsgType == 131
 
         /** 文件是否已就绪、可下载。 */
         val isDownloadable get() = appMsgType == 6 || appMsgType == 130
+
+        /**
+         * 是不是一条**文件**消息 (已就绪或仍在传)。
+         *
+         * 必须与 [appMsgType] 配套使用: 事件驱动路径上 `type` 列经常缺席 (update 只带被改的列),
+         * 链接 / 引用 / 转发等其它 appmsg 会被误当成文件候选。若对它们一律记 pending, 补偿轮
+         * 会永远重试, 而微信侧的文件下载链路解析这些内容后会对 null 解引用抛 NPE
+         * (设备日志: `Attempt to read from field 'int pt0.r.i' on a null object reference`)。
+         */
+        val isFileAppMsg get() = appMsgType == 6 || appMsgType == 130 || isSenderUploading
+
+        /**
+         * content 里是否存在 `<msg><appmsg>` 这一层。
+         *
+         * 用于把"**确凿**不是文件消息"(视频 `<videomsg>` / 语音 / 系统消息, 压根没有
+         * `<appmsg>`) 与"拿不准"(有 `<appmsg>` 但 `<type>` 读不出来) 区分开: 前者可以
+         * 直接结案不再重试, 后者留给调用方的重试上限兜底。
+         */
+        val looksLikeAppMsg get() = runCatching { xml.getByPath("msg.appmsg") != null }.getOrDefault(false)
     }
 
     class ImageMessage(xmlStr: String) {
