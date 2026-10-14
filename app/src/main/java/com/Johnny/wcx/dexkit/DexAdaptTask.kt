@@ -11,6 +11,7 @@ import com.Johnny.wcx.dexkit.resolution.resolveAllDex
 import com.Johnny.wcx.features.core.BaseFeature
 import com.Johnny.wcx.utils.HostInfo
 import com.Johnny.wcx.utils.WeLogger
+import com.Johnny.wcx.utils.android.ProcessPriority
 import com.Johnny.wcx.utils.reflection.retainDexKit
 import com.Johnny.wcx.utils.unreachable
 import kotlinx.coroutines.CoroutineScope
@@ -43,8 +44,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  *  - 扫描期间持一把 `PARTIAL_WAKE_LOCK`，避免息屏后 CPU 进入 suspend 让 native
  *    查询长时间不推进（这是「后台不跑」的另一半原因，与进程冻结无关）。
  *
- * 注意：Android 12+ 的 cached-app freezer 会把整个微信进程冻结，那是系统行为，
- * 应用内没有任何手段能绕过；此时任务只是暂停，进程解冻后会从当前项继续。
+ * v291 补上最后一块：上面说的「微信切后台 → 适配停住」其实**可以**绕过 ——
+ * Android 12+ 的 cached-app freezer 只冻结 cached 进程，而进程是否 cached 由 adj
+ * 决定。适配期间调用 [ProcessPriority]（反射 `IActivityManager.setProcessForeground`，
+ * 即 `Service.startForeground()` 内部那条）把微信进程顶到前台优先级，freezer 就不会碰它，
+ * 切后台也能一路跑完。反射不可用时退化回 v284 的行为：进程解冻后从当前项继续。
  */
 object DexAdaptTask {
 
@@ -132,6 +136,11 @@ object DexAdaptTask {
     private suspend fun runAdaptation(items: List<IResolveDex>) {
         val startedAt = SystemClock.elapsedRealtime()
         val wakeLock = acquireWakeLock()
+
+        // v291: WakeLock 挡不住 Android 12+ 的 cached-app freezer (微信一被切到后台,
+        // 整个进程被冻住, 表现为"进度停在某一项, 切回微信才继续")。把进程顶到前台
+        // 优先级才是系统认的豁免; 反射不可用时只是回到 wakelock 的老行为。
+        val foregrounded = ProcessPriority.raise()
         try {
             // 长期持有同一份 DexKit：pin 住后不会被 120s 空闲回收打断长扫描
             val dexKit = retainDexKit()
@@ -176,6 +185,7 @@ object DexAdaptTask {
                 current = "适配异常: ${t.message}",
             )
         } finally {
+            if (foregrounded) ProcessPriority.release()
             releaseWakeLock(wakeLock)
         }
     }

@@ -129,6 +129,23 @@ import java.util.concurrent.ConcurrentHashMap
  *  2. 只有 XML 已确认是视频消息 XML、却仍解析不出 cdnrawvideourl 时, 才判"没有原视频"结案。
  *  3. 补上跨轮次重试上限 ([MAX_TOTAL_ATTEMPTS]), 让"每 5 分钟补偿扫描"能真正重试,
  *     又不至于永久刷屏; 同时跳过 `isSend=1` (自己发的媒体本地就有原文件, 不必拉 CDN)。
+ *
+ * ### v291: 别和微信抢同一个视频文件 (修复"接收视频后有几率播放不了")
+ *
+ * v290 修好"点开才下载"之后, 用户反馈**收到视频后点开转圈 / 黑屏播不出**。
+ * 根因是**写者冲突**: 原视频下载写的就是普通视频那一个文件 (微信「查看原视频」
+ * 是覆盖本地文件), 而 v290 会在消息落库后几秒内就发起 —— 此刻微信自己正在写
+ * 同一个文件 (普通视频链路), 两个写者并发 → 文件不完整。设备日志佐证:
+ * `23:40:36 收到 → 23:40:42 我们就发起了原视频下载 (accepted=true)`,
+ * 期间微信自己的下载任务也在跑; 之后同一条视频 30 秒内被重复发起 5 次。
+ *
+ * 于是加两道闸:
+ *  1. **等微信把普通视频下完** ([OriginVideoDownload.ordinaryVideoReady]): 查
+ *     `videoinfo2` / `videoinfo` 的 `status` / `netoffset` / `totallen` / `filenowsize`
+ *     (表结构运行时探测, 探测不到就退化为「消息落库 [VIDEO_SAFE_DELAY_MS] 后才动」)。
+ *     在此之前连 `n1.t` 都不调 —— 它也会写 VideoInfo 行, 同样会打扰微信的下载。
+ *  2. **同一条视频 [VIDEO_LAUNCH_COOLDOWN_MS] 内只发起一次**, 顺带压掉补偿扫描
+ *     对同一条消息的反复建任务。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
@@ -199,6 +216,28 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
      */
     private const val MAX_TOTAL_ATTEMPTS = 6
 
+    /**
+     * 【v291】原视频下载写的是**同一个视频文件**: 微信收到视频时自己也在往这个文件里写
+     * (普通视频链路), 两个写者并发 → 文件不完整 → 用户点开就是"转圈 / 黑屏播不出"。
+     *
+     * 所以发起前必须先确认微信已经把普通视频下完 (见 [OriginVideoDownload.ordinaryVideoReady])。
+     * 只有在拿不到下载状态判据 (表结构变了) 时才退化为这条时间门槛 —— 至少躲开
+     * "消息刚落库、微信正在写"这个最容易撞车的时间窗。
+     */
+    private const val VIDEO_SAFE_DELAY_MS = 20_000L
+
+    /**
+     * 同一条视频 (CDN fileid) 两次发起之间的最小间隔。既防与微信自己的任务并发,
+     * 也防补偿扫描在同一条消息上反复建任务 (设备日志里出现过 5 次/30 秒的重复发起)。
+     */
+    private const val VIDEO_LAUNCH_COOLDOWN_MS = 3 * 60_000L
+
+    /**
+     * 视频信息行始终查不到时的放行门槛。表结构若不是我们猜的那样, 老消息也要能拉,
+     * 不能因为判据缺失就永久卡住 (见 [OriginVideoDownload.ordinaryVideoReady])。
+     */
+    private const val VIDEO_ROW_GRACE_MS = 5 * 60_000L
+
     /** 补偿扫描回看窗口。 */
     private const val SCAN_WINDOW_MS = 6 * 60 * 60 * 1000L
 
@@ -252,6 +291,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         attemptsBySvrId.clear()
         inFlight.clear()
         pendingSvrIds.clear()
+        OriginVideoDownload.reset()
         WeLogger.i(TAG, "disabled: 监听已移除, 补偿扫描已停止")
     }
 
@@ -335,14 +375,16 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         val content: String?,
         /** message.imgPath: 视频/图片的 CDN fileid。 */
         val imgPath: String?,
+        /** message.createTime: 用来识别"消息刚落库"这种高风险时刻 (见 [VIDEO_SAFE_DELAY_MS])。 */
+        val createTime: Long = 0L,
     )
 
     private fun queryRow(msgSvrId: Long): Row? {
         if (!ensureDatabase()) return null
         return try {
             WeDatabaseApi.rawQuery(
-                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath FROM message " +
-                    "WHERE msgSvrId=? LIMIT 1",
+                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath, createTime " +
+                    "FROM message WHERE msgSvrId=? LIMIT 1",
                 arrayOf<Any>(msgSvrId)
             ).use { cursor ->
                 if (!cursor.moveToNext()) {
@@ -357,6 +399,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                         isSend = cursor.getInt(cursor.getColumnIndexOrThrow("isSend")),
                         content = cursor.getString(cursor.getColumnIndexOrThrow("content")),
                         imgPath = cursor.getString(cursor.getColumnIndexOrThrow("imgPath")),
+                        createTime = cursor.getLong(cursor.getColumnIndexOrThrow("createTime")),
                     )
                 }
             }
@@ -456,8 +499,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         val since = System.currentTimeMillis() - SCAN_WINDOW_MS
         val rows = try {
             WeDatabaseApi.rawQuery(
-                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath FROM message " +
-                    "WHERE type IN (?, ?) AND isSend=0 AND createTime>? ORDER BY createTime DESC LIMIT ?",
+                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath, createTime " +
+                    "FROM message WHERE type IN (?, ?) AND isSend=0 AND createTime>? " +
+                    "ORDER BY createTime DESC LIMIT ?",
                 arrayOf<Any>(MessageType.IMAGE.code, MessageType.VIDEO.code, since, SCAN_LIMIT)
             ).use { cursor ->
                 buildList<Row> {
@@ -471,6 +515,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                                 isSend = cursor.getInt(cursor.getColumnIndexOrThrow("isSend")),
                                 content = cursor.getString(cursor.getColumnIndexOrThrow("content")),
                                 imgPath = cursor.getString(cursor.getColumnIndexOrThrow("imgPath")),
+                                createTime = cursor.getLong(cursor.getColumnIndexOrThrow("createTime")),
                             )
                         )
                     }
@@ -610,6 +655,140 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
         fun resolve(className: String): Class<*>? = className.toClassOrNull()
 
+        // -----------------------------------------------------------------------------------------
+        // v291: 两条"别和微信抢同一个文件"的闸
+        //
+        // 原视频下载写的就是普通视频那一个文件 (微信「查看原视频」是覆盖本地文件)。
+        // 2026-10-14 v290 的设备日志里, 收到视频后几秒内我们就发起了原视频下载, 而此刻
+        // 微信自己正在写同一个文件 —— 用户之后点开就是"转圈 / 黑屏播不出"。
+        // 所以: (1) 等微信把普通视频下完; (2) 同一条视频不重复发起。
+        // -----------------------------------------------------------------------------------------
+
+        /** 同一条视频 (CDN fileid) 上次发起的时间戳, 用于 [VIDEO_LAUNCH_COOLDOWN_MS] 冷却。 */
+        private val lastLaunchAt = ConcurrentHashMap<String, Long>()
+
+        /** videoinfo(2) 表结构探测结果 (只探一次)。 */
+        @Volatile
+        private var videoTable: VideoTable? = null
+
+        @Volatile
+        private var videoTableProbed = false
+
+        private class VideoTable(
+            val name: String,
+            val keyColumn: String,
+            val columns: Set<String>,
+        )
+
+        private fun videoTableOrNull(): VideoTable? {
+            if (videoTableProbed) return videoTable
+            videoTableProbed = true
+            videoTable = runCatching {
+                for (name in listOf("videoinfo2", "videoinfo")) {
+                    val cols: List<String>? = WeDatabaseApi.rawQuery(
+                        "PRAGMA table_info($name)",
+                        arrayOf<Any>()
+                    ).use { c ->
+                        val idx = c.getColumnIndex("name")
+                        if (idx < 0) null else buildList<String> {
+                            while (c.moveToNext()) add(c.getString(idx))
+                        }
+                    }
+                    if (cols.isNullOrEmpty()) continue
+                    val key = listOf("filename", "msglocalid", "msgLocalId").firstOrNull { it in cols }
+                        ?: continue
+                    return@runCatching VideoTable(name, key, cols.toSet())
+                }
+                null
+            }.onFailure {
+                WeLogger.w(TAG, "视频信息表探测失败: ${it.message}")
+            }.getOrNull()
+            WeLogger.i(
+                TAG,
+                "视频信息表探测: ${videoTable?.let { "${it.name} (key=${it.keyColumn}, ${it.columns.size} 列)" }
+                    ?: "未找到 → 退化为「消息落库 ${VIDEO_SAFE_DELAY_MS / 1000}s 后才拉原视频」"}"
+            )
+            return videoTable
+        }
+
+        /**
+         * 微信自己是否已经把这条视频的「普通视频」下完。
+         * @return false = 还没下完 (此刻拉原视频会与微信并发写同一个文件), 稍后重试。
+         */
+        private fun ordinaryVideoReady(row: Row): Boolean {
+            val age = if (row.createTime > 0L) System.currentTimeMillis() - row.createTime else -1L
+            val table = videoTableOrNull()
+
+            // 拿不到状态判据 (表结构变了): 只躲开"消息刚落库"这个最容易撞车的时间窗
+            if (table == null) {
+                if (age >= 0 && age < VIDEO_SAFE_DELAY_MS) {
+                    diagnoseOnce(row.msgSvrId) {
+                        "视频状态表不可用, 等微信先落普通视频 (消息落库 ${age}ms < 门槛 " +
+                            "${VIDEO_SAFE_DELAY_MS}ms), 稍后重试"
+                    }
+                    return false
+                }
+                return true
+            }
+
+            val keyValue: Any =
+                if (table.keyColumn == "filename") row.imgPath ?: return true else row.msgId
+            if (keyValue is String && keyValue.isEmpty()) return true
+
+            val want = listOf("status", "netoffset", "totallen", "filenowsize").filter { it in table.columns }
+            if (want.isEmpty()) return true
+
+            val values: Map<String, Long?>? = runCatching {
+                WeDatabaseApi.rawQuery(
+                    "SELECT ${want.joinToString(", ")} FROM ${table.name} " +
+                        "WHERE ${table.keyColumn}=? LIMIT 1",
+                    arrayOf<Any>(keyValue)
+                ).use { c ->
+                    if (!c.moveToNext()) {
+                        null
+                    } else {
+                        want.associateWith { col ->
+                            val i = c.getColumnIndex(col)
+                            if (i < 0) null else c.getLong(i)
+                        }
+                    }
+                }
+            }.onFailure {
+                WeLogger.w(TAG, "查询 ${table.name} 失败: ${it.message}")
+            }.getOrNull()
+
+            if (values == null) {
+                // 视频行都还没建 —— 但表结构万一不是我们猜的那样, 老消息就放行, 免得永久卡住
+                if (age > VIDEO_ROW_GRACE_MS) return true
+                diagnoseOnce(row.msgSvrId) {
+                    "视频信息行尚未建立 (${table.name}.${table.keyColumn}=$keyValue), 稍后重试"
+                }
+                return false
+            }
+
+            val status = values["status"]
+            val total = values["totallen"] ?: 0L
+            val offset = values["netoffset"] ?: 0L
+            val fileSize = values["filenowsize"] ?: 0L
+            val done = (status != null && status >= 199L) ||
+                (total > 0L && fileSize >= total && offset >= total)
+            if (!done) {
+                diagnoseOnce(row.msgSvrId) {
+                    "微信仍在下载普通视频 (${table.name}: status=$status, offset=$offset, " +
+                        "file=$fileSize/$total), 暂不拉原视频 —— 并发写同一个文件会把视频写坏"
+                }
+                return false
+            }
+            return true
+        }
+
+        /** 关闭功能时清掉冷却与表结构缓存, 下次开启重新探测。 */
+        fun reset() {
+            lastLaunchAt.clear()
+            videoTable = null
+            videoTableProbed = false
+        }
+
         /** @return true 表示这条消息已经有了定论 (已发起 / 确实没有原视频 / 不是视频消息)。 */
         fun request(msgInfo: Any, row: Row): Boolean {
             val r = resolveRecipe()
@@ -632,6 +811,23 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
          */
         private fun start(r: Recipe, msgInfo: Any, row: Row): Boolean {
             val msgSvrId = row.msgSvrId
+
+            // 0) v291: 别和微信抢同一个视频文件
+            val fileId = row.imgPath
+            if (!fileId.isNullOrEmpty()) {
+                val last = lastLaunchAt[fileId]
+                if (last != null && System.currentTimeMillis() - last < VIDEO_LAUNCH_COOLDOWN_MS) {
+                    WeLogger.i(
+                        TAG,
+                        "同一条视频刚发起过 (fileId=$fileId, " +
+                            "${(System.currentTimeMillis() - last) / 1000}s 前), 本轮不重复发起"
+                    )
+                    return false
+                }
+            }
+            // 微信还在下普通视频时, 这里连 n1.t 都不能调: 它会写 VideoInfo 行,
+            // 与微信正在进行的下载抢同一个文件 / 同一行状态。
+            if (!ordinaryVideoReady(row)) return false
 
             // 1) 不是视频消息: 与微信同款静态判定
             val isVideo = runCatching { r.checkVideo.invoke(null, msgInfo) as? Boolean }.getOrNull()
@@ -695,6 +891,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             val session = r.newSession.newInstance(callback)
             r.sessionAdd.invoke(session, task)
             installProgressPlaceholder(r, session)
+            if (!fileId.isNullOrEmpty()) lastLaunchAt[fileId] = System.currentTimeMillis()
             val accepted = runCatching { r.sessionRun.invoke(session) as? Boolean }.getOrNull()
 
             if (logged.add(msgSvrId)) {
