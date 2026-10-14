@@ -7,6 +7,7 @@ import com.Johnny.wcx.features.api.core.WeMessageApi
 import com.Johnny.wcx.features.api.core.models.MessageType
 import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.features.core.SwitchFeature
+import com.Johnny.wcx.preferences.WePrefs
 import com.Johnny.wcx.utils.WeLogger
 import dev.ujhhgtg.reflekt.reflekt
 import dev.ujhhgtg.reflekt.utils.toClassOrNull
@@ -98,6 +99,18 @@ import java.util.concurrent.ConcurrentHashMap
  * 消息落库的 insert / update 事件驱动, 外加每 5 分钟一轮、回看 6 小时的补偿扫描
  * (与「自动缓存图片」同款设计: 监听器注册晚于消息落库、开启功能时消息早已落库、
  * 图片 / 视频信息行写入过晚都会漏事件, 必须靠扫描兜底)。
+ *
+ * ### v288: 默认跟随「自动查看原图/原视频」的开关
+ *
+ * 设备日志 (2026-10-14) 里本功能**一行日志都没有** —— 因为它的开关一直没人拨过
+ * ([SwitchFeature.startup] 读 `WePrefs.getBoolOrDef(name, defaultEnabled)`,
+ * 而 `defaultEnabled` 原本是 false), 于是 `onEnable()` 从未执行, 用户看到的现象就是
+ * "收到视频不下载, 点开才下载"。用户真正拨过的开关只有「自动查看原图/原视频」。
+ *
+ * 两个功能是同一诉求的两半: 那个只能在**点开**图片/视频页时动作, 本功能才做得到
+ * "不点开也拉"。所以 [defaultEnabled] 改为**跟随**前者的开关值 —— 已经明确开过
+ * "自动查看原图/原视频" 的用户, 升级后本功能自动生效; 在本功能里拨过开关的用户,
+ * 以本功能的 key 为准 (不会覆盖用户的显式选择)。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
@@ -109,6 +122,49 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
     WeDatabaseListenerApi.IUpdateListener {
 
     private const val TAG = "AutoPrefetchOriginalMedia"
+
+    /** 「自动查看原图/原视频」的开关 key (见 [defaultEnabled])。 */
+    private const val VIEW_FEATURE_KEY = "自动查看原图/原视频"
+
+    /** 上面那个功能改名前的 key (v281 事故留下的兼容 key)。 */
+    private const val VIEW_FEATURE_LEGACY_KEY = "自动查看原图"
+
+    /**
+     * 本功能从未被拨动过时的默认值 = **跟随「自动查看原图/原视频」当前的开关值**。
+     *
+     * 用户既然显式开过 "自动查看原图/原视频", 说明他要的就是"原画质自动到本地";
+     * 那个功能只能在**点开**时动作, 本功能才能"不点开也拉", 所以直接继承。
+     * 一旦用户在本功能的设置项里拨过开关, `WePrefs` 里就有本功能的 key 了,
+     * `getBoolOrDef` 不会再走到这里 —— 用户的显式选择永远优先。
+     */
+    override val defaultEnabled: Boolean
+        get() = runCatching {
+            WePrefs.getBoolOrDef(
+                VIEW_FEATURE_KEY,
+                WePrefs.getBoolOrDef(VIEW_FEATURE_LEGACY_KEY, false)
+            )
+        }.getOrDefault(false)
+
+    /**
+     * 启动日志 (v288 新增)。
+     *
+     * v285/v286 的日志里本功能**一行都没有**, 没法区分"开关没开"和"开了但静默失败" ——
+     * 这次把开关值 + 三个 key 的存在性都打出来, 下次一眼就能定论。
+     */
+    override val shouldEnableOnStartup: Boolean
+        get() {
+            val selfKey = runCatching { WePrefs.containsKey(name) }.getOrDefault(false)
+            val viewKey = runCatching { WePrefs.containsKey(VIEW_FEATURE_KEY) }.getOrDefault(false)
+            val viewLegacyKey =
+                runCatching { WePrefs.containsKey(VIEW_FEATURE_LEGACY_KEY) }.getOrDefault(false)
+            WeLogger.i(
+                TAG,
+                "startup: 开关=$_isEnabled (本功能 key '$name' 存在=$selfKey; " +
+                    "未拨动过时跟随「自动查看原图/原视频」: " +
+                    "新key 存在=$viewKey, 旧key 存在=$viewLegacyKey)"
+            )
+            return _isEnabled
+        }
 
     /** 单条消息最多尝试次数 (立即 + 两次延迟重试)。 */
     private const val MAX_ATTEMPTS = 3
