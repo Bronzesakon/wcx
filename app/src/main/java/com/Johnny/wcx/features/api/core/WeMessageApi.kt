@@ -2097,6 +2097,14 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     private data class AppAttachInfo(val status: Long, val offset: Long, val totalLen: Long, val fileFullPath: String?) {
         // 与微信 d.n0() + status==199 一致: 文件已完整落地
         val isComplete get() = status == 199L || totalLen > 0 && offset == totalLen
+
+        /** 微信侧已经有进度但还没完成 —— 此时重复触发会打断它。 */
+        val inProgress get() = !isComplete && offset > 0L
+
+        /** 日志用的一行状态摘要。 */
+        fun describe(): String =
+            "status=$status, offset=$offset/${if (totalLen > 0L) totalLen else -1}" +
+                (fileFullPath?.let { ", path=$it" } ?: "")
     }
 
     /**
@@ -2140,17 +2148,59 @@ object WeMessageApi : ApiFeature(), IResolveDex {
         }
     }
 
+    /**
+     * 等文件落地。
+     *
+     * 设备日志 (2026-10-14) 里出现过"同一文件连续几轮都 download did not complete within timeout"
+     * 却查不到任何进展信息的情况 —— 分不清是"根本没能开始下载"还是"大文件下得慢"。
+     * 所以这里改成**进度感知**:
+     *  - offset 只要还在前进就续期 (单条消息最长等 [MAX_WAIT_MS]), 慢网络 / 大文件不会再被误报失败;
+     *  - 每 30s 打一条进度日志, 让"卡在哪一步"在日志里可判定;
+     *  - 完全没有进展时才按窗口超时返回 null。
+     */
     private fun pollUntilFileDownloaded(msgId: Long, talker: String, msgSvrId: Long = 0L): String? {
-        val deadline = System.currentTimeMillis() + 120_000
-        while (System.currentTimeMillis() < deadline) {
-            val info = queryAppAttach(msgId, talker, msgSvrId)
+        val started = System.currentTimeMillis()
+        val hardDeadline = started + MAX_WAIT_MS
+        var deadline = started + IDLE_TIMEOUT_MS
+        var lastOffset = -1L
+        var lastLog = 0L
+        var info: AppAttachInfo? = null
+
+        while (System.currentTimeMillis() < hardDeadline) {
+            info = queryAppAttach(msgId, talker, msgSvrId)
             if (info != null && info.isComplete && !info.fileFullPath.isNullOrEmpty()) {
                 return info.fileFullPath
             }
-            Thread.sleep(1000)
+            val offset = info?.offset ?: -1L
+            if (offset > lastOffset) {
+                lastOffset = offset
+                deadline = System.currentTimeMillis() + IDLE_TIMEOUT_MS
+            }
+            val now = System.currentTimeMillis()
+            if (now - lastLog >= 30_000L) {
+                lastLog = now
+                WeLogger.i(
+                    TAG,
+                    "cacheFile: msgId=$msgId 下载中 ${info?.describe() ?: "无 appattach 行"} " +
+                        "(已等 ${(now - started) / 1000}s)"
+                )
+            }
+            if (now >= deadline) break
+            Thread.sleep(1_000)
         }
+        WeLogger.w(
+            TAG,
+            "cacheFile: msgId=$msgId 等待窗口内未完成 " +
+                "(${info?.describe() ?: "无 appattach 行"}, 已等 ${(System.currentTimeMillis() - started) / 1000}s)"
+        )
         return null
     }
+
+    /** 完全没有进展时的等待上限 (微信侧一次 CDN 请求都没发成功)。 */
+    private const val IDLE_TIMEOUT_MS = 120_000L
+
+    /** 只要 offset 还在前进就一直等 —— 大文件 / 慢网络的兜底上限。 */
+    private const val MAX_WAIT_MS = 10 * 60_000L
 
     /**
      * 按本地 msgId 缓存文件, 可附带 update 事件带来的新 content。
@@ -2193,6 +2243,27 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             val content = freshContent?.takeIf { it.isNotBlank() } ?: row.content
             if (content.isNullOrBlank()) {
                 WeLogger.e(TAG, "cacheFileByMsgId: content is empty (msgId=$msgId), cannot trigger download")
+                return null
+            }
+
+            // 这条路径 (补偿扫描 / update) 之前只信 `type` 列, 于是"对方仍在上传"的文件
+            // 也会被每 3 分钟推一次下载 —— 每次都注定失败, 在设备上表现为"文件一直下不下来"。
+            // 拿到 content 就地判定一次, 传完之前不推。
+            val file = runCatching { MessageInfo.FileMessage(content) }.getOrNull()
+            if (file == null || !file.isFileAppMsg) {
+                WeLogger.e(
+                    TAG,
+                    "cacheFileByMsgId: msgId=$msgId content 不是文件类 appmsg " +
+                        "(appMsgType=${file?.appMsgType}), 不触发文件下载"
+                )
+                return null
+            }
+            if (file.isSenderUploading) {
+                WeLogger.i(
+                    TAG,
+                    "cacheFileByMsgId: msgId=$msgId (msgSvrId=${row.msgSvrId}) 对方仍在上传 " +
+                        "(appMsgType=${file.appMsgType}), 等传完再试"
+                )
                 return null
             }
 
@@ -2246,11 +2317,10 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             }
 
             // 已缓存则直接返回
-            queryAppAttach(mi.id, talker, mi.serverId)?.let { info ->
-                if (info.isComplete && !info.fileFullPath.isNullOrEmpty()) {
-                    WeLogger.i(TAG, "cacheFile: msgId=${mi.id} already cached -> ${info.fileFullPath}")
-                    return info.fileFullPath
-                }
+            val initial = queryAppAttach(mi.id, talker, mi.serverId)
+            if (initial != null && initial.isComplete && !initial.fileFullPath.isNullOrEmpty()) {
+                WeLogger.i(TAG, "cacheFile: msgId=${mi.id} already cached -> ${initial.fileFullPath}")
+                return initial.fileFullPath
             }
 
             // 微信侧 a0.o(msg, z) 的第一句就是 AppMessage.parse(content), 解析失败后立刻把
@@ -2261,27 +2331,58 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             // 微信自己的准入条件有两条, 这里照抄:
             //   1. content 非空 (t8.K0 = isNullOrEmpty);
             //   2. content 里含 "<msg" (sdk aa.d(content, "msg", "xml") 找不到就让 parse 返回 null);
-            // 再加一条: 必须真的是 appmsg (有 <appmsg><type>) —— 否则不是文件消息。
+            // 再加两条: 必须真的是**文件** appmsg (不是链接 / 引用 / 小程序等各种 appmsg),
+            // 且对方已经传完 —— 否则不是推不动就是必然失败。
             // 不做这个校验的后果是: 每轮补偿扫描都在微信内部刷一条 NPE 堆栈, 且永远不可能成功。
-            val appMsgType = runCatching {
+            val file = runCatching {
                 if (mi.content.isBlank() || !mi.content.contains("<msg")) null
-                else MessageInfo.FileMessage(mi.content).appMsgType
+                else MessageInfo.FileMessage(mi.content)
             }.getOrNull()
-            if (appMsgType == null) {
+            if (file == null || !file.isFileAppMsg) {
                 WeLogger.e(
                     TAG,
-                    "cacheFile: content 不是可解析的 appmsg 文件消息 (msgSvrId=${mi.serverId}, " +
-                        "len=${mi.content.length}, head=${mi.content.take(120)}), skip"
+                    "cacheFile: content 不是可解析的文件类 appmsg (msgSvrId=${mi.serverId}, " +
+                        "len=${mi.content.length}, appMsgType=${file?.appMsgType}, " +
+                        "head=${mi.content.take(120)}), skip"
+                )
+                return null
+            }
+            if (file.isSenderUploading) {
+                // 对方还在上传 (appmsgType 74/131): 此刻触发下载必然失败, 等对方传完的更新事件
+                WeLogger.i(
+                    TAG,
+                    "cacheFile: msgId=${mi.id} 对方仍在上传中 (appMsgType=${file.appMsgType}), 不触发下载"
                 )
                 return null
             }
 
-            if (!triggerFileDownload(msgInfoInstance)) return null
+            // 触发前先看微信这边的下载进度: 已经在下 (offset>0 且未完成) 就别再触发 ——
+            // 重复构造 autoDownloadFile 会把微信自己的 CDN 任务重排/打断, 大文件永远下不完,
+            // 表现得就像"文件无法下载"。
+            WeLogger.i(
+                TAG,
+                "cacheFile: msgId=${mi.id} (msgSvrId=${mi.serverId}) 准备下载 " +
+                    "title=${file.title}, ext=${file.ext}, size=${file.size}, " +
+                    "appMsgType=${file.appMsgType}, appattach=${initial?.describe() ?: "无 appattach 行"}"
+            )
+            if (initial != null && initial.inProgress) {
+                WeLogger.i(
+                    TAG,
+                    "cacheFile: msgId=${mi.id} 微信侧已在下载 (${initial.describe()}), 不重复触发, 只等进度"
+                )
+            } else if (!triggerFileDownload(msgInfoInstance)) {
+                return null
+            }
+
             val path = pollUntilFileDownloaded(mi.id, talker, mi.serverId)
             if (path != null) {
                 WeLogger.i(TAG, "cacheFile: msgId=${mi.id} downloaded -> $path")
             } else {
-                WeLogger.w(TAG, "cacheFile: msgId=${mi.id} (msgSvrId=${mi.serverId}) download did not complete within timeout")
+                WeLogger.w(
+                    TAG,
+                    "cacheFile: msgId=${mi.id} (msgSvrId=${mi.serverId}) 下载未完成 " +
+                        "(appattach=${queryAppAttach(mi.id, talker, mi.serverId)?.describe() ?: "无行"})"
+                )
             }
             path
         } catch (e: Exception) {

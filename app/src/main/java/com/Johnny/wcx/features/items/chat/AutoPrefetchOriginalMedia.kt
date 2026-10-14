@@ -4,6 +4,7 @@ import android.content.ContentValues
 import com.Johnny.wcx.features.api.core.WeDatabaseApi
 import com.Johnny.wcx.features.api.core.WeDatabaseListenerApi
 import com.Johnny.wcx.features.api.core.WeMessageApi
+import com.Johnny.wcx.features.api.core.models.MessageInfo
 import com.Johnny.wcx.features.api.core.models.MessageType
 import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.features.core.SwitchFeature
@@ -111,6 +112,23 @@ import java.util.concurrent.ConcurrentHashMap
  * "不点开也拉"。所以 [defaultEnabled] 改为**跟随**前者的开关值 —— 已经明确开过
  * "自动查看原图/原视频" 的用户, 升级后本功能自动生效; 在本功能里拨过开关的用户,
  * 以本功能的 key 为准 (不会覆盖用户的显式选择)。
+ *
+ * ### v290: 读不出原视频信息 ≠ 没有原视频 (v287 的静默失败还有第二个入口)
+ *
+ * 2026-10-14 设备日志 (微信 8.0.76) 复现了 v287 之后仍然"点开才下载"的现象, 根因是
+ * **假结案**: 21:40:33 收到一条视频, 本功能判"该视频没有原视频信息"并记入 done,
+ * 一分钟后用户点开视频页, 微信自己却弹出了「查看原视频 28MB」。日志里那条判定的
+ * `key` 只有 24 个字符: `wxid_xxx:0:0\n` —— 也就是说**消息刚落库那一刻**,
+ * `n1.t(msg)` 建出的 `v21.v2` 的 `w` 字段 (微信自己也是把它当 `<msg>` XML 传给
+ * `v21.j3.h.d()` 的) 还不是 XML, 解析出来自然没有 cdnrawvideourl。
+ *
+ * 于是 v290 做了三件事:
+ *  1. **候选 XML 交叉验证**: DB 直读的 `content` / `MsgInfo.content` / `v2.h()` 三个来源里,
+ *     取第一个"含 `<msg>` 且含 `videomsg`"的; 全都不像 XML → 判"信息未就绪",
+ *     返回"稍后重试"而**不是**结案。
+ *  2. 只有 XML 已确认是视频消息 XML、却仍解析不出 cdnrawvideourl 时, 才判"没有原视频"结案。
+ *  3. 补上跨轮次重试上限 ([MAX_TOTAL_ATTEMPTS]), 让"每 5 分钟补偿扫描"能真正重试,
+ *     又不至于永久刷屏; 同时跳过 `isSend=1` (自己发的媒体本地就有原文件, 不必拉 CDN)。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
@@ -166,8 +184,20 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             return _isEnabled
         }
 
-    /** 单条消息最多尝试次数 (立即 + 两次延迟重试)。 */
+    /** 单次 dispatch 内的最多尝试次数 (立即 + 两次延迟重试)。 */
     private const val MAX_ATTEMPTS = 3
+
+    /**
+     * 同一条消息**跨轮次** (事件重投 + 补偿扫描) 的总尝试上限。
+     *
+     * v289 之前这里只有"成功才收工"一种终态, 读不出原视频记录时会被当成
+     * "该视频没有原视频信息"**直接结案** —— 设备日志 (2026-10-14, 微信 8.0.76) 里就出现了
+     * 假结案: 21:40:33 收到的视频被判"没有原视频信息", 一分钟后用户点开视频页,
+     * 微信自己却弹出了「查看原视频 28MB」。也就是说**消息刚落库那一刻**拿到的视频信息
+     * 还不完整 (n1.t 建出的 v2 里 w 字段不是 `<msg>` XML), 之后再重试就能成功。
+     * 所以"读不出"只能算"信息不足, 稍后重试", 由 [MAX_TOTAL_ATTEMPTS] 兜底防刷屏。
+     */
+    private const val MAX_TOTAL_ATTEMPTS = 6
 
     /** 补偿扫描回看窗口。 */
     private const val SCAN_WINDOW_MS = 6 * 60 * 60 * 1000L
@@ -183,6 +213,12 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
     /** 已完成 (已拉到本地) 的消息, 键为 "type:msgSvrId"。 */
     private val doneKeys = ConcurrentHashMap.newKeySet<String>()
+
+    /** 已放弃的消息 (重试到顶仍拿不到), 键同 [doneKeys]; 任何路径都不再处理。 */
+    private val settledKeys = ConcurrentHashMap.newKeySet<String>()
+
+    /** 每条消息跨轮次的尝试轮数 (见 [MAX_TOTAL_ATTEMPTS])。 */
+    private val attemptsBySvrId = ConcurrentHashMap<Long, Int>()
 
     /** 正在处理中的 msgSvrId, 防止 insert/update/扫描 三路重复发起。 */
     private val inFlight = ConcurrentHashMap.newKeySet<Long>()
@@ -212,6 +248,8 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         WeDatabaseListenerApi.removeListener(this)
         scope.cancel()
         doneKeys.clear()
+        settledKeys.clear()
+        attemptsBySvrId.clear()
         inFlight.clear()
         pendingSvrIds.clear()
         WeLogger.i(TAG, "disabled: 监听已移除, 补偿扫描已停止")
@@ -267,7 +305,14 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                 val row = queryRow(msgSvrId) ?: return@launch
                 if (!isTarget(row.type)) return@launch
                 val key = "${row.type}:${row.msgSvrId}"
-                if (key in doneKeys) return@launch
+                if (key in doneKeys || key in settledKeys) return@launch
+                // 自己发出的媒体本地就有原文件, 不需要 (也不该) 去 CDN 拉。
+                // insert 事件的 ContentValues 经常缺 isSend 列, 必须按 msgSvrId 回查到行再判。
+                if (row.isSend == 1) {
+                    WeLogger.i(TAG, "跳过 $key (via $via): 自己发出的媒体, 本地已有原文件")
+                    doneKeys.add(key)
+                    return@launch
+                }
                 pendingSvrIds.add(row.msgSvrId)
                 WeLogger.i(
                     TAG,
@@ -280,13 +325,24 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         }
     }
 
-    private class Row(val type: Int, val msgId: Long, val msgSvrId: Long, val talker: String?)
+    private class Row(
+        val type: Int,
+        val msgId: Long,
+        val msgSvrId: Long,
+        val talker: String?,
+        val isSend: Int,
+        /** message.content: 视频消息的 `<msg>` XML (原视频信息就在里面), 图片用不到。 */
+        val content: String?,
+        /** message.imgPath: 视频/图片的 CDN fileid。 */
+        val imgPath: String?,
+    )
 
     private fun queryRow(msgSvrId: Long): Row? {
         if (!ensureDatabase()) return null
         return try {
             WeDatabaseApi.rawQuery(
-                "SELECT type, msgId, talker FROM message WHERE msgSvrId=? LIMIT 1",
+                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath FROM message " +
+                    "WHERE msgSvrId=? LIMIT 1",
                 arrayOf<Any>(msgSvrId)
             ).use { cursor ->
                 if (!cursor.moveToNext()) {
@@ -298,6 +354,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                         msgId = cursor.getLong(cursor.getColumnIndexOrThrow("msgId")),
                         msgSvrId = msgSvrId,
                         talker = cursor.getString(cursor.getColumnIndexOrThrow("talker")),
+                        isSend = cursor.getInt(cursor.getColumnIndexOrThrow("isSend")),
+                        content = cursor.getString(cursor.getColumnIndexOrThrow("content")),
+                        imgPath = cursor.getString(cursor.getColumnIndexOrThrow("imgPath")),
                     )
                 }
             }
@@ -308,6 +367,19 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
     }
 
     private suspend fun runTask(row: Row, via: String, key: String) {
+        val round = attemptsBySvrId.merge(row.msgSvrId, 1, Int::plus) ?: 1
+        if (round > MAX_TOTAL_ATTEMPTS) {
+            // 跨轮次重试到顶: 给"为什么放弃"一个定论, 不再被补偿扫描每轮拾起。
+            if (attemptsBySvrId.remove(row.msgSvrId) != null) {
+                settledKeys.add(key)
+                WeLogger.w(
+                    TAG,
+                    "放弃 $key: 已重试 $MAX_TOTAL_ATTEMPTS 轮仍拿不到 (原视频信息始终未就绪, " +
+                        "或本条确实没有原图/原视频)"
+                )
+            }
+            return
+        }
         for (attempt in 1..MAX_ATTEMPTS) {
             val ok = try {
                 if (row.type == MessageType.IMAGE.code) prefetchImage(row.msgSvrId) else prefetchOriginVideo(row)
@@ -317,6 +389,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             }
             if (ok) {
                 doneKeys.add(key)
+                attemptsBySvrId.remove(row.msgSvrId)
                 pendingSvrIds.remove(row.msgSvrId)
                 return
             }
@@ -325,7 +398,10 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                 delay(if (attempt == 1) 5_000 else 10_000)
             }
         }
-        WeLogger.w(TAG, "后台下载未完成 $key (via $via), 留给补偿扫描")
+        WeLogger.w(
+            TAG,
+            "后台下载未完成 $key (via $via, 第 $round/$MAX_TOTAL_ATTEMPTS 轮), 留给补偿扫描重试"
+        )
     }
 
     /** 原图: 复用「自动缓存图片」的通道 (内部优先取 hdImgId 原图行)。@return 是否已落地。 */
@@ -350,7 +426,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             WeLogger.w(TAG, "取不到 MsgInfo, 跳过: msgId=$msgId")
             return false
         }
-        return OriginVideoDownload.request(msgInfo, row.msgSvrId)
+        return OriginVideoDownload.request(msgInfo, row)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -380,7 +456,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         val since = System.currentTimeMillis() - SCAN_WINDOW_MS
         val rows = try {
             WeDatabaseApi.rawQuery(
-                "SELECT type, msgId, msgSvrId, talker FROM message " +
+                "SELECT type, msgId, msgSvrId, talker, isSend, content, imgPath FROM message " +
                     "WHERE type IN (?, ?) AND isSend=0 AND createTime>? ORDER BY createTime DESC LIMIT ?",
                 arrayOf<Any>(MessageType.IMAGE.code, MessageType.VIDEO.code, since, SCAN_LIMIT)
             ).use { cursor ->
@@ -392,6 +468,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                                 msgId = cursor.getLong(cursor.getColumnIndexOrThrow("msgId")),
                                 msgSvrId = cursor.getLong(cursor.getColumnIndexOrThrow("msgSvrId")),
                                 talker = cursor.getString(cursor.getColumnIndexOrThrow("talker")),
+                                isSend = cursor.getInt(cursor.getColumnIndexOrThrow("isSend")),
+                                content = cursor.getString(cursor.getColumnIndexOrThrow("content")),
+                                imgPath = cursor.getString(cursor.getColumnIndexOrThrow("imgPath")),
                             )
                         )
                     }
@@ -406,7 +485,7 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         rows.forEach { row ->
             if (row.msgSvrId <= 0L) return@forEach
             val key = "${row.type}:${row.msgSvrId}"
-            if (key in doneKeys || row.msgSvrId in inFlight) return@forEach
+            if (key in doneKeys || key in settledKeys || row.msgSvrId in inFlight) return@forEach
             pendingSvrIds.add(row.msgSvrId)
             launched++
             dispatch(row.msgSvrId, "scan")
@@ -531,8 +610,8 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
         fun resolve(className: String): Class<*>? = className.toClassOrNull()
 
-        /** @return true 表示这条消息已经不需要再重试 (已发起 / 本来就没有原视频)。 */
-        fun request(msgInfo: Any, msgSvrId: Long): Boolean {
+        /** @return true 表示这条消息已经有了定论 (已发起 / 确实没有原视频 / 不是视频消息)。 */
+        fun request(msgInfo: Any, row: Row): Boolean {
             val r = resolveRecipe()
             if (r == null) {
                 if (!resolveFailureLogged) {
@@ -541,13 +620,19 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                 }
                 return true
             }
-            return runCatching { start(r, msgInfo, msgSvrId) }.getOrElse { t ->
-                WeLogger.e(TAG, "原视频下载复刻执行异常 (msgSvrId=$msgSvrId)", t)
+            return runCatching { start(r, msgInfo, row) }.getOrElse { t ->
+                WeLogger.e(TAG, "原视频下载复刻执行异常 (msgSvrId=${row.msgSvrId})", t)
                 false
             }
         }
 
-        private fun start(r: Recipe, msgInfo: Any, msgSvrId: Long): Boolean {
+        /**
+         * @return true = 有定论 (已发起下载 / 本条确实没有原视频 / 不是视频消息);
+         *         false = 信息还不完整 (视频信息未就绪), 交给重试与补偿扫描。
+         */
+        private fun start(r: Recipe, msgInfo: Any, row: Row): Boolean {
+            val msgSvrId = row.msgSvrId
+
             // 1) 不是视频消息: 与微信同款静态判定
             val isVideo = runCatching { r.checkVideo.invoke(null, msgInfo) as? Boolean }.getOrNull()
             if (isVideo != true) {
@@ -560,32 +645,50 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             //    用户没打开过视频页时缓存是空的 → v285/v286 就是这样静默失败的。
             val videoInfo = runCatching { r.buildVideoInfo.invoke(null, msgInfo) }.getOrNull()
                 ?: runCatching { r.cachedVideoInfo.invoke(null, msgInfo) }.getOrNull()
-            if (videoInfo == null) {
-                // 解析失败 != "没有原视频" (可能 msg 还没就绪), 交还给重试 / 补偿扫描
-                WeLogger.w(TAG, "视频信息解析失败 (msgSvrId=$msgSvrId), 稍后重试")
-                return false
-            }
-            val key = runCatching { r.videoInfoKey.invoke(videoInfo) as? String }.getOrNull()
-            val url = runCatching { r.videoInfoUrl.invoke(videoInfo) as? String }.getOrNull()
-            if (key.isNullOrEmpty()) {
-                WeLogger.w(TAG, "视频信息缺 key (msgSvrId=$msgSvrId), 稍后重试")
-                return false
-            }
-            if (url.isNullOrEmpty()) {
-                // 视频地址 (msg.imgPath) 还没就绪 —— 收视频瞬间常常如此, 交给重试 / 补偿扫描
-                WeLogger.w(TAG, "视频地址尚未就绪 (msgSvrId=$msgSvrId), 稍后重试")
+
+            // 3) 原视频信息 (cdnrawvideourl / aeskey / rawlength) 藏在视频消息的 `<msg>` XML 里,
+            //    微信自己就是 `v21.j3.h.d(v2.h())` —— v2.h() 应该返回 `<msg>` XML。
+            //
+            //    【v289 的真机结论】消息刚落库那一刻 `v2.h()` 还不是 XML (实测是一条
+            //    `wxid_xxx:0:0\n` 之类的中间态, 见 2026-10-14 设备日志), 于是解析出的记录
+            //    d 为空 → 被误判成"该视频没有原视频信息"并结案; 一分钟后用户点开视频页,
+            //    微信自己却弹出了「查看原视频 28MB」。所以这里改为:
+            //      · 按优先级取多个候选 XML (DB 直读的 content / MsgInfo.content / v2.h()),
+            //        只要有一个是完整的视频 XML 就用它;
+            //      · 全都不像 XML → 判"信息未就绪"返回 false (稍后重试), **绝不结案**。
+            val candidates = buildCandidates(r, msgInfo, row, videoInfo)
+            val picked = candidates.firstOrNull { looksLikeVideoXml(it.second) }
+            if (picked == null) {
+                diagnoseOnce(msgSvrId) {
+                    "视频内容还不是可解析的 XML (msgSvrId=$msgSvrId), 稍后重试; 候选: " +
+                        candidates.joinToString(" | ") { "${it.first}=${describe(it.second)}" }
+                }
                 return false
             }
 
-            // 3) 原视频下载记录 —— 微信自己就是靠它判断"这条消息确实带原视频"
-            val record = runCatching { r.lookupRecord.invoke(r.registry, key) }.getOrNull()
+            // 下载任务的地址参数 = v2.e() (= msg.imgPath); 微信自己的 gallery 也传这个值。
+            val url = runCatching { videoInfo?.let { r.videoInfoUrl.invoke(it) as? String } }
+                .getOrNull()?.takeIf { it.isNotEmpty() }
+                ?: row.imgPath?.takeIf { it.isNotEmpty() }
+            if (url.isNullOrEmpty()) {
+                diagnoseOnce(msgSvrId) { "视频地址尚未就绪 (msgSvrId=$msgSvrId), 稍后重试" }
+                return false
+            }
+
+            // 4) 原视频下载记录 —— 微信自己就是靠它判断"这条消息确实带原视频"
+            val record = runCatching { r.lookupRecord.invoke(r.registry, picked.second) }.getOrNull()
             val recordUrl = record?.let { runCatching { r.recordUrl.get(it) as? String }.getOrNull() }
             if (record == null || recordUrl.isNullOrEmpty()) {
-                WeLogger.i(TAG, "该视频没有原视频信息 (msgSvrId=$msgSvrId key=${key.take(48)}), 无需下载")
+                // 到这里视频 XML 已经确认含 <videomsg>, 仍解析不出 cdnrawvideourl 说明
+                // 这条视频本来就没有原画质版本 —— 这才是可以结案的情形。
+                WeLogger.i(
+                    TAG,
+                    "该视频没有原视频信息 (msgSvrId=$msgSvrId, XML 来源 ${picked.first}), 无需下载"
+                )
                 return true
             }
 
-            // 4) 复刻微信那条链路
+            // 5) 复刻微信那条链路
             val now = r.newTime.newInstance(System.currentTimeMillis())
             val callback = r.newCallback.newInstance(msgInfo, videoInfo, now, record)
             val task = r.newDownloadTask.newInstance(msgInfo, url, true)
@@ -597,13 +700,54 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             if (logged.add(msgSvrId)) {
                 WeLogger.i(
                     TAG,
-                    "原视频下载已发起: msgSvrId=$msgSvrId url=$url accepted=$accepted"
+                    "原视频下载已发起: msgSvrId=$msgSvrId url=$url accepted=$accepted " +
+                        "(XML 来源 ${picked.first})"
                 )
                 if (logged.size > 512) logged.clear()
             } else {
                 WeLogger.i(TAG, "原视频下载再次发起: msgSvrId=$msgSvrId accepted=$accepted")
             }
             return accepted == true
+        }
+
+        /**
+         * 候选视频消息 XML, 按可靠性排序。
+         *
+         * `db.content` 是我们自己 `SELECT content` 读出来的原文, 不经过
+         * `convertFrom(Cursor)` 的字段映射; `msgInfo.content` 与 `v2.h()` 用于交叉验证
+         * (设备日志里三者可能不一致, 谁是真 XML 就用谁)。
+         */
+        private fun buildCandidates(
+            r: Recipe,
+            msgInfo: Any,
+            row: Row,
+            videoInfo: Any?,
+        ): List<Pair<String, String?>> = buildList {
+            add("db.content" to row.content)
+            add("msgInfo.content" to runCatching { MessageInfo(msgInfo).content }.getOrNull())
+            add("v2.h()" to runCatching { videoInfo?.let { r.videoInfoKey.invoke(it) as? String } }
+                .getOrNull())
+        }.filter { !it.second.isNullOrEmpty() }.distinctBy { it.second }
+
+        /** 是不是一条完整的视频消息 XML (`<msg>` + `<videomsg>`)。 */
+        private fun looksLikeVideoXml(text: String?): Boolean =
+            text != null && text.contains("<msg") && text.contains("videomsg")
+
+        /** 日志用: 把候选内容压成一行摘要 (换行转义, 只留头部)。 */
+        private fun describe(text: String?): String {
+            if (text == null) return "null"
+            val head = text.replace("\r", "\\r").replace("\n", "\\n").take(72)
+            return "\"$head\"(len=${text.length})"
+        }
+
+        /** 同一条消息只打一次"信息未就绪"的诊断, 免得补偿轮刷屏。 */
+        private val diagnosed = ConcurrentHashMap.newKeySet<Long>()
+
+        private fun diagnoseOnce(msgSvrId: Long, message: () -> String) {
+            if (diagnosed.add(msgSvrId)) {
+                WeLogger.i(TAG, message())
+                if (diagnosed.size > 512) diagnosed.clear()
+            }
         }
 
         /**
