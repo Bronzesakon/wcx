@@ -43,9 +43,9 @@ android {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        // 跟随 v293 基线，保留 fork 的版本覆盖参数，且不降低已发布的版本号。
-        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 293
-        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v293"
+        // 跟随 v294 基线，保留 fork 的版本覆盖参数，且不降低已发布的版本号。
+        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 294
+        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v294"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")

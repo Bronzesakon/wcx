@@ -1881,25 +1881,98 @@ object WeMessageApi : ApiFeature(), IResolveDex {
      * 微信可能把大图存为 bigImgPath / hevcPath / midImgPath 其中之一 (原图/HEVC 场景),
      * 因此逐个尝试并要求文件确实存在且非空。
      */
+    /**
+     * 解析 ImgInfo2 行对应的、已**真正下完**的 image2/ 大图文件。
+     *
+     * v294 起追加了完成度校验。原来只看"磁盘上文件存在且非空"，而微信的下载服务会在
+     * **写入第一个字节之前**就创建文件、并把 `bigImgPath` 从 `SERVERID://` 改写成最终文件名 ——
+     * 于是下载刚开始 1~2 秒就能命中，看起来"原图已落地"其实只下了几 KB。
+     * 设备日志 (2026-10-15) 实锤:
+     * ```
+     * 14:49:48.606 start cdn download: localId=37952        ← 触发下载
+     * 14:49:50.887 原图已落地: .../image2/2b/8f/2b8f...jpg   ← 2.3 秒就宣布成功
+     * 14:50:57.317 无感加载「查看原图」: 查看原图 3MB (Button) ← 69 秒后微信仍说没下好
+     * ```
+     * 改用**微信内部同款口径**: `ImgInfo2` 行的 `totalLen == offset`（微信就是按这两列
+     * 判完成，`iscomplete` 不可信：DEFAULT 1）。拿不到长度信息（本地图 / GIF / 表结构变了）
+     * 时退回老行为，不把功能卡死。
+     */
     private fun resolveExistingImageFile(row: ImgInfoRow): Path? {
-        return listOfNotNull(row.bigImgPath, row.hevcPath, row.midImgPath)
+        val file = listOfNotNull(row.bigImgPath, row.hevcPath, row.midImgPath)
             .filter { it.isNotEmpty() && !it.startsWith("SERVERID://") }
             .firstNotNullOfOrNull { name ->
                 resolveImageFile(name)?.takeIf { it.isRegularFile() && it.fileSize() > 0 }
-            }
+            } ?: return null
+
+        val progress = queryImageProgress(row.localId) ?: return file
+        if (progress.totalLen <= 0L) return file
+        if (progress.offset < progress.totalLen) return null
+        if (Files.size(file) < progress.totalLen) return null
+        return file
     }
 
+    /** 某张图片行的下载进度 (微信判定完成的口径: totalLen == offset)。 */
+    private data class ImgProgress(val totalLen: Long, val offset: Long)
+
     /**
-     * 确保图片已缓存到微信内部 image2/ 存储, 返回真正落地的图片文件。
-     *
-     * 若消息带"原图" (发送方勾选原图), ImgInfo2 基础行的 reserved1 会指向另一"原图"行,
-     * 该行携带原图自己的 CDN key。微信"查看原图"正是对原图行的 localId 触发下载。
-     * 因此: 有原图则下载原图行, 否则下载基础行 (即微信压缩过的大图)。
-     *
-     * 注意: 不能依赖 ImgInfo2.iscomplete —— 该列 DEFAULT 1, 且微信只按 offset<totalLen?0:1 写它,
-     * 未下载的行也会读到 1; 微信内部判定完成用的是 totalLen==offset。同理 bigImgPath 被下载服务
-     * 在真正写入文件字节 *之前* 就从 SERVERID:// 改写为最终文件名, 所以只能以磁盘上文件是否存在为准。
+     * ImgInfo2 的列名运行时探测（只探一次）。微信不同版本大小写/命名有出入，
+     * 探测不到就返回 null → 判据退回"文件存在即算"。
      */
+    private object ImgInfoSchema {
+        private var probed = false
+        private var totalLenCol: String? = null
+        private var offsetCol: String? = null
+
+        @Synchronized
+        fun resolve(): Pair<String?, String?> {
+            if (!probed) {
+                probed = true
+                val cols = runCatching {
+                    WeDatabaseApi.rawQuery("PRAGMA table_info(ImgInfo2)", arrayOf<Any>()).use { c ->
+                        val i = c.getColumnIndex("name")
+                        if (i < 0) emptyList()
+                        else buildList { while (c.moveToNext()) add(c.getString(i)) }
+                    }
+                }.getOrDefault(emptyList())
+                totalLenCol = cols.firstOrNull { it.equals("totalLen", true) }
+                    ?: cols.firstOrNull { it.equals("totallen", true) }
+                    ?: cols.firstOrNull { it.equals("total_len", true) }
+                offsetCol = cols.firstOrNull { it.equals("offset", true) }
+                    ?: cols.firstOrNull { it.equals("downPos", true) }
+                    ?: cols.firstOrNull { it.equals("downpos", true) }
+                WeLogger.i(
+                    TAG,
+                    "ImgInfo2 列探测: totalLen=${totalLenCol ?: "(无)"} offset=${offsetCol ?: "(无)"}"
+                )
+            }
+            return totalLenCol to offsetCol
+        }
+    }
+
+    private fun queryImageProgress(localId: Long): ImgProgress? {
+        val (totalCol, offsetCol) = ImgInfoSchema.resolve()
+        if (totalCol == null || offsetCol == null) return null
+        return runCatching {
+            WeDatabaseApi.rawQuery(
+                "SELECT $totalCol, $offsetCol FROM ImgInfo2 WHERE id=? LIMIT 1",
+                arrayOf<Any>(localId)
+            ).use { c ->
+                if (!c.moveToNext()) null
+                else ImgProgress(
+                    totalLen = if (c.isNull(0)) 0L else c.getLong(0),
+                    offset = if (c.isNull(1)) 0L else c.getLong(1)
+                )
+            }
+        }.onFailure {
+            WeLogger.w(TAG, "查询 ImgInfo2 进度失败 (localId=$localId): ${it.message}")
+        }.getOrNull()
+    }
+
+    /** v294: 图片下载的等待策略 —— 字节数还在涨就一直等, 完全无进展才超时。 */
+    private const val IMG_IDLE_TIMEOUT_MS = 45_000L
+    private const val IMG_MAX_WAIT_MS = 3 * 60_000L
+    private const val IMG_MAX_TRIGGER = 3
+
     private fun ensureImageCachedFile(msgSvrId: Long): Path? {
         val baseRow = queryImgInfoRow(msgSvrId) ?: run {
             WeLogger.w(TAG, "no ImgInfo2 row for msgSvrId=$msgSvrId")
@@ -1912,25 +1985,68 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             ?.also { WeLogger.i(TAG, "image has original (hdImgId=${baseRow.hdImgId}), downloading original") }
             ?: baseRow
 
-        // 已在磁盘上则直接返回
+        // 已经下完 (含"文件在但只下了一半"的判据) 则直接返回
         resolveExistingImageFile(targetRow)?.let { return it }
 
         val talker = targetRow.talker.ifEmpty { baseRow.talker }
         WeLogger.i(TAG, "start cdn download: svrId=$msgSvrId localId=${targetRow.localId} talker=$talker")
 
-        // 分 3 轮触发下载并各轮询 20 秒: 实测单次触发可能被微信静默丢弃, 周期性重发更可靠;
-        // 总超时 60 秒 (原先单次触发 + 空轮询 120 秒)
-        repeat(3) { round ->
-            if (!triggerDownload(targetRow.localId, talker)) {
-                WeLogger.w(TAG, "triggerDownload invoke failed (round ${round + 1}, svrId=$msgSvrId)")
+        // v294: 进度感知等待 (原先是「每轮触发 + 空转 20 秒」共 3 轮, 慢网络上必然误判失败,
+        // 而快网络又会在半成品上误判成功):
+        //  - 首轮必触发; 之后**只在完全无进展**时补触发 (实测单次触发可能被微信静默丢弃);
+        //  - 只要 offset 在涨就一直等, 直到 [IMG_MAX_WAIT_MS] 的总预算;
+        //  - 每 10 秒打一条进度, 便于下次直接定论。
+        val startAt = System.currentTimeMillis()
+        var lastOffset = -1L
+        var lastProgressAt = startAt
+        var lastLogAt = startAt
+        var triggerCount = 0
+
+        while (System.currentTimeMillis() - startAt < IMG_MAX_WAIT_MS) {
+            val now = System.currentTimeMillis()
+            if (triggerCount == 0 || now - lastProgressAt >= IMG_IDLE_TIMEOUT_MS) {
+                if (triggerCount >= IMG_MAX_TRIGGER) {
+                    WeLogger.w(
+                        TAG,
+                        "image give up: 触发 $triggerCount 次仍无进展 (svrId=$msgSvrId, " +
+                                "localId=${targetRow.localId}, offset=$lastOffset)"
+                    )
+                    break
+                }
+                triggerCount++
+                if (!triggerDownload(targetRow.localId, talker)) {
+                    WeLogger.w(
+                        TAG,
+                        "triggerDownload invoke failed (第 $triggerCount 次, svrId=$msgSvrId)"
+                    )
+                }
             }
-            val deadline = System.currentTimeMillis() + 20_000
-            while (System.currentTimeMillis() < deadline) {
-                Thread.sleep(1000)
-                val row = queryImgInfoRowById(targetRow.localId) ?: continue
-                resolveExistingImageFile(row)?.let { return it }
+
+            Thread.sleep(1_000)
+
+            val row = queryImgInfoRowById(targetRow.localId)
+            if (row != null) resolveExistingImageFile(row)?.let {
+                WeLogger.i(
+                    TAG,
+                    "image landed: svrId=$msgSvrId localId=${targetRow.localId} " +
+                            "触发 $triggerCount 次, 用时 ${(System.currentTimeMillis() - startAt) / 1000}s"
+                )
+                return it
             }
-            WeLogger.w(TAG, "image not landed after round ${round + 1} (svrId=$msgSvrId)")
+
+            val progress = queryImageProgress(targetRow.localId)
+            if (progress != null && progress.offset != lastOffset) {
+                lastOffset = progress.offset
+                lastProgressAt = System.currentTimeMillis()
+            }
+            if (System.currentTimeMillis() - lastLogAt >= 10_000) {
+                lastLogAt = System.currentTimeMillis()
+                WeLogger.i(
+                    TAG,
+                    "image downloading: svrId=$msgSvrId localId=${targetRow.localId} " +
+                            "offset=$lastOffset/${progress?.totalLen ?: -1}"
+                )
+            }
         }
         return null
     }

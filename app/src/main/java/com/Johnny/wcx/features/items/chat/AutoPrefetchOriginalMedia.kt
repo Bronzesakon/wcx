@@ -158,6 +158,25 @@ import java.util.concurrent.ConcurrentHashMap
  * `AutoViewOriginalMedia` 删除。它的开关 key 由 [VIEW_FEATURE_KEY] 继续继承 ——
  * 以前开过那个功能的用户, 升级后本功能默认就是开的。
  * 兜底意义: 后台拉取有漏项或没来得及完成时, 用户打开页面这一下仍能无感拿到原画质。
+ *
+ * ### v294: 原图侧的"假落地" (与视频侧同源的判据问题)
+ *
+ * 设备日志 (2026-10-15) 显示原图预取"看起来成功"、实际没下完:
+ * ```
+ * 14:49:48.606 start cdn download: localId=37952           ← 触发下载
+ * 14:49:50.887 原图已落地: .../image2/2b/8f/2b8f...jpg    ← 2.3 秒就宣布成功
+ * 14:50:57.317 无感加载「查看原图」: 查看原图 3MB (Button) ← 69 秒后微信仍说没下好
+ * ```
+ * 根因在 `WeMessageApi.resolveExistingImageFile`: 判据只有"磁盘文件存在且非空", 而微信的
+ * 下载服务**在写入第一个字节之前**就创建文件并把 `bigImgPath` 从 `SERVERID://` 改写成最终
+ * 文件名 —— 下载刚开始 1~2 秒就能命中, 拿到的其实是半成品。视频侧在 v291/v292 已经因为
+ * 同类问题翻车两次 (详见 [OriginVideoDownload.ordinaryVideoReady]), 这次图片侧是同一枚硬币。
+ *
+ * 修法在 `WeMessageApi` (公共通道, `AutoCacheImages` / `DownloadImagesToLocalStorage` /
+ * `ScheduledMessage` / ApiServer 都走它): 改用**微信内部同款口径** `ImgInfo2.totalLen == offset`
+ * (列名运行时探测), 并要求磁盘字节数不低于 `totalLen`; 拿不到长度信息 (本地图 / GIF /
+ * 表结构变化) 时退回老行为, 不把功能卡死。等待策略同步改为进度感知
+ * (`IMG_IDLE_TIMEOUT_MS` 45s 无进展才补一次触发, `IMG_MAX_WAIT_MS` 3min 总预算)。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
