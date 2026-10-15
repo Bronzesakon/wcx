@@ -6,61 +6,38 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.widget.TextView
-import com.Johnny.wcx.dexkit.abc.IResolveDex
-import com.Johnny.wcx.dexkit.dsl.dexMethod
-import com.Johnny.wcx.features.core.Feature
-import com.Johnny.wcx.features.core.SwitchFeature
-import com.Johnny.wcx.preferences.WePrefs
+import com.Johnny.wcx.features.core.BaseFeature
 import com.Johnny.wcx.ui.utils.allViews
 import com.Johnny.wcx.utils.WeLogger
 import dev.ujhhgtg.reflekt.reflekt
 import dev.ujhhgtg.reflekt.utils.toClass
-import org.luckypray.dexkit.DexKitBridge
 import java.util.Collections
 import java.util.WeakHashMap
 
 /**
- * 打开聊天里的图片 / 视频时**无感**加载原画质 —— 不显示「查看原图 / 查看原视频」按钮，
- * 页面一出现就把原图 / 原视频拉下来。
+ * 打开图片 / 视频查看页时**无感点击**「查看原图 / 查看原视频」按钮。
  *
- * 演进过程（每一步都由设备实测与安装包反查驱动）：
- *  1. 最早只 hook `ImageGalleryUI` 的两个方法并枚举 **Button 类型字段**点击 ——
- *     无日志、无声失效（`setImageHdImgBtnVisibility` 在 8.0.76 的 dex 里**根本不存在**；
- *     `checkNeedShowOriginVideoBtn` 只是一条日志文案，见下）；
- *  2. v283 改为「生命周期轮询视图树找文案命中「查看原图/查看原视频」的控件并点击」——
- *     功能可用了（设备日志出现 `已自动点击「查看原图」: 查看原图 1MB (Button)`），
- *     但按钮会**先显示出来再被点掉**（轮询间隔 600ms），用户能明显看到这一步；
- *  3. v284 起改为 **OnPreDrawListener 帧级拦截**：在每一帧绘制之前扫描，
- *     命中后**先 GONE 再 performClick**，按钮一帧都不会被画出来，视觉上就是
- *     「打开图片直接清晰 / 打开视频直接原画」，并且已处理的控件会持续保持隐藏
- *     （微信下载中会重新显示按钮，这里会再次压掉）。
+ * 原为独立功能「自动查看原图/原视频」(v283~v292)。v293 与「后台自动加载原图/原视频」
+ * ([AutoPrefetchOriginalMedia]) 合并：两个开关描述的其实是同一件事的两个阶段 ——
+ *  - 后台先把收到的原图 / 原视频拉下来 (不点开也拉)；
+ *  - 拉得不够快或有漏项时，用户打开页面这一下由这里兜底，把按钮在帧级拦掉并点掉，
+ *    用户既看不到按钮，点开也已是原画质。
+ * 合并后功能列表里只保留「后台自动加载原图/原视频」一个入口。
  *
- * 反查结论（微信 8.0.76.3141，classes3.dex / classes10.dex）：
- *  - `ImageGalleryUI` 类名未混淆、自身声明 `onCreate` / `onResume`，生命周期 hook 可靠；
- *  - 按钮运行时是 `android.widget.Button`，文案来自字符串资源
- *    （中文「查看原图」「查看原视频」，英文 View Full Video / Full Image），
- *    运行时带体积后缀（「查看原视频 64MB」），所以只能**按渲染文本**定位；
- *  - 点击「查看原图 / 查看原视频」不会弹网络确认框（资源里无「非 WLAN」类文案），
- *    因此静默自动加载不会打断用户。
+ * 实现要点（微信 8.0.76.3141 实测）：
+ *  - `ImageGalleryUI` 未被混淆，onCreate / onResume 用 reflekt 定位，**不依赖 dex 适配**；
+ *  - 按钮运行时是 `android.widget.Button`，文案带体积后缀（「查看原视频 64MB」），
+ *    只能按渲染文本 + 关键字定位；
+ *  - 点击「查看原图 / 查看原视频」不会弹网络确认框，静默点击不打断用户；
+ *  - OnPreDrawListener 帧级拦截：命中后**先 GONE 再 performClick**，按钮一帧都不会
+ *    被画出来；已命中的控件持续压制（微信下载中会改文案再显示按钮）。
  */
-@Feature(
-    name = "自动查看原图/原视频",
-    categories = ["聊天"],
-    description = "打开聊天里的图片 / 视频时无感加载原图 / 原视频：不显示「查看原图 / 查看原视频」按钮，自动拉取原画质"
-)
-object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
+object GalleryOriginButtonHook {
 
-    private const val TAG = "AutoViewOriginalMedia"
+    private const val TAG = "GalleryOriginBtn"
 
     /** 聊天图片 / 视频查看页 (8.0.76 未被混淆, 与 Themes.kt 的运行时判定一致)。 */
     private const val GALLERY_UI_CLASS = "com.tencent.mm.ui.chatting.gallery.ImageGalleryUI"
-
-    /**
-     * 更名前的功能名。开关状态以**功能名**为 key 持久化 ([SwitchFeature.startup] 用
-     * `WePrefs.getBoolOrDef(name, ...)`), 沿用旧 key 的状态做默认值, 避免改名把已开启的
-     * 开关静默重置 (v281 → v282 已经踩过这个坑)。
-     */
-    private const val LEGACY_NAME = "自动查看原图"
 
     /** 按钮文案关键字 (中英双语兜底)。 */
     private val KEYWORDS = listOf(
@@ -83,81 +60,24 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
     private val watchers: MutableMap<Activity, PageWatcher> =
         Collections.synchronizedMap(WeakHashMap())
 
-    private val methodSetImageHdImgBtnVisibility by dexMethod()
-    private val methodCheckNeedShowOriginVideoBtn by dexMethod()
+    /** 是否已安装 (避免重复 hook 生命周期)。 */
+    private var installed = false
+
+    // ─────────────────────────────── 安装 / 卸载 ───────────────────────────────
 
     /**
-     * 单个图片/视频页的观察器。
-     *
-     * [suppressed] 记录**曾经命中过关键字**的控件（按身份）：之后微信把它们重新显示
-     * （下载中会改文案再 setVisibility）时无条件压回 GONE，保证用户始终看不到这个按钮。
-     * [clicked] 按「控件身份 + 文案」去重：同一个控件换到下一个视频时文案会变
-     * （设备日志：64MB → 19MB → 2MB 各自触发过一次点击），必须允许再次点击。
+     * 安装页面兜底点击。
+     * @param host 宿主功能 —— `hookAfter` / `thisObject` 是 [BaseFeature] 的成员扩展,
+     *   hook 也登记在它身上 (功能禁用时随 BaseFeature 的 unhook 机制一起清理)。
      */
-    private class PageWatcher(val activity: Activity, val decor: ViewGroup) {
-        val suppressed: MutableSet<Int> = Collections.synchronizedSet(HashSet())
-        val clicked: MutableSet<String> = Collections.synchronizedSet(HashSet())
-
-        @Volatile
-        var deadline: Long = SystemClock.uptimeMillis() + WATCH_TIMEOUT_MS
-
-        var observer: ViewTreeObserver? = null
-        var preDraw: ViewTreeObserver.OnPreDrawListener? = null
-        var fallback: Runnable? = null
+    fun install(host: BaseFeature) {
+        if (installed) return
+        installGalleryLifecycleHook(host)
+        installed = true
     }
 
-    /** 改名后沿用旧 key 的开关状态, 用户在新名下拨动过开关后以新 key 为准。 */
-    override val defaultEnabled: Boolean
-        get() = runCatching { WePrefs.getBoolOrDef(LEGACY_NAME, false) }.getOrDefault(false)
-
-    /** 启动时把开关判定结果与新 / 旧 key 的存在情况打进日志, 便于下次一眼分辨失效环节。 */
-    override val shouldEnableOnStartup: Boolean
-        get() = _isEnabled.also { on ->
-            val newKey = runCatching { WePrefs.containsKey(name) }.getOrDefault(false)
-            val oldKey = runCatching { WePrefs.containsKey(LEGACY_NAME) }.getOrDefault(false)
-            WeLogger.i(
-                TAG,
-                "startup: 开关=$on (新key '$name' 存在=$newKey, 旧key '$LEGACY_NAME' 存在=$oldKey)"
-            )
-        }
-
-    override fun resolveDex(dexKit: DexKitBridge) {
-        // 图片：这两个方法名在 8.0.76 上未必存在（`setImageHdImgBtnVisibility` 已确认不存在），
-        // 定位不到就走纯 UI 观察路径，不影响功能。
-        runCatching {
-            val imageResults = dexKit.findMethod {
-                matcher {
-                    declaredClass = GALLERY_UI_CLASS
-                    usingEqStrings("setHdImageActionDownloadable")
-                }
-            }.ifEmpty {
-                dexKit.findMethod {
-                    matcher {
-                        declaredClass = GALLERY_UI_CLASS
-                        usingEqStrings("setImageHdImgBtnVisibility")
-                    }
-                }
-            }
-            imageResults.firstOrNull()?.let { methodSetImageHdImgBtnVisibility.setDescriptor(it) }
-        }.onFailure { WeLogger.w(TAG, "定位图片原图按钮方法失败: ${it.message}") }
-
-        runCatching {
-            methodCheckNeedShowOriginVideoBtn.find(dexKit, allowFailure = true) {
-                matcher {
-                    declaredClass = GALLERY_UI_CLASS
-                    usingEqStrings("checkNeedShowOriginVideoBtn")
-                }
-            }
-        }.onFailure { WeLogger.w(TAG, "定位原视频按钮方法失败: ${it.message}") }
-    }
-
-    override fun onEnable() {
-        installGalleryLifecycleHook()
-        installOriginStateHooks()
-        WeLogger.i(TAG, "enabled: 图片 / 视频页无感加载原图与原视频")
-    }
-
-    override fun onDisable() {
+    fun uninstall() {
+        installed = false
         val snapshot = synchronized(watchers) { watchers.values.toList() }
         snapshot.forEach { stop(it) }
         watchers.clear()
@@ -165,10 +85,10 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
 
     // ─────────────────────────────── 触发入口 ───────────────────────────────
 
-    private fun installGalleryLifecycleHook() {
+    private fun installGalleryLifecycleHook(host: BaseFeature) {
         val clazz = runCatching { GALLERY_UI_CLASS.toClass() }.getOrNull()
         if (clazz == null) {
-            WeLogger.w(TAG, "未找到 $GALLERY_UI_CLASS, 仅依赖 dex 方法触发")
+            WeLogger.w(TAG, "未找到 $GALLERY_UI_CLASS, 打开页面时不会自动点原图/原视频按钮")
             return
         }
 
@@ -180,32 +100,20 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
                 clazz.reflekt().firstMethod { name = methodName; parameterCount = paramCount; superclass() }
             }.getOrNull() ?: return@forEach
 
-            method.hookAfter {
-                // 命中父类实现时会收到全部 Activity 的回调, 需按类名过滤
-                val activity = thisObject as? Activity ?: return@hookAfter
-                if (activity.javaClass.name != GALLERY_UI_CLASS) return@hookAfter
-                armWatcher(activity)
+            with(host) {
+                method.hookAfter {
+                    // 命中父类实现时会收到全部 Activity 的回调, 需按类名过滤
+                    val activity = thisObject as? Activity ?: return@hookAfter
+                    if (activity.javaClass.name != GALLERY_UI_CLASS) return@hookAfter
+                    armWatcher(activity)
+                }
             }
             hooked++
         }
         if (hooked > 0) {
             WeLogger.i(TAG, "已 hook $GALLERY_UI_CLASS 的 $hooked 个生命周期方法")
         } else {
-            WeLogger.w(TAG, "未能 hook $GALLERY_UI_CLASS 的生命周期方法, 仅依赖 dex 方法触发")
-        }
-    }
-
-    /** 原有两个 dex 方法仍 hook：它们被调用说明按钮状态刚更新, 顺手续期观察窗口。 */
-    private fun installOriginStateHooks() {
-        listOf(methodSetImageHdImgBtnVisibility, methodCheckNeedShowOriginVideoBtn).forEach { method ->
-            if (method.isPlaceholder) {
-                WeLogger.w(TAG, "${method.key} 未定位到, 跳过 (仅靠 UI 观察)")
-                return@forEach
-            }
-            method.hookAfter {
-                val activity = thisObject as? Activity ?: return@hookAfter
-                armWatcher(activity)
-            }
+            WeLogger.w(TAG, "未能 hook $GALLERY_UI_CLASS 的生命周期方法, 打开页面时不会自动点按钮")
         }
     }
 
@@ -335,5 +243,25 @@ object AutoViewOriginalMedia : SwitchFeature(), IResolveDex {
             depth++
         }
         return view
+    }
+
+    /**
+     * 单个图片/视频页的观察器。
+     *
+     * [suppressed] 记录**曾经命中过关键字**的控件（按身份）：之后微信把它们重新显示
+     * （下载中会改文案再 setVisibility）时无条件压回 GONE，保证用户始终看不到这个按钮。
+     * [clicked] 按「控件身份 + 文案」去重：同一个控件换到下一个视频时文案会变
+     * （设备日志：64MB → 19MB → 2MB 各自触发过一次点击），必须允许再次点击。
+     */
+    private class PageWatcher(val activity: Activity, val decor: ViewGroup) {
+        val suppressed: MutableSet<Int> = Collections.synchronizedSet(HashSet())
+        val clicked: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
+        @Volatile
+        var deadline: Long = SystemClock.uptimeMillis() + WATCH_TIMEOUT_MS
+
+        var observer: ViewTreeObserver? = null
+        var preDraw: ViewTreeObserver.OnPreDrawListener? = null
+        var fallback: Runnable? = null
     }
 }

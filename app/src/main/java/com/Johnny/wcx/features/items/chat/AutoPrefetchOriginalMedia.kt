@@ -146,6 +146,18 @@ import java.util.concurrent.ConcurrentHashMap
  *     在此之前连 `n1.t` 都不调 —— 它也会写 VideoInfo 行, 同样会打扰微信的下载。
  *  2. **同一条视频 [VIDEO_LAUNCH_COOLDOWN_MS] 内只发起一次**, 顺带压掉补偿扫描
  *     对同一条消息的反复建任务。
+ *
+ * ### v293: 合并「自动查看原图/原视频」, 功能列表只留一个入口
+ *
+ * 用户反馈功能列表里「后台自动加载原图/原视频」和「自动查看原图/原视频」描述几乎一样,
+ * 是两个重复入口 (2026-10-15 截图)。实际上它们是同一诉求的两半: 后台"不点开也拉"
+ * (本功能) + 打开页面时"按钮无感点掉" ([GalleryOriginButtonHook])。
+ *
+ * 处理: 保留本功能作为唯一入口, 原「自动查看原图/原视频」的**页面兜底能力**整体并入
+ * (帧级拦截 + 点击「查看原图 / 查看原视频」按钮), 由同一个开关控制; 独立功能
+ * `AutoViewOriginalMedia` 删除。它的开关 key 由 [VIEW_FEATURE_KEY] 继续继承 ——
+ * 以前开过那个功能的用户, 升级后本功能默认就是开的。
+ * 兜底意义: 后台拉取有漏项或没来得及完成时, 用户打开页面这一下仍能无感拿到原画质。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
@@ -158,17 +170,22 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
     private const val TAG = "AutoPrefetchOriginalMedia"
 
-    /** 「自动查看原图/原视频」的开关 key (见 [defaultEnabled])。 */
+    /**
+     * 已合并的「自动查看原图/原视频」的开关 key (见 [defaultEnabled])。
+     *
+     * v293 起那个功能已并入本功能 (它的页面兜底能力见 [GalleryOriginButtonHook]),
+     * 这个 key 现在只作为**兼容旧用户选择**的默认值来源。
+     */
     private const val VIEW_FEATURE_KEY = "自动查看原图/原视频"
 
     /** 上面那个功能改名前的 key (v281 事故留下的兼容 key)。 */
     private const val VIEW_FEATURE_LEGACY_KEY = "自动查看原图"
 
     /**
-     * 本功能从未被拨动过时的默认值 = **跟随「自动查看原图/原视频」当前的开关值**。
+     * 本功能从未被拨动过时的默认值 = **继承已合并的「自动查看原图/原视频」开关值**。
      *
      * 用户既然显式开过 "自动查看原图/原视频", 说明他要的就是"原画质自动到本地";
-     * 那个功能只能在**点开**时动作, 本功能才能"不点开也拉", 所以直接继承。
+     * v293 起那个功能的页面兜底能力也由本功能提供, 所以直接继承。
      * 一旦用户在本功能的设置项里拨过开关, `WePrefs` 里就有本功能的 key 了,
      * `getBoolOrDef` 不会再走到这里 —— 用户的显式选择永远优先。
      */
@@ -282,6 +299,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         WeDatabaseListenerApi.addListener(this)
         installDownloadProbes()
+        // v293: 原「自动查看原图/原视频」已合并进本功能 —— 后台没拉及时 (或漏项) 时,
+        // 用户打开图片/视频页这一下由它兜底: 按钮在帧级被拦掉并点掉, 点开已是原画质。
+        GalleryOriginButtonHook.install(this)
         WeLogger.i(
             TAG,
             "enabled: 收到图片/视频即后台拉原图与原画质视频 " +
@@ -298,8 +318,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         attemptsBySvrId.clear()
         inFlight.clear()
         pendingSvrIds.clear()
+        GalleryOriginButtonHook.uninstall()
         OriginVideoDownload.reset()
-        WeLogger.i(TAG, "disabled: 监听已移除, 补偿扫描已停止")
+        WeLogger.i(TAG, "disabled: 监听已移除, 补偿扫描已停止, 页面兜底点击已卸载")
     }
 
     // ---------------------------------------------------------------------------------------------

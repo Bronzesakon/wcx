@@ -19,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -54,6 +55,19 @@ fun DexResolver(
     // 因此本 effect 被取消（关窗）也不会停掉扫描。
     LaunchedEffect(Unit) {
         DexAdaptTask.start(outdatedItems)
+    }
+
+    // v293: 登记「进度窗口可见」。适配结束时 [DexAdaptTask] 据此决定要不要补一个
+    // 完成弹窗 —— 窗口还开着就由它自己显示完成态，用户关掉了才另弹。
+    DisposableEffect(Unit) {
+        DexAdaptTask.progressWindowVisible.set(true)
+        onDispose { DexAdaptTask.progressWindowVisible.set(false) }
+    }
+
+    // v293: 窗口自己就是完成提示（自带「重启微信」按钮），认领掉，
+    // 免得 FeaturesLoader 的监听协程再弹一个重复的。
+    LaunchedEffect(state.finished) {
+        if (state.finished) DexAdaptTask.claimCompletionPrompt()
     }
 
     val total = if (state.total > 0) state.total else outdatedItems.size
@@ -168,6 +182,76 @@ fun DexResolver(
 
                     else -> TextButton(onClick = dismiss) { Text("关闭") }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * v293: 适配**完成弹窗** —— 用户关掉进度窗口后，适配跑完时由
+ * [com.Johnny.wcx.features.core.FeaturesLoader] 补弹的这个。
+ *
+ * v292 把进度窗口改成「可直接关闭」后出现一个断档：适配完成时只剩一条 Toast
+ * （“DEX 适配完成，重启微信后生效”），没有「重启微信」按钮，用户看完文字并不知道
+ * 去哪重启。这个弹窗就是补上那个动作入口：进度窗口还开着时不会弹（窗口自己带按钮），
+ * 只有被用户关掉了才由 [DexAdaptTask.claimCompletionPrompt] 认领后弹出。
+ */
+@Composable
+fun DexAdaptCompletion(
+    context: Context,
+    total: Int,
+    success: Int,
+    failed: List<DexAdaptTask.AdaptItemState>,
+    dismiss: () -> Unit
+) {
+    Surface(
+        shape = MaterialTheme.shapes.extraLarge,
+        tonalElevation = 6.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(24.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "DEX 适配完成",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold
+            )
+
+            HorizontalDivider()
+
+            Text(
+                text = if (failed.isEmpty()) {
+                    "已成功更新 $success/$total 个功能的 DEX 缓存, 重启微信后生效。"
+                } else {
+                    "已更新 $success/$total 个功能, 但有 ${failed.size} 个失败 " +
+                        "(不影响其他功能使用), 重启微信后生效。"
+                },
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            if (failed.isNotEmpty()) {
+                ErrorDetailsSection(
+                    failedResults = failed,
+                    onCopy = {
+                        copyToClipboard(context, buildErrorReport(failed))
+                        showToast(context, "已复制")
+                    }
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+            ) {
+                TextButton(onClick = dismiss) { Text("稍后再说") }
+                Button(onClick = {
+                    dismiss()
+                    restartHost()
+                }) { Text("重启微信") }
             }
         }
     }

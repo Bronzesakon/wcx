@@ -14,6 +14,7 @@ import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.android.ProcessPriority
 import com.Johnny.wcx.utils.reflection.retainDexKit
 import com.Johnny.wcx.utils.unreachable
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -98,6 +99,27 @@ object DexAdaptTask {
     val isRunning: Boolean get() = _state.value.running
 
     /**
+     * v293: 进度窗口（[com.Johnny.wcx.ui.content.DexResolver]）当前是否可见。
+     *
+     * 适配结束时据此决定要不要补一个「完成弹窗」：窗口还开着就由它自己显示完成态
+     * （自带「重启微信」按钮）；用户已经把窗口关掉了，就得另弹一个，否则完成时
+     * 只有一条 Toast，用户根本不知道可以去重启了。
+     */
+    val progressWindowVisible = AtomicBoolean(false)
+
+    /** v293: 完成提示是否已被认领（进度窗口自己显示完成态 / 完成弹窗已弹，二选一）。 */
+    private val completionPromptClaimed = AtomicBoolean(false)
+
+    /**
+     * 认领一次「完成提示」。
+     * @return true = 认领成功（调用方负责展示），false = 已被别人认领
+     */
+    fun claimCompletionPrompt(): Boolean = completionPromptClaimed.compareAndSet(false, true)
+
+    /** 完成提示是否已被认领（进度窗口据此避免在完成后还弹出来）。 */
+    val isCompletionPromptClaimed: Boolean get() = completionPromptClaimed.get()
+
+    /**
      * 启动一次后台适配。**幂等**：已有任务在跑、或这批项本次进程内都跑过时直接返回。
      * 本方法立即返回，扫描在进程级协程里继续。
      */
@@ -118,6 +140,10 @@ object DexAdaptTask {
             WeLogger.i(TAG, "这批 ${items.size} 项本次启动均已适配过, 跳过重复扫描")
             return
         }
+
+        // v293: 新一轮适配开始, 重置完成提示的认领状态 (上一轮的弹窗/Toast 不算数)
+        progressWindowVisible.set(false)
+        completionPromptClaimed.set(false)
 
         _state.value = AdaptState(running = true, total = pending.size)
         WeLogger.i(
@@ -176,7 +202,10 @@ object DexAdaptTask {
                         "失败 $failed, 总耗时 ${cost / 1000}s"
             )
 
-            notifyFinished(snapshot.total - failed, failed)
+            // v293: 不再在这里 Toast。完成时的「重启微信」提示改由
+            // [com.Johnny.wcx.features.core.FeaturesLoader] 的监听协程以**弹窗**形式给出
+            // (进度窗口还开着就由窗口自己显示完成态; 已被用户关掉就补弹一个),
+            // 只有实在拿不到界面时才退回 Toast (见 FeaturesLoader.handleBrokenItems)。
         } catch (t: Throwable) {
             WeLogger.e(TAG, "后台适配异常终止", t as? Exception ?: Exception(t))
             _state.value = _state.value.copy(
@@ -248,22 +277,6 @@ object DexAdaptTask {
                     "耗时 ${item.elapsedMs}ms, 进度 ${items.size}/${current.total}" +
                     (item.message?.let { ", 原因: $it" } ?: "")
         )
-    }
-
-    /** 适配结束时给个回执：微信在前台时是一条 Toast，退到后台就只落日志。 */
-    private fun notifyFinished(success: Int, failed: Int) {
-        runCatching {
-            Handler(Looper.getMainLooper()).post {
-                runCatching {
-                    val text = if (failed == 0) {
-                        "DEX 适配完成 ($success 项), 重启微信后生效"
-                    } else {
-                        "DEX 适配完成, $failed 项失败 (不影响其他功能)"
-                    }
-                    com.Johnny.wcx.utils.android.showToast(HostInfo.application, text)
-                }
-            }
-        }
     }
 
     // ---------------------------------------------------------------------------
