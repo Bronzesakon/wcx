@@ -7,7 +7,7 @@ name: build
 #   - v* tag → 该 tag 的正式 release
 # 签名复用 zcode-remote（android-shell）的 keystore：材料经 4 个 WEKIT_* Secrets
 # 注入，与 E:\Zcode_harmony\android-shell 的 ANDROID_* 流同源同key。
-# 密钥缺失不阻断：回退 debug 签名并给出 warning（与 android-shell 一致）。
+# 发布必须使用固定证书；只有无 Secrets 的 PR 检查允许 debug 签名且不发布。
 
 on:
   push:
@@ -66,6 +66,53 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Restore release keystore
+        shell: bash
+        env:
+          WEKIT_KEYSTORE_BASE64: ${{ secrets.WEKIT_KEYSTORE_BASE64 }}
+          WEKIT_KEYSTORE_PASSWORD: ${{ secrets.WEKIT_KEYSTORE_PASSWORD }}
+          WEKIT_KEY_ALIAS: ${{ secrets.WEKIT_KEY_ALIAS }}
+          WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keys=(WEKIT_KEYSTORE_BASE64 WEKIT_KEYSTORE_PASSWORD WEKIT_KEY_ALIAS WEKIT_KEY_PASSWORD)
+          configured=0
+          for key in "${keys[@]}"; do
+            if [ -n "${!key:-}" ]; then configured=$((configured + 1)); fi
+          done
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$configured" -eq 0 ]; then
+            echo "SIGNING=debug" >> "$GITHUB_ENV"
+            echo "::notice::PR without signing secrets: debug artifact only, no release."
+            exit 0
+          fi
+          for key in "${keys[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Required release signing secret is missing: $key"
+              exit 1
+            fi
+          done
+          umask 077
+          keystore_path="$RUNNER_TEMP/wcx-release.p12"
+          if ! printf '%s' "$WEKIT_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$keystore_path" || ! test -s "$keystore_path"; then
+            echo "::error::Release keystore could not be decoded"
+            exit 1
+          fi
+          expected=$(tr -d '[:space:]' < .github/signing-certificate.sha256)
+          if ! actual=$(keytool -exportcert -storetype PKCS12 -keystore "$keystore_path" \
+            -alias "$WEKIT_KEY_ALIAS" -storepass:env WEKIT_KEYSTORE_PASSWORD | sha256sum | cut -d ' ' -f 1); then
+            echo "::error::Cannot read release signing certificate; check PKCS12 password and alias"
+            exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Release keystore certificate mismatch: expected $expected, got $actual"
+            exit 1
+          fi
+          {
+            echo "WEKIT_KEYSTORE_FILE=$keystore_path"
+            echo "SIGNING=release"
+          } >> "$GITHUB_ENV"
+          echo "Verified release keystore certificate SHA-256: $actual"
+
       - name: Check scheduled-message timing
         shell: pwsh
         run: ./scripts/check-scheduled-message-timing.ps1
@@ -109,24 +156,6 @@ jobs:
       # Gradle 缓存由 setup-gradle 自带；这里只补 wrapper 下载缓存已在其中，
       # 不额外缓存 build/ —— APK 产物本身不缓存。
 
-      - name: Restore release keystore
-        env:
-          WEKIT_KEYSTORE_BASE64: ${{ secrets.WEKIT_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -n "${WEKIT_KEYSTORE_BASE64:-}" ]; then
-            printf '%s' "$WEKIT_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$HOME/wcx-keystore.jks"
-            if ! [ -s "$HOME/wcx-keystore.jks" ]; then
-              echo "::error::WEKIT_KEYSTORE_BASE64 解码后为空，请检查 secret 取值"
-              exit 1
-            fi
-            echo "SIGNING=release" >> "$GITHUB_ENV"
-            echo "Release keystore restored (zcode-remote shared key)."
-          else
-            echo "SIGNING=debug" >> "$GITHUB_ENV"
-            echo "::warning title=Debug-signed build::WEKIT_KEYSTORE_BASE64 未配置，APK 将使用 debug 签名，无法覆盖安装正式签名包（需卸载重装）。"
-          fi
-
       - name: Set build task
         # 默认只编 standard flavor 且只出 arm64-v8a 分包（-Pwcx.abi 过滤，见
         # app/build.gradle.kts 的 splits 块）；手动勾选 full_build 时编全部 4 个。
@@ -151,13 +180,41 @@ jobs:
       - name: Build release APKs
         env:
           # wcx 的 build.gradle.kts 签名解析优先读这 4 个环境变量
-          WEKIT_KEYSTORE_FILE: ${{ env.SIGNING == 'release' && format('{0}/wcx-keystore.jks', env.HOME) || '' }}
+          # WEKIT_KEYSTORE_FILE 由恢复步骤写入 GITHUB_ENV，直接继承真实绝对路径。
           WEKIT_KEYSTORE_PASSWORD: ${{ secrets.WEKIT_KEYSTORE_PASSWORD }}
           WEKIT_KEY_ALIAS: ${{ secrets.WEKIT_KEY_ALIAS }}
           WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
           # 写入 BuildConfig.RELEASE_TAG 供应用内更新判等
           WCX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
-        run: ./gradlew --no-daemon --console=plain $BUILD_PROPS "$BUILD_TASK"
+        run: ./gradlew --no-daemon --console=plain -Pwcx.requireReleaseSigning="${{ env.SIGNING == 'release' }}" $BUILD_PROPS "$BUILD_TASK"
+
+      - name: Verify APK signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=($APK_DIR_PATTERN/*.apk)
+          test "${#apks[@]}" -gt 0
+          expected=$(tr -d '[:space:]' < .github/signing-certificate.sha256)
+          apksigner="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner"
+          for apk in "${apks[@]}"; do
+            echo "== $apk"
+            certs=$("$apksigner" verify --verbose --print-certs "$apk")
+            printf '%s\n' "$certs"
+            if [ "$SIGNING" = "release" ]; then
+              actual=$(printf '%s\n' "$certs" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+              if ! grep -qx 'Number of signers: 1' <<< "$certs" || [ "$actual" != "$expected" ]; then
+                echo "::error::APK certificate mismatch: expected $expected, got $actual"
+                exit 1
+              fi
+            elif [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+              echo "::error::Refusing to publish a debug-signed APK"
+              exit 1
+            fi
+          done
+          if [ "$SIGNING" = "release" ]; then
+            echo "APK_CERT_SHA256=$expected" >> "$GITHUB_ENV"
+          fi
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
@@ -166,15 +223,6 @@ jobs:
           path: ${{ env.APK_DIR_PATTERN }}/*.apk
           if-no-files-found: error
           retention-days: 30
-
-      - name: Verify APK signatures
-        if: env.SIGNING == 'release'
-        run: |
-          set -euo pipefail
-          for apk in ${{ env.APK_DIR_PATTERN }}/*.apk; do
-            echo "== $apk"
-            "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --print-certs "$apk" | head -3
-          done
 
       # 发布：PR 不发；tag → 正式 release；master 推送 → 滚动 pre-release `latest`。
       # `latest` 刻意不带 v 前缀，避免匹配本 workflow 的 `v*` 触发造成循环。
@@ -185,6 +233,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          test "$SIGNING" = "release"
+          test -n "$APK_CERT_SHA256"
           shopt -s nullglob
           apks=(${{ env.APK_DIR_PATTERN }}/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then
@@ -194,7 +244,7 @@ jobs:
 
           build_start="${BUILD_START_UTC8:-$(date -u -d "@$(( $(date -u +%s) + 28800 ))" '+%Y-%m-%d %H:%M:%S')}"
           push_time="${PUSH_TIME_UTC8:-$(date -u -d "@$(( $(git log -1 --pretty=%ct) + 28800 ))" '+%Y-%m-%d %H:%M:%S')}"
-          notes="build start ${build_start} (UTC+8) - commit ${push_time} (UTC+8) - ${GITHUB_SHA:0:7} - signing: ${SIGNING}"
+          notes="build start ${build_start} (UTC+8) - commit ${push_time} (UTC+8) - ${GITHUB_SHA:0:7} - signing: ${SIGNING} - certificate-sha256: ${APK_CERT_SHA256}"
 
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             tag="$GITHUB_REF_NAME"

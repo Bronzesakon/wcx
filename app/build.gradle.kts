@@ -100,28 +100,38 @@ android {
     //   2. gradle 属性同名 key
     //   3. 默认 keystore：~/wcx-keystore.jks → ~/.wcx/wcx-keystore.jks → <rootProject>/wcx-keystore.jks
     //      （alias=wcx，store/key 密码 wcx-store-pass，与历史交付 APK 一致）
-    //   4. 都找不到 → 回退 Android 默认 debug keystore（仅 CI 临时构建）
+    //   4. 未配置密钥时允许本地/PR 使用 debug；发布 CI 必须传 -Pwcx.requireReleaseSigning=true
+    // 显式配置的路径无效时立即失败，避免错误路径静默生成另一张证书的 APK。
     // ────────────────────────────────────────────────────────────────────────
     @Suppress("LocalVariableName")
     signingConfigs {
         fun resolveProp(name: String): String? =
-            System.getenv(name) ?: runCatching { project.property(name) }.getOrNull() as? String?
+            System.getenv(name)?.takeIf { it.isNotBlank() }
+                ?: (project.findProperty(name) as? String)?.takeIf { it.isNotBlank() }
 
         val home = System.getProperty("user.home") ?: ""
         val defaultStore = listOf("$home/wcx-keystore.jks", "$home/.wcx/wcx-keystore.jks")
-            .firstOrNull { File(it).exists() }
-            ?: rootProject.file("wcx-keystore.jks").takeIf { it.exists() }?.absolutePath
+            .firstOrNull { File(it).isFile }
+            ?: rootProject.file("wcx-keystore.jks").takeIf { it.isFile }?.absolutePath
 
-        val _storeFile = resolveProp("WEKIT_KEYSTORE_FILE") ?: defaultStore
+        val configuredStore = resolveProp("WEKIT_KEYSTORE_FILE")
+        val _storeFile = configuredStore ?: defaultStore
         val _storePassword = resolveProp("WEKIT_KEYSTORE_PASSWORD") ?: "wcx-store-pass"
         val _keyAlias = resolveProp("WEKIT_KEY_ALIAS") ?: "wcx"
         val _keyPassword = resolveProp("WEKIT_KEY_PASSWORD") ?: "wcx-store-pass"
 
-        val storeExists = _storeFile != null && File(_storeFile).exists()
+        val store = _storeFile?.let { file(it) }
+        val storeExists = store?.isFile == true
+        require(configuredStore == null || storeExists) {
+            "WEKIT_KEYSTORE_FILE must point to an existing keystore; refusing debug signing fallback"
+        }
+        require(providers.gradleProperty("wcx.requireReleaseSigning").orNull != "true" || storeExists) {
+            "Release signing is required, but no keystore was found"
+        }
         if (storeExists) {
             create("release") {
                 foundKeystore = true
-                storeFile = file(_storeFile)
+                storeFile = store
                 storePassword = _storePassword
                 keyAlias = _keyAlias
                 keyPassword = _keyPassword
