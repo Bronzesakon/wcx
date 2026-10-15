@@ -1,6 +1,8 @@
 package com.Johnny.wcx.features.items.chat
 
 import android.app.AlarmManager
+import android.app.Activity
+import android.app.Application
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -8,6 +10,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -99,10 +102,6 @@ object ScheduledMessage : ClickableFeature() {
     private const val SEGMENT_RETRY_DELAY_MS = 2_000L
     /** 单次任务迟到重试的间隔 */
     private const val ONETIME_RETRY_DELAY_MS = 30_000L
-    /** 进程内定时器最后一段进入自旋的提前量: 协程 delay 漂移可达数十 ms, 100ms 足以吸收 */
-    private const val SPIN_LEAD_MS = 100L
-    /** 自旋总时长上限: 墙钟被校时/回拨时放弃自旋直接触发, 避免长时间占住协程 worker */
-    private const val MAX_SPIN_MS = 150L
     /** 单个任务当天最多尝试次数, 超出则等明天, 防止失败时无限重试 */
     private const val MAX_FIRE_ATTEMPTS = 3
 
@@ -226,17 +225,38 @@ object ScheduledMessage : ClickableFeature() {
     // 发送开始前占位、结束后释放, 保证同一任务同一时刻只有一个触发者在执行。
     private val triggering = ConcurrentHashMap.newKeySet<String>()
     private lateinit var alarmReceiver: BroadcastReceiver
+    private val recoveryCallbacks = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(activity: Activity) = recoverSchedules("resume")
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+        override fun onActivityStarted(activity: Activity) {}
+        override fun onActivityPaused(activity: Activity) {}
+        override fun onActivityStopped(activity: Activity) {}
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+        override fun onActivityDestroyed(activity: Activity) {}
+    }
+
+    private fun recoverSchedules(source: String) {
+        if (!isActive) return
+        scope.launch {
+            if (this@ScheduledMessage.isActive) sweepSchedules(source)
+        }
+    }
 
     override fun onEnable() {
         alarmReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != ALARM_ACTION) {
+                    recoverSchedules(intent?.action ?: return)
+                    return
+                }
                 val scheduleId = intent?.getStringExtra(EXTRA_SCHEDULE_ID) ?: return
+                val receivedAtMs = System.currentTimeMillis()
                 // goAsync: 声明本次广播需要延长生命周期, 避免 onReceive 返回后
                 // 系统提前回收广播上下文导致发送中途被中断
                 val pending = goAsync()
                 scope.launch {
                     try {
-                        handleScheduleTrigger(scheduleId)
+                        handleScheduleTrigger(scheduleId, "alarm", receivedAtMs)
                     } finally {
                         runCatching { pending.finish() }
                     }
@@ -245,7 +265,11 @@ object ScheduledMessage : ClickableFeature() {
         }
 
         runCatching {
-            val filter = IntentFilter(ALARM_ACTION)
+            val filter = IntentFilter(ALARM_ACTION).apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_TIME_CHANGED)
+            }
             // Android 13+ 必须声明接收器导出标志，否则注册抛 SecurityException
             ContextCompat.registerReceiver(
                 HostInfo.application,
@@ -256,6 +280,9 @@ object ScheduledMessage : ClickableFeature() {
         }.onFailure {
             WeLogger.e(TAG, "failed to register alarm receiver", it)
         }
+
+        runCatching { HostInfo.application.registerActivityLifecycleCallbacks(recoveryCallbacks) }
+            .onFailure { WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to register schedule recovery", it) }
 
         runCatching {
             // 注意: 先取一次快照再逐个排期, 不要边遍历边改存储
@@ -288,7 +315,7 @@ object ScheduledMessage : ClickableFeature() {
             while (isActive) {
                 try {
                     delay(MONITOR_INTERVAL_MS)
-                    sweepSchedules()
+                    sweepSchedules("monitor")
                 } catch (e: CancellationException) {
                     return@launch
                 } catch (e: Throwable) {
@@ -298,7 +325,8 @@ object ScheduledMessage : ClickableFeature() {
         }
     }
 
-    private fun sweepSchedules() {
+    private fun sweepSchedules(source: String) {
+        if (!isActive) return
         val now = System.currentTimeMillis()
         val list = runCatching { synchronized(storageLock) { schedules } }
             .onFailure { WeLogger.e(TAG, "failed to read schedules in monitor", it) }
@@ -308,12 +336,11 @@ object ScheduledMessage : ClickableFeature() {
                 when {
                     // 到点未触发(定时器丢失/休眠错过): 立即执行
                     schedule.nextSendTime in 1..now -> {
-                        WeLogger.i(TAG, "monitor: ${schedule.id} overdue (next=${schedule.nextSendTime}), triggering now")
-                        scope.launch { handleScheduleTrigger(schedule.id) }
+                        scope.launch { handleScheduleTrigger(schedule.id, source) }
                     }
                     // 定时器缺失(异常退出)但还没到点: 重新挂上
                     schedule.nextSendTime > now && timerJobs[schedule.id]?.isActive != true -> {
-                        WeLogger.i(TAG, "monitor: re-arm in-process timer for ${schedule.id}")
+                        WeLogger.i(TAG, "${WeLogger.FORK_LOG_PREFIX} $source: re-arm in-process timer for ${schedule.id}")
                         scheduleInProcess(schedule)
                     }
                     // 从未排过期(存储被清理/新增任务时进程忙): 重新计算
@@ -332,6 +359,7 @@ object ScheduledMessage : ClickableFeature() {
         activeAlarms.clear()
         timerJobs.values.forEach { it.cancel() }
         timerJobs.clear()
+        HostInfo.application.unregisterActivityLifecycleCallbacks(recoveryCallbacks)
         runCatching {
             HostInfo.application.unregisterReceiver(alarmReceiver)
         }.onFailure {
@@ -360,6 +388,7 @@ object ScheduledMessage : ClickableFeature() {
         val context = HostInfo.application
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(ALARM_ACTION).apply {
+            setPackage(context.packageName)
             putExtra(EXTRA_SCHEDULE_ID, schedule.id)
         }
 
@@ -385,7 +414,7 @@ object ScheduledMessage : ClickableFeature() {
         schedule.nextSendTime = triggerTime
         synchronized(storageLock) { updateSchedule(schedule) }
 
-        // 进程内定时器：只要微信进程存活就保证准点触发，不受系统闹钟权限/省电策略影响
+        // 进程内计时与系统闹钟互为兜底；休眠恢复时重新按墙钟判断到点。
         scheduleInProcess(schedule)
 
         runCatching {
@@ -407,8 +436,9 @@ object ScheduledMessage : ClickableFeature() {
             }
 
             activeAlarms[schedule.id] = pendingIntent
+            WeLogger.i(TAG, "${WeLogger.FORK_LOG_PREFIX} armed ${schedule.id}: next=$triggerTime, exact=$exactAllowed, wall=${System.currentTimeMillis()}, elapsed=${SystemClock.elapsedRealtime()}, uptime=${SystemClock.uptimeMillis()}")
         }.onFailure {
-            WeLogger.e(TAG, "failed to set exact alarm for schedule ${schedule.id}", it)
+            WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to set alarm for schedule ${schedule.id}", it)
             // 最后兜底：精确闹钟被拒绝时再尝试一次不精确闹钟
             runCatching {
                 alarmManager.setAndAllowWhileIdle(
@@ -417,6 +447,7 @@ object ScheduledMessage : ClickableFeature() {
                     pendingIntent
                 )
                 activeAlarms[schedule.id] = pendingIntent
+                WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} armed ${schedule.id}: next=$triggerTime, fallback=inexact")
             }.onFailure { e2 ->
                 WeLogger.e(TAG, "fallback alarm also failed for ${schedule.id}", e2)
             }
@@ -430,21 +461,16 @@ object ScheduledMessage : ClickableFeature() {
     private fun scheduleInProcess(schedule: ScheduleConfig) {
         timerJobs.remove(schedule.id)?.cancel()
         val next = schedule.nextSendTime
-        val delayMs = next - System.currentTimeMillis()
-        if (delayMs <= 0) return
+        if (next <= 0) return
         val job = scope.launch {
             try {
-                // 两段式唤醒: 先粗睡到剩 SPIN_LEAD_MS, 再有界自旋贴准到点,
-                // 把协程 delay 的漂移(可达数十 ms)压到 ±1-2ms。
-                // 深度休眠期间 delay 依赖的单调时钟不会推进, 醒来时可能已经过点;
-                // 过点跳过自旋照常触发, 由 handleScheduleTrigger 内部的时间守卫与去重兜底
-                val coarseMs = delayMs - SPIN_LEAD_MS
-                if (coarseMs > 0) delay(coarseMs)
-                val spinStartNs = System.nanoTime()
-                while (System.currentTimeMillis() < next) {
-                    if (System.nanoTime() - spinStartNs > MAX_SPIN_MS * 1_000_000L) break
+                val deadline = ScheduledMessageDeadline(next)
+                while (isActive) {
+                    val waitMs = deadline.nextWaitMillis(System.currentTimeMillis(), System.nanoTime())
+                    if (waitMs == 0L) break
+                    if (waitMs > 0) delay(waitMs)
                 }
-                handleScheduleTrigger(schedule.id)
+                if (isActive) handleScheduleTrigger(schedule.id, "timer")
             } catch (e: CancellationException) {
                 // 任务被取消（停用/删除/重设闹钟）
             } catch (e: Throwable) {
@@ -500,7 +526,8 @@ object ScheduledMessage : ClickableFeature() {
         return if (schedule.repeatDaily) now + 2000L else now + ONETIME_RETRY_DELAY_MS
     }
 
-    private suspend fun handleScheduleTrigger(scheduleId: String) {
+    private suspend fun handleScheduleTrigger(scheduleId: String, source: String, receivedAtMs: Long = 0) {
+        if (!isActive) return
         val probeEntryNs = SystemClock.elapsedRealtimeNanos()
         val schedule = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
 
@@ -521,7 +548,7 @@ object ScheduledMessage : ClickableFeature() {
             // 占位成功后必须重读: 上面的快照可能是在上一个触发者落库前读的,
             // 拿过期 lastFiredDate 判重会放行成重复发送
             val fresh = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
-            if (!fresh.enabled) return
+            if (!fresh.enabled || !isActive) return
             // 当天已成功发过: 只推进排期, 不再重复发送
             if (fresh.lastFiredDate == todayKey()) {
                 WeLogger.i(TAG, "schedule ${fresh.id} already fired today, advancing schedule only")
@@ -554,7 +581,7 @@ object ScheduledMessage : ClickableFeature() {
             // 延迟探针: 唤醒漂移(正值=晚于到点)与 触发入口→发送返回 耗时, 验收 <=5ms 用
             WeLogger.i(
                 TAG,
-                "${WeLogger.FORK_LOG_PREFIX} trigger ${fresh.id} probe: wakeDrift=${nowMs - fresh.nextSendTime}ms, entryToSend=${entryToSendUs}us, sent=$sentOk"
+                "${WeLogger.FORK_LOG_PREFIX} trigger ${fresh.id} probe: source=$source, wakeDrift=${nowMs - fresh.nextSendTime}ms, entryToSend=${entryToSendUs}us, sent=$sentOk, alarmReceivedAt=$receivedAtMs, wall=$nowMs, elapsed=${SystemClock.elapsedRealtime()}, uptime=${SystemClock.uptimeMillis()}"
             )
             advanceAfterTrigger(fresh, sentOk)
         } finally {
