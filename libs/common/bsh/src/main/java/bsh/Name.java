@@ -396,14 +396,10 @@ class Name implements java.io.Serializable
                     null, null, JavaFieldHookParam.ACCESS_READ,
                     false, Thread.currentThread().getStackTrace());
                 Interpreter.bshHookManager.fireBeforeJavaField(fieldHook);
-                if (fieldHook.isIntercepted()) {
-                    Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
-                    return completeRound(field, suffix(evalName), fieldHook.getReturnValue());
-                }
-                obj = Reflect.getStaticFieldValue(clas, field);
-                fieldHook.setReturnValue(obj);
-                Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
-                obj = fieldHook.getReturnValue();
+                if (fieldHook.isIntercepted())
+                    obj = fieldHook.getReturnValue();
+                else
+                    obj = Reflect.getStaticFieldValue(clas, field);
             } catch( ReflectError e ) {
                 Interpreter.debug("field reflect error: ", e);
             }
@@ -462,10 +458,8 @@ class Name implements java.io.Serializable
                 null, null, JavaFieldHookParam.ACCESS_READ,
                 false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaField(fieldHook);
-            if (fieldHook.isIntercepted()) {
-                Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
+            if (fieldHook.isIntercepted())
                 return completeRound( field, suffix(evalName), fieldHook.getReturnValue() );
-            }
 
             Object obj = Reflect.getObjectFieldValue(evalBaseObject, field);
 
@@ -828,11 +822,13 @@ class Name implements java.io.Serializable
                 classOfStaticMethod, methodName, paramTypes, args,
                 null, null, false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaMethod(hookParam);
-            if (!hookParam.isIntercepted()) {
-                Object result = Reflect.invokeStaticMethod(
-                    bcm, classOfStaticMethod, methodName, args, callerInfo );
-                hookParam.setReturnValue(result);
-            }
+            if (hookParam.isIntercepted())
+                return hookParam.getReturnValue();
+
+            Object result = Reflect.invokeStaticMethod(
+                bcm, classOfStaticMethod, methodName, args, callerInfo );
+
+            hookParam.setReturnValue(result);
             Interpreter.bshHookManager.fireAfterJavaMethod(hookParam);
             return hookParam.getReturnValue();
         }
@@ -868,11 +864,13 @@ class Name implements java.io.Serializable
                     instance.getClass(), methodName, paramTypes, args,
                     null, null, false, Thread.currentThread().getStackTrace());
                 Interpreter.bshHookManager.fireBeforeJavaMethod(hookParam);
-                if (!hookParam.isIntercepted()) {
-                    Object result = ClassGenerator.getClassGenerator()
-                        .invokeSuperclassMethod( bcm, instance, classStatic, methodName, args );
-                    hookParam.setReturnValue(result);
-                }
+                if (hookParam.isIntercepted())
+                    return hookParam.getReturnValue();
+
+                Object result = ClassGenerator.getClassGenerator()
+                    .invokeSuperclassMethod( bcm, instance, classStatic, methodName, args );
+
+                hookParam.setReturnValue(result);
                 Interpreter.bshHookManager.fireAfterJavaMethod(hookParam);
                 return hookParam.getReturnValue();
             }
@@ -913,11 +911,13 @@ class Name implements java.io.Serializable
                 obj.getClass(), methodName, paramTypes, args,
                 null, null, false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaMethod(hookParam);
-            if (!hookParam.isIntercepted()) {
-                Object result = Reflect.invokeObjectMethod(
-                    obj, methodName, args, interpreter, callstack, callerInfo );
-                hookParam.setReturnValue(result);
-            }
+            if (hookParam.isIntercepted())
+                return hookParam.getReturnValue();
+
+            Object result = Reflect.invokeObjectMethod(
+                obj, methodName, args, interpreter, callstack, callerInfo );
+
+            hookParam.setReturnValue(result);
             Interpreter.bshHookManager.fireAfterJavaMethod(hookParam);
             return hookParam.getReturnValue();
         }
@@ -944,10 +944,12 @@ class Name implements java.io.Serializable
             clas, methodName, paramTypes, args,
             null, null, false, Thread.currentThread().getStackTrace());
         Interpreter.bshHookManager.fireBeforeJavaMethod(hookParam);
-        if (!hookParam.isIntercepted()) {
-            Object result = Reflect.invokeStaticMethod( bcm, clas, methodName, args, callerInfo );
-            hookParam.setReturnValue(result);
-        }
+        if (hookParam.isIntercepted())
+            return hookParam.getReturnValue();
+
+        Object result = Reflect.invokeStaticMethod( bcm, clas, methodName, args, callerInfo );
+
+        hookParam.setReturnValue(result);
         Interpreter.bshHookManager.fireAfterJavaMethod(hookParam);
         return hookParam.getReturnValue();
     }
@@ -998,23 +1000,25 @@ class Name implements java.io.Serializable
         // If defined, invoke it
         if ( meth != null ) {
             LocalMethodHookParam hookParam = new LocalMethodHookParam(
-                interpreter, namespace, methodName, argTypes, args, meth.getReturnType(),
-                null, false, Thread.currentThread().getStackTrace());
+                methodName, argTypes, args, meth.getReturnType(),
+                null, false, Thread.currentThread().getStackTrace(), interpreter);
 
             Interpreter.bshHookManager.fireBeforeLocalMethod(hookParam);
-            if (!hookParam.isIntercepted()) {
-                // whether to use callstack.top or new child of declared name space
-                // enables late binding for closures and namespace chaining #676
-                boolean overrideChild = !namespace.isMethod
-                        && !meth.isScriptedObject
-                        && namespace.isChildOf(meth.declaringNameSpace)
-                        && !namespace.getParent().isClass
-                        && !noOverride.matcher(meth.getName()).matches();
+            if (hookParam.isIntercepted())
+                return hookParam.getReturnValue();
 
-                Object result = meth.invoke( args, interpreter, callstack, callerInfo,
-                                             overrideChild, extensionReceiver );
-                hookParam.setReturnValue(result);
-            }
+            // whether to use callstack.top or new child of declared name space
+            // enables late binding for closures and namespace chaining #676
+            boolean overrideChild = !namespace.isMethod
+                    && !meth.isScriptedObject
+                    && namespace.isChildOf(meth.declaringNameSpace)
+                    && !namespace.getParent().isClass
+                    && !noOverride.matcher(meth.getName()).matches();
+
+            Object result = meth.invoke( args, interpreter, callstack, callerInfo,
+                                         overrideChild, extensionReceiver );
+
+            hookParam.setReturnValue(result);
             Interpreter.bshHookManager.fireAfterLocalMethod(hookParam);
             return hookParam.getReturnValue();
         }

@@ -181,10 +181,12 @@ class LHS implements ParserConstants, Serializable {
                 null, null, JavaFieldHookParam.ACCESS_READ,
                 false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaField(fieldHook);
-            if (!fieldHook.isIntercepted()) {
-                Object result = inv.invoke(object);
-                fieldHook.setReturnValue(result);
-            }
+            if (fieldHook.isIntercepted())
+                return fieldHook.getReturnValue();
+
+            Object result = inv.invoke(object);
+
+            fieldHook.setReturnValue(result);
             Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
             return fieldHook.getReturnValue();
         } catch( ReflectiveOperationException e2 ) {
@@ -299,12 +301,13 @@ class LHS implements ParserConstants, Serializable {
                 val, null, JavaFieldHookParam.ACCESS_WRITE,
                 false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaField(fieldHook);
-            if (!fieldHook.isIntercepted()) {
-                Object finalVal = fieldHook.getValue();
-                Objects.requireNonNull(field,
-                    "assign value, field cannot be null").invoke( object, finalVal);
-            }
-            Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
+            if (fieldHook.isIntercepted())
+                return fieldHook.getReturnValue();
+            // value may have been modified by the hook
+            Object finalVal = fieldHook.getValue();
+
+            Objects.requireNonNull(field,
+                "assign value, field cannot be null").invoke( object, finalVal);
             return getValueImpl();
         } catch (ReflectiveOperationException e) {
             throw new UtilEvalError(

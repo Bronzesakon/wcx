@@ -1,5 +1,6 @@
 package bsh;
 
+import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -11,9 +12,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public class BshHookManager {
 
-    private final CopyOnWriteArrayList<BshHook> hooks = new CopyOnWriteArrayList<>();
+    private final List<BshHook> hooks = new CopyOnWriteArrayList<>();
 
-    public void addHook(BshHook hook) { hooks.addIfAbsent(hook); }
+    public void addHook(BshHook hook) { hooks.add(hook); }
     public void removeHook(BshHook hook) { hooks.remove(hook); }
     public void clearHooks() { hooks.clear(); }
 

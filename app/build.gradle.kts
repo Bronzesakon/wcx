@@ -12,11 +12,19 @@ plugins {
     alias(libs.plugins.aboutlibraries.android)
 }
 
-fun getGitHash(): String {
-    return providers.exec {
-        commandLine("git", "rev-parse", "--short", "HEAD")
-    }.standardOutput.asText.get().trim()
-}
+// Source ZIPs often do not include .git metadata. Do not make a clean export
+// impossible to build just because the repository history is unavailable.
+fun gitValue(vararg args: String): String? = runCatching {
+    providers.exec {
+        commandLine("git", *args)
+        isIgnoreExitValue = true
+    }.let { result ->
+        if (result.result.get().exitValue == 0) result.standardOutput.asText.get().trim().takeIf { it.isNotEmpty() }
+        else null
+    }
+}.getOrNull()
+
+fun getGitHash(): String = gitValue("rev-parse", "--short", "HEAD") ?: "source-zip"
 
 android {
     namespace = libs.versions.namespace.get()
@@ -28,20 +36,16 @@ android {
     ndkVersion = libs.versions.ndk.get()
 
     val gitHash = getGitHash()
-
-    // 本地定制：CI 发布时由 sync-upstream 工作流注入本次将发布的 Release tag (v259),
-    // 写入 BuildConfig.RELEASE_TAG 供 AppUpdater 判等, 避免重复发布时每次启动都误报新版本。
-    // 本地构建为空字符串。
+    // fork 的 build.yml 注入发布标签；应用内更新检查继续保持关闭。
     val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        // fork 版本号: 默认 261（高于 dostume 已发布的 260，保证被识别为更新而非降级）。
-        // 发版时可覆盖: -Pwcx.versionCode=262 -Pwcx.versionName=v262（CI 同样可传）。
-        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 261
-        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v261"
+        // 跟随 v293 基线，保留 fork 的版本覆盖参数，且不降低已发布的版本号。
+        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 293
+        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v293"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")

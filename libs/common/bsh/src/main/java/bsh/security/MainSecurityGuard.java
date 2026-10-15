@@ -8,7 +8,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
-import bsh.BshHookManager;
 import bsh.Interpreter;
 import bsh.Primitive;
 import bsh.Reflect;
@@ -251,31 +250,20 @@ public final class MainSecurityGuard {
         }
 
         public boolean canInvokeMethod(Object thisArg, String methodName, Object[] args) {
-            return !(thisArg instanceof MainSecurityGuard)
-                    && !(thisArg instanceof BshHookManager);
+            return !(thisArg instanceof MainSecurityGuard);
         }
 
         public boolean canSetField(Object thisArg, String fieldName, Object value) {
-            return !(thisArg instanceof MainSecurityGuard)
-                    && !(thisArg instanceof BshHookManager);
-        }
-
-        public boolean canGetField(Object thisArg, String fieldName) {
-            return !(thisArg instanceof MainSecurityGuard)
-                    && !(thisArg instanceof BshHookManager);
+            return !(thisArg instanceof MainSecurityGuard);
         }
 
         public boolean canSetStaticField(Class<?> _class, String fieldName, Object value) {
-            if (Interpreter.class.isAssignableFrom(_class)
-                    && (fieldName.equals("mainSecurityGuard") || fieldName.equals("bshHookManager")))
-                return false;
+            if (_class == Interpreter.class && fieldName.equals("mainSecurityGuard")) return false;
             return true;
         }
 
         public boolean canGetStaticField(Class<?> _class, String fieldName) {
-            if (Interpreter.class.isAssignableFrom(_class)
-                    && (fieldName.equals("mainSecurityGuard") || fieldName.equals("bshHookManager")))
-                return false;
+            if (_class == Interpreter.class && fieldName.equals("mainSecurityGuard")) return false;
             return true;
         }
 

@@ -190,16 +190,18 @@ public class BSHPrimarySuffix extends SimpleNode
                         null, null, JavaFieldHookParam.ACCESS_READ,
                         false, Thread.currentThread().getStackTrace());
                     Interpreter.bshHookManager.fireBeforeJavaField(fieldHook);
-                    if (!fieldHook.isIntercepted()) {
-                        Object fieldResult = Reflect.getObjectFieldValue( obj, field );
-                        fieldHook.setReturnValue(fieldResult);
-                    }
+                    if (fieldHook.isIntercepted())
+                        return fieldHook.getReturnValue();
+
+                    Object fieldResult = Reflect.getObjectFieldValue( obj, field );
+
+                    fieldHook.setReturnValue(fieldResult);
                     Interpreter.bshHookManager.fireAfterJavaField(fieldHook);
                     return fieldHook.getReturnValue();
-                } catch (ReflectError e) {
+                } catch (Throwable t) {
                     try {
                         return Reflect.getObjectProperty( obj, field );
-                    } catch (ReflectError ignored) {
+                    } catch (Throwable tt) {
                         return Primitive.VOID;
                     }
                 }
@@ -218,11 +220,13 @@ public class BSHPrimarySuffix extends SimpleNode
                 obj.getClass(), field, paramTypes, oa,
                 null, null, false, Thread.currentThread().getStackTrace());
             Interpreter.bshHookManager.fireBeforeJavaMethod(hookParam);
-            if (!hookParam.isIntercepted()) {
-                Object result2 = Reflect.invokeObjectMethod(
-                    obj, field, oa, interpreter, callstack, this );
-                hookParam.setReturnValue(result2);
-            }
+            if (hookParam.isIntercepted())
+                return hookParam.getReturnValue();
+
+            Object result2 = Reflect.invokeObjectMethod(
+                obj, field, oa, interpreter, callstack, this );
+
+            hookParam.setReturnValue(result2);
             Interpreter.bshHookManager.fireAfterJavaMethod(hookParam);
             return hookParam.getReturnValue();
         } catch (UtilEvalError e1) {

@@ -69,6 +69,26 @@ object WeDatabaseApi : ApiFeature(), IResolveDex {
 
     val isReady: Boolean get() = ::db.isInitialized
 
+    /**
+     * 按需初始化 db: [onEnable] 只 hook getStorage(), 靠微信再次调用它才能拿到 db。
+     * 若 hook 安装时微信早已调用过 (重置 dex 缓存后重适配完成但进程未重启、
+     * 或在次要进程里 getStorage 从未被调用), hookAfter 永远不会触发,
+     * db 将一直处于未初始化状态, 所有查询抛 UninitializedPropertyAccessException。
+     * 这里在首次真正需要数据库时主动补一次初始化。
+     * @return true 表示 db 可用
+     */
+    @Synchronized
+    fun ensureDatabase(): Boolean {
+        if (::db.isInitialized) return true
+        return try {
+            initializeDatabase(coreStorage)
+            ::db.isInitialized
+        } catch (e: Exception) {
+            WeLogger.w(TAG, "ensureDatabase failed: db not ready yet", e)
+            false
+        }
+    }
+
     private const val TAG = "WeDatabaseApi"
 
     val coreStorage by lazy {
@@ -352,12 +372,19 @@ object WeDatabaseApi : ApiFeature(), IResolveDex {
     }
 
     @Suppress("NOTHING_TO_INLINE")
-    inline fun rawQuery(sql: String, args: Array<Any>? = null): Cursor = db.rawQuery(sql, args)
+    inline fun rawQuery(sql: String, args: Array<Any>? = null): Cursor {
+        ensureDatabase()
+        return db.rawQuery(sql, args)
+    }
 
     @Suppress("NOTHING_TO_INLINE")
-    inline fun delete(table: String, conditions: String, args: Array<String>? = null): Int = db.delete(table, conditions, args)
+    inline fun delete(table: String, conditions: String, args: Array<String>? = null): Int {
+        ensureDatabase()
+        return db.delete(table, conditions, args)
+    }
 
     fun executeQuery(statement: String, args: Array<Any>? = null): List<Map<String, Any?>> {
+        ensureDatabase()
         val result = mutableListOf<Map<String, Any?>>()
 
         var cursor: Cursor? = null

@@ -51,6 +51,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentManager
 import com.Johnny.wcx.BuildConfig
 import com.Johnny.wcx.features.api.core.WeApi
+import com.Johnny.wcx.features.api.core.WeConversationApi
 import com.Johnny.wcx.features.api.core.WeDatabaseApi
 import com.Johnny.wcx.features.core.ClickableFeature
 import com.Johnny.wcx.features.core.Feature
@@ -455,20 +456,19 @@ object HomeSidePanelFeature : ClickableFeature() {
         Triple("朋友圈", "♥", "com.tencent.mm.plugin.sns.ui.improve.ImproveSnsTimelineUI"),
         Triple("收藏", "★", "com.tencent.mm.plugin.fav.ui.FavoriteIndexUI"),
         Triple("钱包", "💰", "com.tencent.mm.plugin.offline.ui.WalletOfflineCoinPurseUI"),
-        Triple("视频号", "▶", "com.tencent.mm.plugin.finder.ui.FinderHomeUI"),
-        Triple("通讯录", "☻", "com.tencent.mm.ui.contact.ContactsUI"),
-        Triple("我", "★", "com.tencent.mm.ui.MeTabUI"),
-        Triple("设置", "⚙", "com.tencent.mm.ui.setting.SettingsUI"),
-        Triple("搜一搜", "🔍", "com.tencent.mm.plugin.search.ui.SearchMainUI"),
-        Triple("小程序", "▦", "com.tencent.mm.plugin.appbrand.ui.AppBrandMainUI")
+        Triple("视频号", "▶", "com.tencent.mm.plugin.finder.ui.FinderHomeAffinityUI"),
+        Triple("通讯录", "☻", "com.tencent.mm.ui.contact.AddressUI"),
+        Triple("我", "★", "com.tencent.mm.ui.MoreTabUI"),
+        Triple("设置", "⚙", "com.tencent.mm.plugin.setting.ui.setting_new.MainSettingsUI"),
+        Triple("搜一搜", "🔍", "com.tencent.mm.plugin.fts.ui.FTSMainUI"),
+        Triple("小程序", "▦", "com.tencent.mm.plugin.appbrand.ui.AppBrandLauncherUI")
     )
 
     /** 模块内置功能（用于 slot 选择） */
     private fun moduleTargets(): List<Triple<String, String, String>> {
         return listOf(
-            Triple("WCX 设置", "⚙", "com.Johnny.wcx.SettingsActivity"),
-            Triple("清空未读", "✓", "__clear_unread__"),
-            Triple("群成员变动提醒", "☻", "__group_member__")
+            Triple("WCX 设置", "⚙", "com.Johnny.wcx.activity.settings.SettingsActivity"),
+            Triple("清空未读", "✓", "__clear_unread__")
         )
     }
 
@@ -581,11 +581,9 @@ fun isHomePageActive(act: Activity): Boolean = try {
                         return
                     }
                 }
-                // 诊断：记录各列表容器类名（去重），用于确认微信会话列表的真实类名
+                // 诊断（已置空）：记录各列表容器类名（去重），用于确认微信会话列表的真实类名
                 if (n.contains("RecyclerView") || n.contains("ListView")) {
-                    runCatching {
-                        if (listDiagSet.add(n)) diagFile("LIST v=$n shown=${v.isShown}")
-                    }
+                    runCatching { diagFile("LIST v=$n shown=${v.isShown}") }
                 }
                 if (!found && !decorAttached &&
                     (n == "androidx.appcompat.widget.ActionBarOverlayLayout" ||
@@ -642,20 +640,17 @@ private fun isVisibleTree(v: View): Boolean {
 }
 
 /**
- * 以下 4 个 diag* 函数曾是开发期调试用的旁路日志，直接硬编码写
+ * 以下 diag* 函数曾是开发期调试用的旁路日志，直接硬编码写
  * /sdcard/Android/data/com.tencent.mm/WCX/diag.log，既不受「关闭所有日志」开关控制，
  * 又挂在 isHomePageActive() 热路径上（每次触摸都遍历一遍 decorView 写文件）。
  * 现全部置空为 no-op：调用点保留以免破坏结构，运行时零开销、零输出。
  */
-private val listDiagSet = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
 private fun diagIsHome(act: Activity, fragCls: String?, isHome: Boolean, visible: Boolean?) = Unit
 
-/** 诊断：记录 LauncherUI decor 顶层 view 结构签名（去重）。用户在 4 个 Tab 间切换时，
- *  每个 Tab 的顶栏（搜索/+ 栏等）结构不同，据此识别「微信」Tab 以控制侧边栏入口显隐。 */
 private fun diagFile(msg: String) = Unit
+
 private fun dumpTopBar(act: Activity) = Unit
 
-/** 诊断：LauncherUI 非 androidx FragmentActivity 时，dump 继承链与 fragment 反射信息（限频一次） */
 private fun dumpLauncherDiagnostics(act: Activity) = Unit
 
 /**
@@ -1183,6 +1178,13 @@ private fun isHomeTabClass(className: String): Boolean {
         } catch (e: Throwable) { WeLogger.e(TAG, "removeAllViews 异常", e) }
     }
 
+    // 手动刷新必须绕过天气缓存；普通打开面板仍使用缓存，避免频繁请求天气 API。
+    private fun refreshPanelData(act: Activity) {
+        cachedWeather = null
+        lastWeatherFetchTime = 0L
+        loadPanelData(act)
+    }
+
     // ==================== 面板数据加载（异步喂给 Compose 状态） ====================
     private fun loadPanelData(act: Activity) {
         try {
@@ -1270,7 +1272,7 @@ private fun isHomeTabClass(className: String): Boolean {
                         Text(uiTime, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = cs.onSurface)
                         Text(uiDate, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
                     }
-                    IconButton(onClick = { loadPanelData(act) }) {
+                    IconButton(onClick = { refreshPanelData(act) }) {
                         Icon(MaterialSymbols.OutlinedFilled.Update, "刷新", tint = cs.onSurfaceVariant)
                     }
                 }
@@ -1318,7 +1320,10 @@ private fun isHomeTabClass(className: String): Boolean {
                                     Text(w.weather, style = MaterialTheme.typography.bodySmall, color = cs.primary, maxLines = 1)
                                 }
                             }
-                            Text(w.updateTime, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant, maxLines = 1)
+                            val weatherUpdateTime = w.updateTime.ifBlank {
+                                SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                            }
+                            Text("更新于 $weatherUpdateTime", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant, maxLines = 1)
                         }
                         Text(w.weatherIcon?.takeIf { it.isNotBlank() } ?: "☁", fontSize = 26.sp)
                     }
@@ -1385,16 +1390,30 @@ private fun isHomeTabClass(className: String): Boolean {
         }
     }
 
+    /** 在后台线程清理未读，避免遍历会话数据库时阻塞微信主线程。 */
+    private fun markAllConversationsRead(act: Activity) {
+        Thread({
+            try {
+                WeConversationApi.markAllAsRead()
+                mainHandler.post {
+                    if (!act.isFinishing) Toast.makeText(act, "已将全部未读消息标为已读", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Throwable) {
+                WeLogger.e(TAG, "清空未读异常", e)
+                mainHandler.post {
+                    if (!act.isFinishing) Toast.makeText(act, "清空未读失败，请查看日志", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "WCX-MarkAllRead").start()
+    }
+
     /** 执行 slot 绑定的功能跳转 */
     private fun executeSlotTarget(act: Activity, slot: SlotConfig) {
         when (slot.targetActivity) {
-            "__clear_unread__" -> {
-                try { Toast.makeText(act, "已尝试清空未读（占位）", Toast.LENGTH_SHORT).show() }
-                catch (e: Throwable) { WeLogger.e(TAG, "清空未读异常", e) }
-            }
+            "__clear_unread__" -> markAllConversationsRead(act)
             "__group_member__" -> {
-                try { Toast.makeText(act, "群成员变动提醒设置入口", Toast.LENGTH_SHORT).show() }
-                catch (e: Throwable) { WeLogger.e(TAG, "群成员入口异常", e) }
+                // 旧版本保存过该占位目标；明确反馈而不是伪装成已经打开设置。
+                Toast.makeText(act, "该快捷功能尚未接入，请长按图标选择其他功能", Toast.LENGTH_LONG).show()
             }
             else -> startActivityByName(act, slot.targetActivity, slot.isCustomIntent)
         }
@@ -1405,9 +1424,9 @@ private fun isHomeTabClass(className: String): Boolean {
     private fun buildFeatureEntries(act: Activity): List<FeatureEntry> {
         val list = mutableListOf<FeatureEntry>()
         if (momentsEntryEnabled) list.add(FeatureEntry(MaterialSymbols.OutlinedFilled.Favorite, "朋友圈") { startActivityByName(act, "com.tencent.mm.plugin.sns.ui.improve.ImproveSnsTimelineUI") })
-        if (videoEntryEnabled) list.add(FeatureEntry(MaterialSymbols.OutlinedFilled.Movie, "视频号") { startActivityByName(act, "com.tencent.mm.plugin.finder.ui.FinderHomeUI") })
+        if (videoEntryEnabled) list.add(FeatureEntry(MaterialSymbols.OutlinedFilled.Movie, "视频号") { startActivityByName(act, "com.tencent.mm.plugin.finder.ui.FinderHomeAffinityUI") })
         if (clearUnreadEnabled) list.add(FeatureEntry(MaterialSymbols.OutlinedFilled.Check_circle, "清空未读") {
-            try { Toast.makeText(act, "已尝试清空未读（占位）", Toast.LENGTH_SHORT).show() } catch (e: Throwable) { WeLogger.e(TAG, "清空未读异常", e) }
+            markAllConversationsRead(act)
         })
         if (wcxSettingsEnabled) list.add(FeatureEntry(MaterialSymbols.OutlinedFilled.Settings, "WCX 设置") {
             try {
@@ -1963,11 +1982,16 @@ private fun isHomeTabClass(className: String): Boolean {
         if (cachedW != null && cachedW.city == city &&
             now - lastWeatherFetchTime < weatherRefreshInterval * 1000L) return cachedW
         return try {
-            val w = if (useOpenMeteoSource()) {
+            val fetched = if (useOpenMeteoSource()) {
                 fetchOpenMeteoWeather(city) ?: fetchWttrWeather(city)
             } else {
                 fetchCustomApiWeather(city)
             }
+            // 统一显示本机 24 小时制的实际拉取时间，避免 wttr.in 的 observation_time
+            // 为空、带 AM/PM 或格式不一致时只显示“更新于”而没有时分。
+            val w = fetched?.copy(
+                updateTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            )
             if (w != null) { cachedWeather = w; lastWeatherFetchTime = now }
             w ?: cachedWeather
         } catch (e: Throwable) {

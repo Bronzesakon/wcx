@@ -54,6 +54,7 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import kotlinx.coroutines.CancellationException
 
 
 // ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ fun HomePager(onOpenFeatures: () -> Unit) {
 
     LaunchedEffect(Unit) {
         isChecking = true
-        runCatching {
+        try {
             when (val result = AppUpdater.checkForUpdate()) {
                 is UpdateResult.UpdateAvailable -> {
                     val tag = result.info.releaseTag.removePrefix("v").ifEmpty { null }
@@ -228,8 +229,12 @@ fun HomePager(onOpenFeatures: () -> Unit) {
                     isLatest = false
                 }
             }
-        }.onFailure {
-            WeLogger.e("HomePager", "Update check exception", it)
+        } catch (ce: CancellationException) {
+            // 页面离开组合导致 LaunchedEffect 取消，属正常流程，
+            // 不得吞掉后写状态（会刷 "coroutine scope left the composition" 噪音日志）
+            throw ce
+        } catch (t: Throwable) {
+            WeLogger.e("HomePager", "Update check exception", t)
             latestVersion = null
             isLatest = false
         }

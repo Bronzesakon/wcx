@@ -17,13 +17,6 @@ configure<LibraryExtension> {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
-
-    testOptions {
-        unitTests.all {
-            it.useJUnitPlatform()
-            it.jvmArgs("--add-opens=java.base/java.lang=ALL-UNNAMED")
-        }
-    }
 }
 
 val pgccTool = configurations.maybeCreate("pgccTool")
@@ -89,15 +82,6 @@ val javaccGen = tasks.register<JavaExec>("javaccGen") {
 dependencies {
     add("pgccTool", "com.helger:parser-generator-cc:2.0.1")
     implementation("com.jakewharton.android.repackaged:dalvik-dx:16.0.1")
-    testImplementation("org.junit.jupiter:junit-jupiter:6.1.2")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-}
-
-tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    jvmArgs(
-        "--add-opens=java.base/java.lang=ALL-UNNAMED",
-        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED"
-    )
 }
 
 plugins.withId("com.android.library") {

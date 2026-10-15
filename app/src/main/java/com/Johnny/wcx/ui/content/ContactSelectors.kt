@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +23,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyRow
@@ -124,15 +127,18 @@ private data class ContactFilterOption(
     val wxIds: Set<String>,
 )
 
-enum class SortMode(val icon: ImageVector) {
-    ALPHABETICAL(MaterialSymbols.Outlined.Sort_by_alpha),
-    LAST_MESSAGE_TIME(MaterialSymbols.Outlined.Schedule);
+/**
+ * 排序方式: 默认按「最近聊天」(最近消息时间) 排序, 对应 chip 排在最前;
+ * 第二项是 A-Z 拼音/字母序。[reversed] 为 true 时方向反转
+ * (最近→最旧 / Z-A), chip 文案随之变化。
+ */
+enum class SortMode(val icon: ImageVector, val title: String) {
+    RECENT(MaterialSymbols.Outlined.Schedule, "最近"),
+    ALPHABETICAL(MaterialSymbols.Outlined.Sort_by_alpha, "A-Z");
 
-    fun displayNameRes(reversed: Boolean): String = when (this) {
-        ALPHABETICAL -> if (reversed) "Z–A"
-        else "A–Z"
-        LAST_MESSAGE_TIME -> if (reversed) "旧-新"
-        else "新-旧"
+    fun displayName(reversed: Boolean): String = when (this) {
+        RECENT -> if (reversed) "最旧" else "最近"
+        ALPHABETICAL -> if (reversed) "Z–A" else "A–Z"
     }
 }
 
@@ -150,22 +156,44 @@ fun BaseContactSelector(
     modifier: Modifier = Modifier,
     selectionKey: Any,
     isSelected: (IWeContact) -> Boolean,
+    showConfirmButton: Boolean = true,
     dismissButtonText: String? = null,
     avatarModelProvider: ((IWeContact) -> Any)? = { it.avatarUrl },
-    subtitleProvider: ((IWeContact) -> String)? = { it.wxId },
+    subtitleProvider: ((IWeContact) -> String)? = null,
     leadingControl: @Composable (LazyItemScope.(IWeContact) -> Unit)? = null,
     trailingControl: @Composable (LazyItemScope.(IWeContact) -> Unit)? = null,
     onItemClick: (IWeContact) -> Unit,
     onSelectAll: ((List<IWeContact>) -> Unit)? = null,
     onDeselectAll: ((List<IWeContact>) -> Unit)? = null,
-    onInvertSelection: ((List<IWeContact>) -> Unit)? = null
+    onInvertSelection: ((List<IWeContact>) -> Unit)? = null,
+    fullScreen: Boolean = true
 ) {
     val context = LocalContext.current
     val localizedContext = LocalContext.current
     val currentLocalizedContext = rememberUpdatedState(localizedContext)
+    // 筛选 chip / 标题 / 搜索框统一小号字。FilterChip 的 label 默认继承 bodyMedium,
+    // 这里把 chip 行 (类型+标签合并行 / 排序 / 全选) 全部钉死 labelSmall (12sp),
+    // 标题 14sp, 搜索框用 13sp 的 TextStyle 覆盖 bodyMedium; chip 高度统一 28dp。
+    val chipTextStyle = MaterialTheme.typography.labelSmall
+    val titleStyle = MaterialTheme.typography.titleSmall
+    val searchTextStyle = MaterialTheme.typography.titleSmall.copy(fontSize = 13.sp)
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
     val alphabet = remember { listOf(SELECTED_SECTION_KEY) + ('A'..'Z').map { it.toString() } + "#" }
+
+    // 多选已选数量: selectionKey 变化即重算, 展示在「全选/全不选/反选」行右侧
+    // (原来把数量塞进确定按钮 "确定 (" 的格式串漏了 %d, 按钮只显示一个残缺括号)
+    val selectedCount = remember(selectionKey, allContacts) { allContacts.count { isSelected(it) } }
+
+    // 打开选择器时在后台线程重建搜索索引: searchBlobCache 是跨会话的静态缓存,
+    // 用户改了备注之后如果一直沿用旧 blob 会搜不到; 但每次按键在主线程做 ICU 转写
+    // 又会卡, 所以进页面就预先算好填满缓存, 输入时直接命中。
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            searchBlobCache.clear()
+            allContacts.forEach { searchBlobCache[it.wxId] = buildSearchBlob(it) }
+        }
+    }
 
     val transliterator = remember {
         try {
@@ -219,7 +247,7 @@ fun BaseContactSelector(
         withContext(Dispatchers.IO) {
             // 先在 IO 线程把分组字母算好, 主线程之后每次按键都只命中缓存。
             // (之后新增的联系人会在 initialOf 里按需补算, 结果一致。)
-            runCatching { allContacts.forEach { initialOf(it.displayName) } }
+            runCatching { allContacts.forEach { initialOf(it.selectorName) } }
 
             try {
                 if (WeDatabaseApi.isReady) {
@@ -297,41 +325,24 @@ fun BaseContactSelector(
 
     var filtersExpanded by remember { mutableStateOf(true) }
 
-    var sortMode by remember { mutableStateOf(SortMode.ALPHABETICAL) }
+    var sortMode by remember { mutableStateOf(SortMode.RECENT) }
     var sortReversed by remember { mutableStateOf(false) }
     var lastMessageTimes by remember { mutableStateOf<Map<String, Long>?>(null) }
-    var isSortLoading by remember { mutableStateOf(false) }
+
+    // 默认按最近聊天排序: 打开时后台拉取各会话最近消息时间, 拉取成功后列表按时间重排。
+    // 数据库不可用时静默保持 RECENT 分组 (没有时间的联系人兜底为 Long.MIN_VALUE, 展示顺序稳定),
+    // 不弹 toast 打断筛选流。
+    LaunchedEffect(Unit) {
+        val times = withContext(Dispatchers.IO) {
+            if (WeDatabaseApi.isReady) WeDatabaseApi.getLastMessageTimes() else null
+        }
+        if (times != null) lastMessageTimes = times
+    }
 
     fun switchSortMode(target: SortMode) {
-        if (target == sortMode || isSortLoading) return
-        if (target == SortMode.ALPHABETICAL) {
-            sortMode = SortMode.ALPHABETICAL
-            return
-        }
-        // 切换到按最近消息时间排序
-        if (lastMessageTimes != null) {
-            sortMode = SortMode.LAST_MESSAGE_TIME
-            return
-        }
-        isSortLoading = true
-        coroutineScope.launch {
-            val times = withContext(Dispatchers.IO) {
-                if (WeDatabaseApi.isReady) WeDatabaseApi.getLastMessageTimes() else null
-            }
-            // getLastMessageTimes() 内部吞掉异常后返回空表, 所以空结果也当作失败:
-            // 否则会静默按"所有会话时间相同"排出一个随意的顺序, 而且缓存住之后再也不会重试。
-            if (times.isNullOrEmpty()) {
-                val currentResources = currentLocalizedContext.value
-                showToast(
-                    context,
-                    "数据库尚未初始化, 无法按时间排序!",
-                )
-            } else {
-                lastMessageTimes = times
-                sortMode = SortMode.LAST_MESSAGE_TIME
-            }
-            isSortLoading = false
-        }
+        if (target == sortMode) return
+        sortMode = target
+        sortReversed = false
     }
 
     val typeCounts = remember(filteredContacts, friendWxIds, groupWxIds, officialAccountWxIds) {
@@ -421,7 +432,16 @@ fun BaseContactSelector(
             }
         }
     }
-    val showFilterModeRow = availableFilterModes.isNotEmpty()
+    // 当前筛选方式下是否真的有可选项 (标签 / 归拢 / 分组 各一组)。
+    // 没有可选项时连「不限」一起隐藏 —— 孤零零一个按钮反而让人猜它在筛什么。
+    val hasFilterModeOptions = when (filterMode) {
+        ContactFilterMode.LABELS -> availableLabels.isNotEmpty()
+        ContactFilterMode.AGGREGATION -> availableAggregationOptions.isNotEmpty()
+        ContactFilterMode.GROUPING -> availableGroupingOptions.isNotEmpty()
+    }
+    // 类型筛选 chip 与后面的筛选条件 chip 之间画一条竖线做区隔,
+    // 否则「不限」紧跟在「群聊 (55)」后面, 看着像同一组里的第四个分类。
+    val showFilterDivider = showTypeFilterRow && (availableFilterModes.size > 1 || hasFilterModeOptions)
 
     val displayedContacts = remember(filteredContacts, selectedType, filterMode, selectedLabelName, selectedAggregationId, selectedGroupingId, friendWxIds, groupWxIds, officialAccountWxIds, labelContactsMap, aggregationOptions, groupingOptions) {
         filteredContacts.filter { contact ->
@@ -448,7 +468,7 @@ fun BaseContactSelector(
     }
 
     val groupedContacts = remember(displayedContacts, initialCache, selectionKey, sortMode, sortReversed, lastMessageTimes) {
-        if (sortMode == SortMode.LAST_MESSAGE_TIME) {
+        if (sortMode == SortMode.RECENT) {
             val times = lastMessageTimes ?: emptyMap()
             val sorted = if (sortReversed) {
                 displayedContacts.sortedBy { times[it.wxId] ?: Long.MIN_VALUE }
@@ -464,7 +484,7 @@ fun BaseContactSelector(
             }
         } else {
             displayedContacts.groupBy { contact ->
-                if (isSelected(contact)) SELECTED_SECTION_KEY else initialOf(contact.displayName)
+                if (isSelected(contact)) SELECTED_SECTION_KEY else initialOf(contact.selectorName)
             }.toSortedMap { c1, c2 ->
                 when {
                     c1 == c2 -> 0
@@ -493,8 +513,8 @@ fun BaseContactSelector(
         modifier = modifier
             .fillMaxWidth()
             .fillMaxHeight(),
-        fullScreen = true,
-        title = { Text(title) },
+        fullScreen = fullScreen,
+        title = { Text(title, style = titleStyle) },
         text = {
             Column(modifier = Modifier.fillMaxSize()) {
                 Row(
@@ -508,7 +528,8 @@ fun BaseContactSelector(
                         value = searchQuery,
                         onValueChange = onSearchQueryChange,
                         modifier = Modifier.weight(1f),
-                        placeholder = { Text("搜索昵称或微信号") },
+                        placeholder = { Text("搜索昵称/备注/拼音首字母", style = searchTextStyle) },
+                        textStyle = searchTextStyle,
                         leadingIcon = {
                             Icon(
                                 MaterialSymbols.Outlined.Search,
@@ -535,8 +556,9 @@ fun BaseContactSelector(
                     exit = shrinkVertically() + fadeOut()
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
-                        // 第一行：类型筛选 + 筛选模式
-                        if (showTypeFilterRow || showFilterModeRow) {
+                        // 类型筛选与「标签/归拢/分组」筛选合并为同一行横向滚动 (组间竖线分隔),
+                        // 比原来两行堆叠省一整行的高度; 所有 chip 统一 28dp 高、12sp 字。
+                        if (showTypeFilterRow || availableFilterModes.size > 1 || hasFilterModeOptions) {
                             LazyRow(
                                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                                 contentPadding = PaddingValues(horizontal = 4.dp),
@@ -556,7 +578,7 @@ fun BaseContactSelector(
                                             label = {
                                                 Text(
                                                     "%1\$s (%2\$d)".format(displayName, count),
-                                                    style = MaterialTheme.typography.labelSmall
+                                                    style = chipTextStyle,
                                                 )
                                             },
                                             leadingIcon = {
@@ -569,68 +591,87 @@ fun BaseContactSelector(
                                                         FilterType.OTHERS -> MaterialSymbols.Outlined.Tag
                                                     },
                                                     contentDescription = displayName,
-                                                    modifier = Modifier.size(14.dp)
+                                                    modifier = Modifier.size(16.dp)
                                                 )
                                             },
                                             modifier = Modifier.height(28.dp)
                                         )
                                     }
                                 }
-                                if (showFilterModeRow) {
+
+                                if (showFilterDivider) {
+                                    item {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(1.dp)
+                                                .height(20.dp)
+                                                .background(MaterialTheme.colorScheme.outlineVariant)
+                                        )
+                                    }
+                                }
+                                if (availableFilterModes.size > 1) {
+                                    // 筛选方式切换 chip (标签 / 归拢 / 分组) 只在真的存在多种方式时才有意义。
+                                    // 单模式下它点不动 (点击只弹提示), 而且「标签」两个字紧贴在标签列表前面,
+                                    // 会被当成列表里的第一个标签项 —— 索性不显示。
                                     item {
                                         val modeIndex = availableFilterModes.indexOf(filterMode).coerceAtLeast(0)
-                                        val hasMoreModes = availableFilterModes.size > 1
                                         FilterChip(
                                             selected = true,
                                             onClick = {
-                                                if (!hasMoreModes) {
-                                                    showToast(
-                                                        context,
-                                                        "可启用「对话归拢」或「对话分组」以使用更多筛选方式",
-                                                    )
-                                                } else {
-                                                    filterMode = availableFilterModes[(modeIndex + 1) % availableFilterModes.size]
-                                                    persistedContactFilterMode = filterMode.name
-                                                    selectedLabelName = null
-                                                    selectedAggregationId = null
-                                                    selectedGroupingId = null
-                                                }
+                                                filterMode = availableFilterModes[(modeIndex + 1) % availableFilterModes.size]
+                                                persistedContactFilterMode = filterMode.name
+                                                selectedLabelName = null
+                                                selectedAggregationId = null
+                                                selectedGroupingId = null
                                             },
-                                            label = { Text(filterMode.nameRes, style = MaterialTheme.typography.labelSmall) },
+                                            label = { Text(filterMode.nameRes, style = chipTextStyle) },
                                             leadingIcon = {
                                                 Icon(
                                                     imageVector = filterMode.icon,
                                                     contentDescription = filterMode.nameRes,
-                                                    modifier = Modifier.size(14.dp),
+                                                    modifier = Modifier.size(16.dp)
                                                 )
                                             },
                                             modifier = Modifier.height(28.dp)
                                         )
                                     }
-                                    if (filterMode == ContactFilterMode.LABELS) {
+                                }
+
+                                if (filterMode == ContactFilterMode.LABELS) {
+                                    if (hasFilterModeOptions) {
+                                        // 「不限」= 不按标签过滤。原先叫「全部」, 和左侧类型筛选的
+                                        // 「全部 (数量)」撞名, 会被当成同一个东西。
                                         item {
                                             val isSelected = selectedLabelName == null
                                             FilterChip(
                                                 selected = isSelected,
                                                 onClick = { selectedLabelName = null },
-                                                label = { Text("全部", style = MaterialTheme.typography.labelSmall) }
+                                                label = { Text("不限", style = chipTextStyle) },
+                                                modifier = Modifier.height(28.dp)
                                             )
                                         }
+
                                         items(availableLabels) { label ->
                                             val isSelected = selectedLabelName == label.labelName
                                             val labelCount = labelCounts[label.labelName] ?: 0
                                             FilterChip(
                                                 selected = isSelected,
                                                 onClick = { selectedLabelName = if (isSelected) null else label.labelName },
-                                                label = { Text(label.labelName, style = MaterialTheme.typography.labelSmall) }
+                                                label = {
+                                                    Text("%1\$s (%2\$d)".format(label.labelName, labelCount), style = chipTextStyle)
+                                                },
+                                                modifier = Modifier.height(28.dp)
                                             )
                                         }
+                                    }
+                                } else {
+                                    val options = if (filterMode == ContactFilterMode.AGGREGATION) {
+                                        availableAggregationOptions
                                     } else {
-                                        val options = if (filterMode == ContactFilterMode.AGGREGATION) {
-                                            availableAggregationOptions
-                                        } else {
-                                            availableGroupingOptions
-                                        }
+                                        availableGroupingOptions
+                                    }
+                                    // 与标签分组同理: 没有可选项时连「不限」一起隐藏。
+                                    if (hasFilterModeOptions) {
                                         item {
                                             val isSelected = if (filterMode == ContactFilterMode.AGGREGATION) {
                                                 selectedAggregationId == null
@@ -646,7 +687,8 @@ fun BaseContactSelector(
                                                         selectedGroupingId = null
                                                     }
                                                 },
-                                                label = { Text("全部", style = MaterialTheme.typography.labelSmall) },
+                                                label = { Text("不限", style = chipTextStyle) },
+                                                modifier = Modifier.height(28.dp)
                                             )
                                         }
                                         items(options, key = { it.id }) { option ->
@@ -662,7 +704,8 @@ fun BaseContactSelector(
                                                         selectedGroupingId = if (isSelected) null else option.id
                                                     }
                                                 },
-                                                label = { Text(option.name, style = MaterialTheme.typography.labelSmall) },
+                                                label = { Text("%1\$s (%2\$d)".format(option.name, count), style = chipTextStyle) },
+                                                modifier = Modifier.height(28.dp)
                                             )
                                         }
                                     }
@@ -670,112 +713,113 @@ fun BaseContactSelector(
                             }
                         }
 
-                        // 第二行：排序方式 + 全选/全不选/反选
-                        if (SortMode.entries.isNotEmpty() || onSelectAll != null || onDeselectAll != null || onInvertSelection != null) {
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                contentPadding = PaddingValues(horizontal = 4.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                SortMode.entries.forEach { mode ->
-                                    item {
-                                        val displayName = mode.displayNameRes(sortReversed)
-                                        FilterChip(
-                                            selected = sortMode == mode,
-                                            enabled = !isSortLoading,
-                                            onClick = { switchSortMode(mode) },
-                                            label = { Text(displayName, style = MaterialTheme.typography.labelSmall) },
-                                            leadingIcon = {
-                                                if (isSortLoading && mode == SortMode.LAST_MESSAGE_TIME) {
-                                                    CircularProgressIndicator(
-                                                        modifier = Modifier.size(14.dp),
-                                                        strokeWidth = 2.dp
-                                                    )
-                                                } else {
-                                                    Icon(
-                                                        imageVector = mode.icon,
-                                                        contentDescription = displayName,
-                                                        modifier = Modifier.size(14.dp)
-                                                    )
-                                                }
-                                            },
-                                            modifier = Modifier.height(28.dp)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp)
+                                .padding(bottom = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SortMode.entries.forEach { mode ->
+                                val displayName = mode.displayName(sortReversed)
+                                FilterChip(
+                                    selected = sortMode == mode,
+                                    onClick = { switchSortMode(mode) },
+                                    label = { Text(displayName, style = chipTextStyle) },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = mode.icon,
+                                            contentDescription = displayName,
+                                            modifier = Modifier.size(16.dp)
                                         )
-                                    }
-                                }
-                                if (!isSortLoading) {
-                                    item {
-                                        FilterChip(
-                                            selected = sortReversed,
-                                            enabled = !isSortLoading,
-                                            onClick = { sortReversed = !sortReversed },
-                                            label = {
-                                                Icon(
-                                                    imageVector = MaterialSymbols.Outlined.Swap_vert,
-                                                    contentDescription = "切换排序方向",
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            },
-                                            modifier = Modifier.height(28.dp)
-                                        )
-                                    }
-                                }
-                                if (onSelectAll != null) {
-                                    item {
-                                        FilterChip(
-                                            selected = false,
-                                            onClick = { onSelectAll(displayedContacts) },
-                                            label = { Text("全选", style = MaterialTheme.typography.labelSmall) },
-                                            leadingIcon = {
-                                                Icon(
-                                                    imageVector = MaterialSymbols.Outlined.Select_all,
-                                                    contentDescription = "全选",
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            },
-                                            modifier = Modifier.height(28.dp)
-                                        )
-                                    }
-                                }
-                                if (onDeselectAll != null) {
-                                    item {
-                                        FilterChip(
-                                            selected = false,
-                                            onClick = { onDeselectAll(displayedContacts) },
-                                            label = { Text("全不选", style = MaterialTheme.typography.labelSmall) },
-                                            leadingIcon = {
-                                                Icon(
-                                                    imageVector = MaterialSymbols.Outlined.Deselect,
-                                                    contentDescription = "全不选",
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            },
-                                            modifier = Modifier.height(28.dp)
-                                        )
-                                    }
-                                }
-                                if (onInvertSelection != null) {
-                                    item {
-                                        FilterChip(
-                                            selected = false,
-                                            onClick = { onInvertSelection(displayedContacts) },
-                                            label = { Text("反选", style = MaterialTheme.typography.labelSmall) },
-                                            leadingIcon = {
-                                                Icon(
-                                                    imageVector = MaterialSymbols.Outlined.Compare_arrows,
-                                                    contentDescription = "反选",
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            },
-                                            modifier = Modifier.height(28.dp)
-                                        )
-                                    }
-                                }
+                                    },
+                                    modifier = Modifier.height(28.dp)
+                                )
                             }
+
+                            FilterChip(
+                                selected = sortReversed,
+                                onClick = { sortReversed = !sortReversed },
+                                label = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Swap_vert,
+                                        contentDescription = "切换排序方向",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                modifier = Modifier.height(28.dp)
+                            )
                         }
+
+                    }
+                }
+
+                // 全选 / 全不选 / 反选常驻显示, 不被「折叠筛选」收起。
+                if (onSelectAll != null || onDeselectAll != null || onInvertSelection != null) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp)
+                            .padding(bottom = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        onSelectAll?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("全选", style = chipTextStyle) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Select_all,
+                                        contentDescription = "全选",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                modifier = Modifier.height(28.dp)
+                            )
+                        }
+                        onDeselectAll?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("全不选", style = chipTextStyle) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Deselect,
+                                        contentDescription = "全不选",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                modifier = Modifier.height(28.dp)
+                            )
+                        }
+                        onInvertSelection?.let {
+                            FilterChip(
+                                selected = false,
+                                onClick = { it(displayedContacts) },
+                                label = { Text("反选", style = chipTextStyle) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Outlined.Compare_arrows,
+                                        contentDescription = "反选",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                modifier = Modifier.height(28.dp)
+                            )
+                        }
+
+                        // 已选数量靠右显示, 不再挤占确定按钮 (原实现按钮文字被截断成 "确定 (")
+                        Spacer(modifier = Modifier.weight(1f))
+                        Text(
+                            text = "已选 $selectedCount",
+                            style = chipTextStyle,
+                            maxLines = 1,
+                            softWrap = false,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
 
@@ -855,11 +899,13 @@ fun BaseContactSelector(
 
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(
-                                                text = contact.displayName,
+                                                text = contact.selectorName,
                                                 style = MaterialTheme.typography.bodyLarge
                                             )
                                             Text(
-                                                text = subtitleProvider?.invoke(contact) ?: contact.wxId,
+                                                text = subtitleProvider?.invoke(contact)
+                                                    ?: (if (contact is WeContact) contact.nickname else null)?.takeIf { it.isNotBlank() }
+                                                    ?: "",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
@@ -924,19 +970,21 @@ fun BaseContactSelector(
                 }
             }
         },
-        confirmButton = {
-            Button(
-                onClick = onConfirm,
-                enabled = confirmButtonEnabled
-            ) {
-                Text(confirmButtonText)
-            }
-        },
         dismissButton = {
             TextButton(onDismiss) {
                 Text(dismissButtonText ?: "取消")
             }
-        }
+        },
+        confirmButton = if (showConfirmButton) {
+            {
+                Button(
+                    onClick = onConfirm,
+                    enabled = confirmButtonEnabled
+                ) {
+                    Text(confirmButtonText)
+                }
+            }
+        } else null
     )
 }
 
@@ -1004,7 +1052,7 @@ fun ContactsSelector(
         onSearchQueryChange = { searchQuery = it },
         filteredContacts = filteredContacts,
         allContacts = contacts,
-        confirmButtonText = "确定 (".format(selectedWxIds.size),
+        confirmButtonText = "确定",
         confirmButtonEnabled = true,
         onDismiss = onDismiss,
         onConfirm = { onConfirm(selectedWxIds) },
@@ -1060,13 +1108,23 @@ private class SortableContact(
  * 调用方只在联系人列表变化时调用一次, 搜索时改用 [filterSortedContacts] 在已排好序的
  * 列表上做纯字符串过滤, 避免每敲一个字就在主线程上重跑一遍 ICU 排序。
  */
+/**
+ * 选择器里代表联系人的名字: 有备注就用备注, 没备注才用昵称。
+ *
+ * 不能用 displayName —— 它是 "备注 (昵称)" 的拼合形式, 会把昵称混进展示 / 排序 /
+ * 分组首字母 / 搜索, 与「以备注为准」冲突。展示、排序、分组、搜索必须统一用它,
+ * 只改其中一处会留下"显示的是备注、却按昵称命中"的错位感。
+ */
+private val IWeContact.selectorName: String
+    get() = (this as? WeContact)?.remarkName?.takeIf { it.isNotBlank() } ?: nickname
+
 private fun sortContactsByDisplayName(contacts: List<IWeContact>): List<IWeContact> {
     if (contacts.size < 2) return contacts
     val collator = Collator.getInstance(Locale.CHINA)
     val keyCache = HashMap<String, CollationKey>()
     return contacts
         .map { contact ->
-            val name = contact.displayName
+            val name = contact.selectorName
             SortableContact(
                 contact = contact,
                 isBlankName = name.isBlank(),
@@ -1078,12 +1136,63 @@ private fun sortContactsByDisplayName(contacts: List<IWeContact>): List<IWeConta
 }
 
 /**
- * 在已排好序的列表上过滤。过滤保序, 所以结果与"先过滤再排序"完全一致。
+ * 搜索不再只看 displayName / wxId, 还覆盖:
+ * - 备注 (remarkName)
+ * - 昵称拼音全拼 (nicknamePinyin) 与首字母 (initialNickname, 来自微信数据库)
+ * - 备注 / 昵称的拼音全拼与首字母 (用 ICU 现转, 设备不支持时跳过)
+ *
+ * 拼成一段小写 blob, 查询串在 blob 里 contains 即命中。首字母 (如 "zhs") 也作为一段
+ * 拼进 blob, 所以输入首字母也能命中 (纯 contains 即可, 不必单独比前缀)。
  */
+private val pinyinTransliterator: Transliterator? by lazy {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Transliterator.getInstance("Han-Latin; Any-Latin; Latin-ASCII")
+        } else {
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun toPinyin(str: String): String {
+    val t = pinyinTransliterator ?: return ""
+    return synchronized(t) { t.transliterate(str) }.lowercase()
+}
+
+private fun pinyinInitials(str: String): String {
+    val full = toPinyin(str)
+    if (full.isEmpty()) return ""
+    return full.split(Regex("[^a-z]+"))
+        .filter { it.isNotEmpty() }
+        .joinToString("") { it.first().toString() }
+}
+
+private val searchBlobCache = ConcurrentHashMap<String, String>()
+
+private fun buildSearchBlob(contact: IWeContact): String {
+    val sb = StringBuilder()
+    // 「以备注为准」: 有备注就只认备注, 没备注才退到昵称(否则没备注的联系人根本搜不到)。
+    // 因此昵称的 nicknamePinyin / initialNickname 一律不进索引 —— 否则给某人设了备注之后
+    // 还能用他的旧昵称搜到他, 正是用户不要的行为。
+    val name = contact.selectorName
+    sb.append(name).append(' ')
+    sb.append(toPinyin(name)).append(' ')
+    sb.append(pinyinInitials(name)).append(' ')
+    // 微信 wxid 不再参与搜索/筛选 (界面也不展示), 仅对自定义微信号做精确兜底。
+    if (contact is WeContact && contact.customWxId.isNotBlank()) {
+        sb.append(contact.customWxId).append(' ')
+    }
+    return sb.toString().lowercase()
+}
+
 private fun filterSortedContacts(sorted: List<IWeContact>, query: String): List<IWeContact> {
     if (query.isEmpty()) return sorted
+    val q = query.lowercase().trim()
+    if (q.isEmpty()) return sorted
     return sorted.filter {
-        it.displayName.contains(query, ignoreCase = true) ||
-                it.wxId.contains(query, ignoreCase = true)
+        // wxId 是稳定主键, 每个联系人只算一次 blob 并缓存, 避免每次按键都对备注做 ICU 转写。
+        searchBlobCache.getOrPut(it.wxId) { buildSearchBlob(it) }.contains(q)
     }
 }

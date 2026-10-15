@@ -465,12 +465,12 @@ object ScheduledMessage : ClickableFeature() {
         val job = scope.launch {
             try {
                 val deadline = ScheduledMessageDeadline(next)
-                while (isActive) {
+                while (coroutineContext.isActive) {
                     val waitMs = deadline.nextWaitMillis(System.currentTimeMillis(), System.nanoTime())
                     if (waitMs == 0L) break
                     if (waitMs > 0) delay(waitMs)
                 }
-                if (isActive) handleScheduleTrigger(schedule.id, "timer")
+                if (coroutineContext.isActive) handleScheduleTrigger(schedule.id, "timer")
             } catch (e: CancellationException) {
                 // 任务被取消（停用/删除/重设闹钟）
             } catch (e: Throwable) {
@@ -529,6 +529,7 @@ object ScheduledMessage : ClickableFeature() {
     private suspend fun handleScheduleTrigger(scheduleId: String, source: String, receivedAtMs: Long = 0) {
         if (!isActive) return
         val probeEntryNs = SystemClock.elapsedRealtimeNanos()
+        val entryUptimeMs = SystemClock.uptimeMillis()
         val schedule = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
 
         if (!schedule.enabled) return
@@ -549,6 +550,8 @@ object ScheduledMessage : ClickableFeature() {
             // 拿过期 lastFiredDate 判重会放行成重复发送
             val fresh = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
             if (!fresh.enabled || !isActive) return
+            // 恢复事件可能与计时器并发；旧触发者不能提前执行已被另一通道重排的任务。
+            if (fresh.nextSendTime != schedule.nextSendTime) return
             // 当天已成功发过: 只推进排期, 不再重复发送
             if (fresh.lastFiredDate == todayKey()) {
                 WeLogger.i(TAG, "schedule ${fresh.id} already fired today, advancing schedule only")
@@ -581,7 +584,7 @@ object ScheduledMessage : ClickableFeature() {
             // 延迟探针: 唤醒漂移(正值=晚于到点)与 触发入口→发送返回 耗时, 验收 <=5ms 用
             WeLogger.i(
                 TAG,
-                "${WeLogger.FORK_LOG_PREFIX} trigger ${fresh.id} probe: source=$source, wakeDrift=${nowMs - fresh.nextSendTime}ms, entryToSend=${entryToSendUs}us, sent=$sentOk, alarmReceivedAt=$receivedAtMs, wall=$nowMs, elapsed=${SystemClock.elapsedRealtime()}, uptime=${SystemClock.uptimeMillis()}"
+                "${WeLogger.FORK_LOG_PREFIX} trigger ${fresh.id} probe: source=$source, wakeDrift=${nowMs - fresh.nextSendTime}ms, entryToSend=${entryToSendUs}us, sent=$sentOk, alarmReceivedAt=$receivedAtMs, wall=$nowMs, elapsed=${probeEntryNs / 1_000_000L}, uptime=$entryUptimeMs"
             )
             advanceAfterTrigger(fresh, sentOk)
         } finally {

@@ -11,165 +11,68 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.Johnny.wcx.dexkit.DexAdaptTask
 import com.Johnny.wcx.dexkit.abc.IResolveDex
-import com.Johnny.wcx.dexkit.cache.DexCacheManager
-import com.Johnny.wcx.dexkit.resolution.resolveAllDex
-import com.Johnny.wcx.features.core.BaseFeature
-import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.android.copyToClipboard
 import com.Johnny.wcx.utils.android.showToast
-import com.Johnny.wcx.utils.reflection.DexKit
 import com.Johnny.wcx.utils.restartHost
-import com.Johnny.wcx.utils.unreachable
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.asFlow
-import kotlinx.coroutines.flow.buffer
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.launch
-import org.luckypray.dexkit.DexKitBridge
 import java.io.PrintWriter
 import java.io.StringWriter
 
-private sealed class ScanProgress {
-    data class Start(val displayName: String) : ScanProgress()
-    data class Complete(val displayName: String) : ScanProgress()
-    data class Failed(val displayName: String, val error: Exception) : ScanProgress()
-}
-
-private sealed class ScanResult {
-    data class Success(val displayName: String) : ScanResult()
-    data class Failed(val displayName: String, val error: Exception) : ScanResult()
-}
-
-private sealed class DialogPhase {
-    object Idle : DialogPhase()
-    object Scanning : DialogPhase()
-    data class Done(val failed: List<ScanResult.Failed>) : DialogPhase()
-    data class Error(val message: String) : DialogPhase()
-}
-
-private val TAG = "DexResolver"
-
+/**
+ * DEX 适配进度对话框 —— **纯观察者**。
+ *
+ * v284 起扫描由 [DexAdaptTask] 在进程级协程里跑，本对话框只订阅它的 `state`：
+ *  - 打开即自动开始适配（不再需要点「开始适配」）；
+ *  - 随时可以关闭，**适配会在后台继续**（旧实现一关窗口/一切后台，用户就以为停了）；
+ *  - 关掉后再打开、或微信下次启动，仍能看到最新进度与结果。
+ */
 @Composable
 fun DexResolver(
     context: Context,
     outdatedItems: List<IResolveDex>,
-    scope: CoroutineScope,
     dismiss: () -> Unit
 ) {
-    var phase by remember { mutableStateOf<DialogPhase>(DialogPhase.Idle) }
-    var currentTask by remember { mutableStateOf("正在适配...") }
-    var completed by remember { mutableIntStateOf(0) }
-    val scanResults = remember { mutableStateMapOf<String, ScanResult>() }
+    val state by DexAdaptTask.state.collectAsState()
 
-    fun updateProgress(progress: ScanProgress) {
-        when (progress) {
-            is ScanProgress.Complete -> {
-                scanResults[progress.displayName] = ScanResult.Success(progress.displayName)
-                completed = scanResults.size
-                currentTask = "已完成: ${progress.displayName}"
-            }
-
-            is ScanProgress.Failed -> {
-                scanResults[progress.displayName] = ScanResult.Failed(progress.displayName, progress.error)
-                completed = scanResults.size
-                currentTask = "失败: ${progress.displayName}"
-            }
-
-            else -> {}
-        }
+    // 打开即启动；start 是幂等的，且任务本身与这个 composition 无关，
+    // 因此本 effect 被取消（关窗）也不会停掉扫描。
+    LaunchedEffect(Unit) {
+        DexAdaptTask.start(outdatedItems)
     }
 
-    suspend fun scanItem(
-        item: IResolveDex,
-        dexKit: DexKitBridge,
-        progressChannel: Channel<ScanProgress>
-    ): ScanResult {
-        val displayName = if (item is BaseFeature) item.displayName else unreachable()
-        return try {
-            progressChannel.send(ScanProgress.Start(displayName))
-
-            item.resolveAllDex(dexKit)
-
-            DexCacheManager.saveItemCache(item)
-
-            // 保存后复检：若校验仍不通过（如部分委托未解析出任何结果），如实上报失败，
-            // 而不是显示"成功"后下次启动又弹"需要更新 DEX 缓存"的死循环
-            if (!DexCacheManager.isItemCacheValid(item)) {
-                val unresolvedKeys = item.dexDelegates
-                    .filter { it.getDescriptorString().isNullOrEmpty() }
-                    .joinToString(", ") { it.key }
-                throw IllegalStateException(
-                    if (unresolvedKeys.isEmpty()) "缓存写入后校验未通过"
-                    else "缓存写入后校验未通过，以下委托未解析出结果（当前微信版本可能缺少对应符号）: $unresolvedKeys"
-                )
-            }
-
-            progressChannel.send(ScanProgress.Complete(displayName))
-            ScanResult.Success(displayName)
-        } catch (e: Exception) {
-            WeLogger.e(TAG, "failed to scan: $displayName", e)
-            progressChannel.send(ScanProgress.Failed(displayName, e))
-            ScanResult.Failed(displayName, e)
-        }
+    // v293: 登记「进度窗口可见」。适配结束时 [DexAdaptTask] 据此决定要不要补一个
+    // 完成弹窗 —— 窗口还开着就由它自己显示完成态，用户关掉了才另弹。
+    DisposableEffect(Unit) {
+        DexAdaptTask.progressWindowVisible.set(true)
+        onDispose { DexAdaptTask.progressWindowVisible.set(false) }
     }
 
-    fun startScanning() {
-        phase = DialogPhase.Scanning
-        scope.launch {
-            try {
-                val progressChannel = Channel<ScanProgress>(Channel.UNLIMITED)
-
-                // progress consumer on Main
-                launch(Dispatchers.Main) {
-                    for (p in progressChannel) updateProgress(p)
-                }
-
-                // parallel scan — same flow/buffer/async structure
-                val results = outdatedItems.asFlow()
-                    .map { item ->
-                        async(Dispatchers.IO) {
-                            scanItem(
-                                item,
-                                DexKit,
-                                progressChannel
-                            )
-                        }
-                    }
-                    .buffer(8)
-                    .map { it.await() }
-                    .toList()
-
-                progressChannel.close()
-
-                val failed = results.filterIsInstance<ScanResult.Failed>()
-                phase = DialogPhase.Done(failed)
-            } catch (e: Exception) {
-                WeLogger.e(TAG, "scanning failed", e)
-                phase = DialogPhase.Error("扫描过程中发生未知错误: ${e.message}")
-            }
-        }
+    // v293: 窗口自己就是完成提示（自带「重启微信」按钮），认领掉，
+    // 免得 FeaturesLoader 的监听协程再弹一个重复的。
+    LaunchedEffect(state.finished) {
+        if (state.finished) DexAdaptTask.claimCompletionPrompt()
     }
+
+    val total = if (state.total > 0) state.total else outdatedItems.size
+    val running = state.running
+    val failed = state.failed
 
     Surface(
         shape = MaterialTheme.shapes.extraLarge,
@@ -184,7 +87,6 @@ fun DexResolver(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Title with icon
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -196,14 +98,13 @@ fun DexResolver(
                     fontWeight = FontWeight.Bold
                 )
 
-                // Badge showing count
-                if (phase is DialogPhase.Idle || phase is DialogPhase.Scanning) {
+                if (running || !state.finished) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = MaterialTheme.colorScheme.primaryContainer
                     ) {
                         Text(
-                            text = "${outdatedItems.size}",
+                            text = "$total",
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -215,78 +116,142 @@ fun DexResolver(
 
             HorizontalDivider()
 
-            // Tip text
-            val tipText = when (val p = phase) {
-                is DialogPhase.Idle ->
-                    "检测到 ${outdatedItems.size} 个功能需要更新 DEX 缓存, 开始适配后将自动扫描并更新。" +
-                            "若直接关闭对话框, 相关功能将不会被加载"
+            val tipText = when {
+                running ->
+                    "正在后台适配 ${state.completed}/$total。点空白处或返回键可关闭本窗口, " +
+                            "适配会在后台继续, 完成后重启微信生效"
 
-                is DialogPhase.Scanning -> null
-                is DialogPhase.Done ->
-                    if (p.failed.isEmpty()) "适配完成! 所有功能已成功更新 DEX 缓存"
-                    else "适配完成, 但有 ${p.failed.size} 个功能失败 (不影响其他功能使用)"
+                state.finished && failed.isEmpty() ->
+                    "适配完成! 所有功能已成功更新 DEX 缓存"
 
-                is DialogPhase.Error -> p.message
+                state.finished && failed.isNotEmpty() ->
+                    "适配完成, 但有 ${failed.size} 个功能失败 (不影响其他功能使用)"
+
+                else ->
+                    "检测到 $total 个功能需要更新 DEX 缓存, 正在启动扫描…"
             }
-            if (tipText != null) {
-                Text(text = tipText, style = MaterialTheme.typography.bodyMedium)
-            }
+            Text(text = tipText, style = MaterialTheme.typography.bodyMedium)
 
-            // Progress
-            AnimatedVisibility(visible = phase is DialogPhase.Scanning) {
+            AnimatedVisibility(visible = running) {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(text = currentTask, style = MaterialTheme.typography.bodyMedium)
+                    Text(text = state.current, style = MaterialTheme.typography.bodyMedium)
                     LinearWavyProgressIndicator(
-                        progress = { if (outdatedItems.isEmpty()) 0f else completed.toFloat() / outdatedItems.size },
+                        progress = {
+                            if (total == 0) 0f else state.completed.toFloat() / total
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         amplitude = { progress ->
-                            if (progress == 0f || progress == 1f) {
-                                0f
-                            } else {
-                                1f
-                            }
+                            if (progress == 0f || progress == 1f) 0f else 1f
                         }
                     )
                     Text(
-                        text = "总进度: $completed/${outdatedItems.size}",
+                        text = "总进度: ${state.completed}/$total",
                         style = MaterialTheme.typography.labelSmall
                     )
                     LinearWavyProgressIndicator(modifier = Modifier.fillMaxWidth()) // indeterminate sub-bar
                 }
             }
 
-            // Error details (Done with failures)
-            val donePhase = phase as? DialogPhase.Done
-            AnimatedVisibility(visible = donePhase?.failed?.isNotEmpty() == true) {
-                donePhase?.failed?.let { failed ->
-                    ErrorDetailsSection(
-                        failedResults = failed,
-                        onCopy = {
-                            val report = buildErrorReport(failed)
-                            copyToClipboard(context, report)
-                            showToast(context, "已复制")
-                        }
-                    )
-                }
+            AnimatedVisibility(visible = failed.isNotEmpty()) {
+                ErrorDetailsSection(
+                    failedResults = failed,
+                    onCopy = {
+                        copyToClipboard(context, buildErrorReport(failed))
+                        showToast(context, "已复制")
+                    }
+                )
             }
 
-            // Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
             ) {
-                if (phase !is DialogPhase.Scanning) {
-                    TextButton(onClick = dismiss) { Text("关闭") }
+                when {
+                    // v292: 去掉「后台运行」按钮 —— 适配本来就在后台跑, 这个按钮只会让人以为
+                    // 点了才会切到后台。要关窗口直接点空白处 / 返回键 (见 showComposeDialog
+                    // 的 directlyDismissable), 进度不受影响。
+                    running -> Unit
+
+                    state.finished -> {
+                        TextButton(onClick = dismiss) { Text("关闭") }
+                        Button(onClick = {
+                            dismiss()
+                            restartHost()
+                        }) { Text("重启微信") }
+                    }
+
+                    else -> TextButton(onClick = dismiss) { Text("关闭") }
                 }
-                if (phase is DialogPhase.Idle) {
-                    Button(onClick = ::startScanning) { Text("开始适配") }
-                }
-                if (phase is DialogPhase.Done || phase is DialogPhase.Error) {
-                    Button(onClick = {
-                        dismiss()
-                        restartHost()
-                    }) { Text("重启微信") }
-                }
+            }
+        }
+    }
+}
+
+/**
+ * v293: 适配**完成弹窗** —— 用户关掉进度窗口后，适配跑完时由
+ * [com.Johnny.wcx.features.core.FeaturesLoader] 补弹的这个。
+ *
+ * v292 把进度窗口改成「可直接关闭」后出现一个断档：适配完成时只剩一条 Toast
+ * （“DEX 适配完成，重启微信后生效”），没有「重启微信」按钮，用户看完文字并不知道
+ * 去哪重启。这个弹窗就是补上那个动作入口：进度窗口还开着时不会弹（窗口自己带按钮），
+ * 只有被用户关掉了才由 [DexAdaptTask.claimCompletionPrompt] 认领后弹出。
+ */
+@Composable
+fun DexAdaptCompletion(
+    context: Context,
+    total: Int,
+    success: Int,
+    failed: List<DexAdaptTask.AdaptItemState>,
+    dismiss: () -> Unit
+) {
+    Surface(
+        shape = MaterialTheme.shapes.extraLarge,
+        tonalElevation = 6.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(24.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "DEX 适配完成",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold
+            )
+
+            HorizontalDivider()
+
+            Text(
+                text = if (failed.isEmpty()) {
+                    "已成功更新 $success/$total 个功能的 DEX 缓存, 重启微信后生效。"
+                } else {
+                    "已更新 $success/$total 个功能, 但有 ${failed.size} 个失败 " +
+                        "(不影响其他功能使用), 重启微信后生效。"
+                },
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            if (failed.isNotEmpty()) {
+                ErrorDetailsSection(
+                    failedResults = failed,
+                    onCopy = {
+                        copyToClipboard(context, buildErrorReport(failed))
+                        showToast(context, "已复制")
+                    }
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+            ) {
+                TextButton(onClick = dismiss) { Text("稍后再说") }
+                Button(onClick = {
+                    dismiss()
+                    restartHost()
+                }) { Text("重启微信") }
             }
         }
     }
@@ -294,7 +259,7 @@ fun DexResolver(
 
 @Composable
 private fun ErrorDetailsSection(
-    failedResults: List<ScanResult.Failed>,
+    failedResults: List<DexAdaptTask.AdaptItemState>,
     onCopy: () -> Unit
 ) {
     Surface(
@@ -308,8 +273,8 @@ private fun ErrorDetailsSection(
         ) {
             val errorText = buildString {
                 failedResults.forEachIndexed { i, r ->
-                    append("${i + 1}. ${r.displayName}\n")
-                    append("   错误: ${r.error.message}\n\n")
+                    append("${i + 1}. ${r.name}\n")
+                    append("   错误: ${r.message}\n\n")
                 }
             }
             Text(
@@ -326,14 +291,15 @@ private fun ErrorDetailsSection(
     }
 }
 
-private fun buildErrorReport(failedResults: List<ScanResult.Failed>) = buildString {
+private fun buildErrorReport(failedResults: List<DexAdaptTask.AdaptItemState>) = buildString {
     append("=== WCX Dex 扫描错误报告 ===\n\n")
     failedResults.forEachIndexed { i, r ->
-        append("${i + 1}. ${r.displayName}\n")
-        append("   错误信息: ${r.error.message}\n")
+        append("${i + 1}. ${r.name}\n")
+        append("   错误信息: ${r.message}\n")
+        append("   耗时: ${r.elapsedMs}ms\n")
         append("   堆栈跟踪:\n")
         val sw = StringWriter()
-        r.error.printStackTrace(PrintWriter(sw))
+        Exception(r.message).printStackTrace(PrintWriter(sw))
         append(sw.toString())
         append("\n\n")
     }

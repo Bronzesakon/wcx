@@ -12,9 +12,11 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         maven { url = uri("file:///root/maven-mirror") }
-        // JitPack 必须排在通用镜像之前, 且通用镜像要显式排除这些组:
-        // 部分镜像会残留这些组的元数据却没有构件文件, Gradle 一旦在镜像处
-        // 命中模块描述符就不会再尝试其他仓库, 导致 CI 端解析失败
+        // jitpack 必须排在通用镜像之前: 腾讯镜像会返回 com.github.* 的模块元数据, 但产物
+        // jar 对 GitHub Actions runner 不可达 (2026-10-13 实测 sync-upstream 连续两次
+        // "Could not find rhino-45f29f6.jar, searched in mirrors.cloud.tencent.com",
+        // 同一 URL 本地代理访问却正常)。元数据一旦从镜像拿到, Gradle 就不会再回退
+        // jitpack, 构建直接失败。镜像侧再加 excludeGroup 双保险。
         maven("https://jitpack.io") {
             content {
                 includeGroup("com.github.Ujhhgtg")

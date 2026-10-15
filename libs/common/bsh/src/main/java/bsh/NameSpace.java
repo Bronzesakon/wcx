@@ -296,10 +296,8 @@ public class NameSpace
             VariableHookParam.ACCESS_WRITE,
             false, Thread.currentThread().getStackTrace());
         Interpreter.bshHookManager.fireBeforeVariable(hookParam);
-        if (hookParam.isIntercepted()) {
-            Interpreter.bshHookManager.fireAfterVariable(hookParam);
+        if (hookParam.isIntercepted())
             return null;
-        }
         value = hookParam.getValue();
 
         // Locate the variable definition if it exists.
@@ -307,7 +305,6 @@ public class NameSpace
         // Found an existing variable here (or above if recurse allowed)
         if ( existing != null ) {
             existing.setValue( value, Variable.ASSIGNMENT );
-            Interpreter.bshHookManager.fireAfterVariable(hookParam);
             return existing;
         } else {
             // No previous variable definition found here (or above if recurse)
@@ -323,7 +320,6 @@ public class NameSpace
                     null/* modifiers */);
             this.variables.put(name, var);
             this.nameSpaceChanged();
-            Interpreter.bshHookManager.fireAfterVariable(hookParam);
             return var;
         }
     }
@@ -399,10 +395,8 @@ public class NameSpace
             VariableHookParam.ACCESS_WRITE,
             false, Thread.currentThread().getStackTrace());
         Interpreter.bshHookManager.fireBeforeVariable(hookParam);
-        if (hookParam.isIntercepted()) {
-            Interpreter.bshHookManager.fireAfterVariable(hookParam);
+        if (hookParam.isIntercepted())
             return;
-        }
         value = hookParam.getValue();
 
         // Locate the variable definition if it exists.
@@ -424,10 +418,8 @@ public class NameSpace
             final boolean setProp = this.attemptSetPropertyValue(name, value,
                     null != thisReference ? thisReference.declaringInterpreter
                     : null);
-            if (setProp) {
-                Interpreter.bshHookManager.fireAfterVariable(hookParam);
+            if (setProp)
                 return;
-            }
             // If recurse, set global untyped var, else set it here.
             // NameSpace varScope = recurse ? getGlobal() : this;
             // This modification makes default allocation local
@@ -436,7 +428,6 @@ public class NameSpace
                     this.createVariable(name, value, null/* modifiers */));
             this.nameSpaceChanged();
         }
-        Interpreter.bshHookManager.fireAfterVariable(hookParam);
     }
 
     /** Creates the variable.
@@ -675,15 +666,15 @@ public class NameSpace
         Interpreter.debug("Get variable: ", name, " = ", var);
         if (var == null)
             return Primitive.VOID;
+        Object result = this.unwrapVariable(var);
         VariableHookParam hookParam = new VariableHookParam(
-            name, var.getType(), null, null,
+            name, var.getType(), null, result,
             VariableHookParam.ACCESS_READ,
             false, Thread.currentThread().getStackTrace());
         Interpreter.bshHookManager.fireBeforeVariable(hookParam);
-        if (!hookParam.isIntercepted())
-            hookParam.setReturnValue(this.unwrapVariable(var));
-        Interpreter.bshHookManager.fireAfterVariable(hookParam);
-        return hookParam.getReturnValue();
+        if (hookParam.isIntercepted())
+            return hookParam.getReturnValue();
+        return result;
     }
 
     /** Locate a variable and return the Variable object with optional recursion

@@ -66,6 +66,46 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Check scheduled-message timing
+        shell: pwsh
+        run: ./scripts/check-scheduled-message-timing.ps1
+
+      # v293 的音频等功能依赖 Rust 原生库；Gradle 打包前必须按所选 ABI 构建。
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Prepare native build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_version=$(sed -n 's/^ndk = "\([^"]*\)"/\1/p' gradle/libs.versions.toml)
+          test -n "$ndk_version"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-multilib libclang-dev pkg-config
+
+      - name: Build native library
+        shell: bash
+        env:
+          FULL_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+        run: |
+          set -euo pipefail
+          cargo xtask configure
+          if [ "$FULL_BUILD" = "true" ]; then
+            cargo xtask build --native-only
+            test -s app/src/main/jniLibs/armeabi-v7a/libwekit_native.so
+          else
+            cargo xtask build --native-only --abi arm64-v8a
+          fi
+          test -s app/src/main/jniLibs/arm64-v8a/libwekit_native.so
+
       # Gradle 缓存由 setup-gradle 自带；这里只补 wrapper 下载缓存已在其中，
       # 不额外缓存 build/ —— APK 产物本身不缓存。
 

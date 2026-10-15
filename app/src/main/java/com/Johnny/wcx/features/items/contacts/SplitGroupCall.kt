@@ -317,7 +317,7 @@ object SplitGroupCall : ClickableFeature(), IContactInfoProvider, IResolveDex {
     }
 
     override fun onClick(context: ComponentActivity) {
-        showComposeDialog(context) {
+        showComposeDialog(context, fullScreen = true) {
             SingleContactSelector(
                 ("分裂群组通话"),
                 WeDatabaseApi.getGroups(),
@@ -505,7 +505,7 @@ object SplitGroupCall : ClickableFeature(), IContactInfoProvider, IResolveDex {
                 WeLogger.e(TAG, "split group call batch aborted", e)
             } finally {
                 runCatching {
-                    DeleteSplitGroupChats.deleteFakeGroups(generatedIds)
+                    DeleteFakeGroups.deleteFakeGroups(generatedIds)
                 }.onFailure { e ->
                     cleanupFailed = true
                     WeLogger.e(TAG, "failed to clean generated fake groups", e)

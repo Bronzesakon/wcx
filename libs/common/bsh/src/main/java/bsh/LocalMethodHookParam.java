@@ -6,8 +6,6 @@ package bsh;
  * in the local namespace.
  */
 public class LocalMethodHookParam {
-    private final Interpreter interpreter;
-    private final NameSpace invocationNameSpace;
     private final String methodName;
     private final Class<?>[] paramTypes;
     private final Object[] args;
@@ -15,14 +13,12 @@ public class LocalMethodHookParam {
     private Object returnValue;
     private boolean isIntercepted;
     private final StackTraceElement[] callStack;
+    private final Interpreter interpreter;
 
     public LocalMethodHookParam(
-            Interpreter interpreter, NameSpace invocationNameSpace,
             String methodName, Class<?>[] paramTypes, Object[] args,
             Class<?> returnType, Object returnValue, boolean isIntercepted,
-            StackTraceElement[] callStack) {
-        this.interpreter = interpreter;
-        this.invocationNameSpace = invocationNameSpace;
+            StackTraceElement[] callStack, Interpreter interpreter) {
         this.methodName = methodName;
         this.paramTypes = paramTypes;
         this.args = args;
@@ -30,19 +26,11 @@ public class LocalMethodHookParam {
         this.returnValue = returnValue;
         this.isIntercepted = isIntercepted;
         this.callStack = callStack;
+        this.interpreter = interpreter;
     }
 
-    public LocalMethodHookParam(
-            String methodName, Class<?>[] paramTypes, Object[] args,
-            Class<?> returnType, Object returnValue, boolean isIntercepted,
-            StackTraceElement[] callStack) {
-        this(null, null, methodName, paramTypes, args, returnType,
-                returnValue, isIntercepted, callStack);
-    }
+    // --- getters ---
 
-
-    public Interpreter getInterpreter() { return interpreter; }
-    public NameSpace getInvocationNameSpace() { return invocationNameSpace; }
     public String getMethodName() { return methodName; }
     public Class<?>[] getParamTypes() { return paramTypes; }
     public Object[] getArgs() { return args; }
@@ -60,4 +48,6 @@ public class LocalMethodHookParam {
     public void setIntercepted(boolean isIntercepted) {
         this.isIntercepted = isIntercepted;
     }
+
+    public Interpreter getInterpreter() { return interpreter; }
 }

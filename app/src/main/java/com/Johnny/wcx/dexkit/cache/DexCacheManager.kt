@@ -30,6 +30,7 @@ object DexCacheManager {
     private const val CACHE_DIR_NAME = "dex_cache"
     private const val CACHE_FILE_SUFFIX = ".json"
     private const val KEY_HOST_VERSION = "host_version"
+    private const val KEY_ATTEMPTED_AT = "attemptedAt"
 
     private val cacheDir: Path by lazy {
         (KnownPaths.moduleData / CACHE_DIR_NAME).createDirsSafe()
@@ -112,6 +113,9 @@ object DexCacheManager {
             // 下次启动按 key 完整性校验（见 isItemCacheValid），item 可正常启用。
             calculateMethodHash(item)?.let { json.put("methodHash", it) }
             json.put("timestamp", System.currentTimeMillis())
+            // 适配"尝试过"的印记。成功失败都写：失败的项靠它判定为"已定论"，
+            // 不再每次启动都弹一遍适配框（见 isSettled）。
+            json.put(KEY_ATTEMPTED_AT, System.currentTimeMillis())
 
             item.collectDescriptors().forEach { (key, value) ->
                 json.put(key, value)
@@ -163,12 +167,56 @@ object DexCacheManager {
         WeLogger.i(TAG, "all cache cleared")
     }
 
+    /**
+     * 该项在当前代码 / 宿主版本上是否已经"定论"。
+     *
+     * 判定条件：缓存里有适配尝试印记（[KEY_ATTEMPTED_AT]），且 methodHash 与当前一致
+     * —— 说明上一次启动已经跑过适配，结果就是现在这份（可能不完整的）缓存，
+     * 再跑一遍结果不会变。
+     *
+     * 为什么需要它：某些功能在特定微信版本上确实定位不到符号，缓存永远写不完整。
+     * 旧逻辑下这类项每次启动都被判为"需要更新"，适配对话框反复弹出、又永远修不好，
+     * 用户看到的就是"卡在适配中 / 重启多少次都没用"。
+     *
+     * 现在这类项直接跳过（功能不加载），等下面任一情况出现才重新尝试：
+     * - 模块升级导致 resolveDex 变化（methodHash 变）
+     * - 微信版本变化（[init] 会整体清空缓存）
+     * - 用户在 设置 → 兼容 → 重置适配信息 中手动重置
+     */
+    fun isSettled(item: IResolveDex): Boolean {
+        if (item !is BaseFeature) unreachable()
+
+        val cacheFile = getCacheFile(item.name)
+        if (!cacheFile.exists()) return false
+
+        return try {
+            val json = JSONObject(cacheFile.readText())
+            if (!json.has(KEY_ATTEMPTED_AT)) return false
+
+            val currentHash = calculateMethodHash(item)
+            if (currentHash != null) {
+                val cachedHash = json.optString("methodHash", "")
+                if (cachedHash != currentHash) {
+                    WeLogger.d(TAG, "resolveDex of ${item.displayName} changed, re-adapting (was settled)")
+                    return false
+                }
+            }
+            true
+        } catch (e: Exception) {
+            WeLogger.e(TAG, "failed to read cache for: ${item.displayName}", e)
+            false
+        }
+    }
+
+    /**
+     * 需要重新适配的项：缓存无效，且还没有"定论"过。
+     */
     fun getOutdatedItems(items: List<IResolveDex>): List<IResolveDex> =
-        items.filter { !isItemCacheValid(it) }
+        items.filter { !isItemCacheValid(it) && !isSettled(it) }
 
     // ---------------------------------------------------------------------------
 
-    private val META_KEYS = setOf("methodHash", "timestamp")
+    private val META_KEYS = setOf("methodHash", "timestamp", KEY_ATTEMPTED_AT)
 
     private fun getCacheFile(path: String): Path =
         cacheDir / (path.replace("/", "_") + CACHE_FILE_SUFFIX)

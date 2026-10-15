@@ -8,8 +8,7 @@ package bsh;
  * If a before-hook sets {@code param.isIntercepted = true}, the original
  * operation is skipped and {@code param.getReturnValue()} is used as the result.
  * The corresponding after-hook still fires (with {@code isIntercepted == true})
- * for cleanup. After-hooks also run after successful original operations, but
- * not when the original operation throws.
+ * for cleanup.
  */
 public interface BshHook {
 

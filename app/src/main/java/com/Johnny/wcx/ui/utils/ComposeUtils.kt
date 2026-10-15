@@ -3,6 +3,7 @@ package com.Johnny.wcx.ui.utils
 import android.app.Dialog
 import android.content.Context
 import android.graphics.Color
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -34,23 +35,20 @@ fun showComposeDialog(
 ) {
     val context = CommonContextWrapper(context)
 
-    val dialog = Dialog(
-        context,
+    // 全屏弹窗必须用非浮动主题: 浮动主题 (windowIsFloating=true) 自带最小宽度约束,
+    // 只靠 setLayout(MATCH_PARENT, MATCH_PARENT) 压不住窗口。
+    val theme = if (fullScreen) {
+        android.R.style.Theme_DeviceDefault_Light_NoActionBar
+    } else {
         android.R.style.Theme_DeviceDefault_Light_Dialog_NoActionBar_MinWidth
-    )
+    }
+    val dialog = Dialog(context, theme)
     val lifecycleOwner = XposedLifecycleOwner.create()
 
     dialog.apply {
         window!!.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
             requestFeature(Window.FEATURE_NO_TITLE)
-            if (fullScreen) {
-                // 铺满全屏: 窗口尺寸匹配父容器, 解除平台 Dialog 的默认尺寸约束
-                setLayout(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            }
         }
 
         setCancelable(directlyDismissable)
@@ -72,11 +70,7 @@ fun showComposeDialog(
                     CompositionLocalProvider(LocalContext provides context) {
                         ModuleTheme {
                             Box(
-                                modifier = if (fullScreen) {
-                                    Modifier.fillMaxSize()
-                                } else {
-                                    Modifier.wrapContentSize()
-                                },
+                                modifier = if (fullScreen) Modifier.fillMaxSize() else Modifier.wrapContentSize(),
                                 contentAlignment = Alignment.Center
                             ) {
                                 scope.content()
@@ -90,6 +84,11 @@ fun showComposeDialog(
         window!!.setBackgroundDrawable(Color.TRANSPARENT.toDrawable())
         setOnDismissListener { lifecycleOwner.onDestroy() }
         show()
+        if (fullScreen) {
+            // show() 之后再钉一次 setLayout, 否则部分 ROM 下窗口尺寸不生效。
+            window!!.setGravity(Gravity.FILL)
+            window!!.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
     }
 }
 

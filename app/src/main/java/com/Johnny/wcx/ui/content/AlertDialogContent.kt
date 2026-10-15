@@ -4,17 +4,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.LocalTextStyle
@@ -30,24 +25,26 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun AlertDialogContent(
     modifier: Modifier = Modifier,
-    fullScreen: Boolean = false,
     icon: @Composable (() -> Unit)? = null,
     title: @Composable (() -> Unit)?,
     text: @Composable (() -> Unit)?,
     confirmButton: (@Composable () -> Unit)? = null,
-    dismissButton: (@Composable () -> Unit)? = null
+    dismissButton: (@Composable () -> Unit)? = null,
+    fullScreen: Boolean = false
 ) {
     Surface(
-        shape = if (fullScreen) MaterialTheme.shapes.small else MaterialTheme.shapes.extraLarge,
-        tonalElevation = 6.dp,
-        modifier = modifier
-            .fillMaxWidth()
-            .then(if (fullScreen) Modifier.fillMaxHeight() else Modifier.wrapContentHeight())
+        shape = if (fullScreen) RectangleShape else MaterialTheme.shapes.extraLarge,
+        tonalElevation = if (fullScreen) 0.dp else 6.dp,
+        modifier = modifier.then(
+            if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
+        )
     ) {
+        // 非全屏（浮动 Dialog）时按内容自适应高度，避免内容少时把面板撑到接近全屏；
+        // 全屏模式（联系人选择器）仍撑满。
         Column(
             modifier = Modifier
-                .padding(if (fullScreen) 12.dp else 20.dp)
-                .then(if (fullScreen) Modifier.fillMaxSize() else Modifier),
+                .then(if (fullScreen) Modifier.fillMaxSize() else Modifier)
+                .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Row(
@@ -74,29 +71,24 @@ fun AlertDialogContent(
 
             HorizontalDivider()
 
-            if (text != null) {
+            text?.let {
                 val bodyStyle = MaterialTheme.typography.bodyMedium
                 val bodyColor = MaterialTheme.colorScheme.onSurface
 
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f, fill = false)
+                        .then(
+                            // 全屏时内容区只占「剩余」高度 (weight), 把底部按钮行的位置留出来;
+                            // 原来用 fillMaxSize() 会把按钮行挤成 0 高度, 用户看不到确定/取消。
+                            if (fullScreen) Modifier.fillMaxWidth().weight(1f)
+                            else Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 400.dp)
+                        )
                 ) {
                     CompositionLocalProvider(
                         LocalTextStyle provides bodyStyle,
                         LocalContentColor provides bodyColor
                     ) {
-                        if (fullScreen) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                            ) {
-                                text()
-                            }
-                        } else {
-                            text()
-                        }
+                        it()
                     }
                 }
             }
