@@ -67,6 +67,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
@@ -449,6 +450,9 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     private const val TAG = "WeMessageApi"
     private const val MAX_EMOJI_DIMENSION = 1024
     private const val STICKER_SEND_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000L
+
+    /** 图片下载入口 `o11.j.b(long, MsgIdTalker, int, Object, int, w, int, boolean)` 的第 2 参。 */
+    private const val MSG_ID_TALKER = "com.tencent.mm.plugin.msg.MsgIdTalker"
 
     private enum class StickerFileFormat {
         GIF,
@@ -1893,22 +1897,77 @@ object WeMessageApi : ApiFeature(), IResolveDex {
      * 14:49:50.887 原图已落地: .../image2/2b/8f/2b8f...jpg   ← 2.3 秒就宣布成功
      * 14:50:57.317 无感加载「查看原图」: 查看原图 3MB (Button) ← 69 秒后微信仍说没下好
      * ```
-     * 改用**微信内部同款口径**: `ImgInfo2` 行的 `totalLen == offset`（微信就是按这两列
-     * 判完成，`iscomplete` 不可信：DEFAULT 1）。拿不到长度信息（本地图 / GIF / 表结构变了）
-     * 时退回老行为，不把功能卡死。
+     * 改用**消息 XML 里的原图字节数**（`<img hdlength="...">`）作为权威判据 —— 这正是
+     * 微信「查看原图 2MB」那个数字的来源，落库即有、**不依赖下载进度**，所以刚触发时
+     * 就能立刻判断"还差多少"，不会被进度列的延迟写入骗到。
+     *
+     * v294 曾试过用 `ImgInfo2.totalLen == offset`（微信内部口径），但**方向反了**：
+     * 下载刚触发时 totalLen 还是 0（要等 CDN 回包才填），于是命中了
+     * `totalLen <= 0 → 算已完成` 的兜底，1 秒内就宣布"原图已落地" —— 拿到的是微信
+     * 预创建的空壳文件。设备日志 2026-10-15 15:49 实锤：
+     * ```
+     * 15:49:51.137 triggerDownload result=0
+     * 15:49:52.140 ImgInfo2 列探测: totalLen=totalLen offset=offset
+     * 15:49:52.142 image landed: 触发 1 次, 用时 1s            ← 1 秒就宣布成功
+     * 15:51:41.089 无感加载「查看原图」: 查看原图 2MB           ← 112 秒后仍未下好
+     * ```
+     * **教训：拿不到进度 ≠ 可以当成完成。任何兜底都不能朝"提前宣布成功"的方向退。**
      */
-    private fun resolveExistingImageFile(row: ImgInfoRow): Path? {
+    private fun resolveExistingImageFile(row: ImgInfoRow, expectedBytes: Long): Path? {
         val file = listOfNotNull(row.bigImgPath, row.hevcPath, row.midImgPath)
             .filter { it.isNotEmpty() && !it.startsWith("SERVERID://") }
             .firstNotNullOfOrNull { name ->
                 resolveImageFile(name)?.takeIf { it.isRegularFile() && it.fileSize() > 0 }
             } ?: return null
 
-        val progress = queryImageProgress(row.localId) ?: return file
-        if (progress.totalLen <= 0L) return file
-        if (progress.offset < progress.totalLen) return null
-        if (Files.size(file) < progress.totalLen) return null
+        // 权威判据: 消息 XML 的 hdlength (原图字节数)。拿不到才退到 ImgInfo2.totalLen,
+        // 且只用它的 > 0 部分 —— 0 意味着"还没开始下", 不能当完成。
+        val expected = if (expectedBytes > 0L) {
+            expectedBytes
+        } else {
+            queryImageProgress(row.localId)?.totalLen?.takeIf { it > 0L } ?: 0L
+        }
+        if (expected <= 0L) {
+            // 真的拿不到任何长度信息 (本地图 / GIF / 表结构变了)。此时只能按文件存在算,
+            // 明确记一笔, 让下次日志能一眼分辨"确实没有长度"和"判据失效了"。
+            WeLogger.w(
+                TAG,
+                "resolveExistingImageFile: 拿不到原图字节数 (localId=${row.localId}), " +
+                        "只能按文件存在判定 -> ${file.fileName} (${Files.size(file)}B)"
+            )
+            return file
+        }
+        val size = Files.size(file)
+        if (size < expected) return null
         return file
+    }
+
+    /**
+     * v297: **这个函数是错的, 但暂时保留, 供探针对照。**
+     *
+     * 它返回 `hdlength`(发送方声明的原始字节数)。v295~v296 把它当「这张图应该多大」的权威判据,
+     * 而 v296 设备日志证明这是**张冠李戴**:
+     * ```
+     * localId=37956  big → 65740B   offset=65740/65740   hdlength=2919329
+     * ```
+     * `offset == totalLen` 恒成立 → 微信认为 `hdImgId` 那行**已经下完**; 而 `hdlength` 是原图的
+     * 字节数, 接收方微信**从未把它落盘**(不在 `ImgInfo2` 里)。于是拿它当完成判据, 等的是一个
+     * **永远不会发生的未来**。
+     *
+     * 真正的原图走另一条 CDN 链路(视频侧对称字段 `cdnrawvideourl`), 字段名待v297 探针确认。
+     * 在确认之前, **不要再把它当作完成判据使用** —— 详见 `AutoPrefetchOriginalMedia` 类文档 v297 节。
+     */
+    private fun queryExpectedImageBytes(msgSvrId: Long): Long {
+        val content = runCatching {
+            WeDatabaseApi.rawQuery(
+                "SELECT content FROM message WHERE msgSvrId=? LIMIT 1",
+                arrayOf<Any>(msgSvrId)
+            ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull().orEmpty()
+        if (content.isEmpty() || !content.contains("<img")) return 0L
+        return extractXmlAttr(content, "hdlength").toLongOrNull()?.takeIf { it > 0L }
+            ?: extractXmlAttr(content, "length").toLongOrNull()?.takeIf { it > 0L }
+            ?: 0L
     }
 
     /** 某张图片行的下载进度 (微信判定完成的口径: totalLen == offset)。 */
@@ -1973,7 +2032,56 @@ object WeMessageApi : ApiFeature(), IResolveDex {
     private const val IMG_MAX_WAIT_MS = 3 * 60_000L
     private const val IMG_MAX_TRIGGER = 3
 
+    /** v295: 搭车等其它功能下载时的等待上限 (对方总预算是 3min, 这里留出余量后自行放弃)。 */
+    private const val IMG_FOLLOW_WAIT_MS = 3 * 60_000L
+
+    /**
+     * v295: 同一个 msgSvrId 的下载 single-flight。
+     *
+     * 「后台自动加载原图」和「自动缓存图片」是两个独立功能，各有自己的去重集合
+     * (inFlight / pendingSvrIds)，彼此看不见 —— 同一条消息会被两路同时下发
+     * `triggerDownload`。微信的下载任务被重复触发会**互相打断**（视频侧 v290 已经踩过：
+     * "重复触发会打断微信 CDN 任务"），大文件永远下不完。
+     * 设备日志 2026-10-15 15:49 实锤：同一条消息 `start cdn download` 打了 **3 次**。
+     * 所以去重必须做在**公共通道**上，而不是各功能内部。
+     */
+    private val imageDownloadInFlight = ConcurrentHashMap.newKeySet<Long>()
+
     private fun ensureImageCachedFile(msgSvrId: Long): Path? {
+        if (!imageDownloadInFlight.add(msgSvrId)) {
+            // 别人正在下这条图, 直接搭车等它的结果, 不要再 triggerDownload。
+            // 每秒先试一次「判定」—— 文件一落地就能立刻返回, 不用等对方收尾;
+            // 对方一旦退出 in-flight(成功或放弃)而文件仍不完整, 就返回 null 交由调用方重试。
+            val deadline = System.currentTimeMillis() + IMG_FOLLOW_WAIT_MS
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(1_000)
+                resolveCompletedImage(msgSvrId)?.let {
+                    WeLogger.i(TAG, "搭车成功: svrId=$msgSvrId 的原图由其它功能下完 -> $it")
+                    return it
+                }
+                if (msgSvrId !in imageDownloadInFlight) {
+                    WeLogger.w(TAG, "同 svrId=$msgSvrId 的其它下载已结束但文件仍不完整, 本次放弃")
+                    return null
+                }
+            }
+            WeLogger.w(TAG, "等待 svrId=$msgSvrId 的其它下载超时, 本次放弃")
+            return null
+        }
+        return try {
+            doEnsureImageCachedFile(msgSvrId)
+        } finally {
+            imageDownloadInFlight.remove(msgSvrId)
+        }
+    }
+
+    /** 只做判定, 不触发下载 (给 single-flight 的等待方复用)。 */
+    private fun resolveCompletedImage(msgSvrId: Long): Path? {
+        val baseRow = queryImgInfoRow(msgSvrId) ?: return null
+        val targetRow = baseRow.hdImgId.takeIf { it > 0 }?.let { queryImgInfoRowById(it) } ?: baseRow
+        return resolveExistingImageFile(targetRow, queryExpectedImageBytes(msgSvrId))
+    }
+
+    private fun doEnsureImageCachedFile(msgSvrId: Long): Path? {
         val baseRow = queryImgInfoRow(msgSvrId) ?: run {
             WeLogger.w(TAG, "no ImgInfo2 row for msgSvrId=$msgSvrId")
             return null
@@ -1985,8 +2093,18 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             ?.also { WeLogger.i(TAG, "image has original (hdImgId=${baseRow.hdImgId}), downloading original") }
             ?: baseRow
 
+        // 权威的"原图应该多大" —— 消息 XML 的 hdlength, 落库即有。
+        val expectedBytes = queryExpectedImageBytes(msgSvrId)
+        logImageDiagnose(msgSvrId, targetRow, expectedBytes)
+        WeLogger.i(
+            TAG,
+            "原图目标大小: svrId=$msgSvrId expected=${expectedBytes}B " +
+                    "(localId=${targetRow.localId}, 已有文件=" +
+                    "${resolveExistingImageFileUnchecked(targetRow).sizeOrZero()}B)"
+        )
+
         // 已经下完 (含"文件在但只下了一半"的判据) 则直接返回
-        resolveExistingImageFile(targetRow)?.let { return it }
+        resolveExistingImageFile(targetRow, expectedBytes)?.let { return it }
 
         val talker = targetRow.talker.ifEmpty { baseRow.talker }
         WeLogger.i(TAG, "start cdn download: svrId=$msgSvrId localId=${targetRow.localId} talker=$talker")
@@ -1994,10 +2112,10 @@ object WeMessageApi : ApiFeature(), IResolveDex {
         // v294: 进度感知等待 (原先是「每轮触发 + 空转 20 秒」共 3 轮, 慢网络上必然误判失败,
         // 而快网络又会在半成品上误判成功):
         //  - 首轮必触发; 之后**只在完全无进展**时补触发 (实测单次触发可能被微信静默丢弃);
-        //  - 只要 offset 在涨就一直等, 直到 [IMG_MAX_WAIT_MS] 的总预算;
+        //  - 只要磁盘字节数在涨就一直等, 直到 [IMG_MAX_WAIT_MS] 的总预算;
         //  - 每 10 秒打一条进度, 便于下次直接定论。
         val startAt = System.currentTimeMillis()
-        var lastOffset = -1L
+        var lastSize = -1L
         var lastProgressAt = startAt
         var lastLogAt = startAt
         var triggerCount = 0
@@ -2009,7 +2127,7 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                     WeLogger.w(
                         TAG,
                         "image give up: 触发 $triggerCount 次仍无进展 (svrId=$msgSvrId, " +
-                                "localId=${targetRow.localId}, offset=$lastOffset)"
+                                "localId=${targetRow.localId}, ${lastSize}B/${expectedBytes}B)"
                     )
                     break
                 }
@@ -2024,8 +2142,9 @@ object WeMessageApi : ApiFeature(), IResolveDex {
 
             Thread.sleep(1_000)
 
+            // 落地判据只认"磁盘字节数达到 hdlength", 不看微信的进度列 (刚触发时那些列还是 0)。
             val row = queryImgInfoRowById(targetRow.localId)
-            if (row != null) resolveExistingImageFile(row)?.let {
+            if (row != null) resolveExistingImageFile(row, expectedBytes)?.let {
                 WeLogger.i(
                     TAG,
                     "image landed: svrId=$msgSvrId localId=${targetRow.localId} " +
@@ -2034,9 +2153,10 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                 return it
             }
 
-            val progress = queryImageProgress(targetRow.localId)
-            if (progress != null && progress.offset != lastOffset) {
-                lastOffset = progress.offset
+            // 进展以**磁盘字节数**为准 —— 微信写文件是我们能观测到的唯一硬事实
+            val size = resolveExistingImageFileUnchecked(targetRow).sizeOrZero()
+            if (size != lastSize) {
+                lastSize = size
                 lastProgressAt = System.currentTimeMillis()
             }
             if (System.currentTimeMillis() - lastLogAt >= 10_000) {
@@ -2044,12 +2164,165 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                 WeLogger.i(
                     TAG,
                     "image downloading: svrId=$msgSvrId localId=${targetRow.localId} " +
-                            "offset=$lastOffset/${progress?.totalLen ?: -1}"
+                            "onDisk=$size/${if (expectedBytes > 0L) expectedBytes else -1}B"
                 )
             }
         }
         return null
     }
+
+    /** 只做「文件在哪、多大」，不做完成度判定 —— 给进度观测用。 */
+    private fun resolveExistingImageFileUnchecked(row: ImgInfoRow): Path? =
+        listOfNotNull(row.bigImgPath, row.hevcPath, row.midImgPath)
+            .filter { it.isNotEmpty() && !it.startsWith("SERVERID://") }
+            .firstNotNullOfOrNull { name ->
+                resolveImageFile(name)?.takeIf { it.isRegularFile() && it.fileSize() > 0 }
+            }
+
+    /**
+     * v296 诊断: 把「为什么字节数不涨」这件事一次性说清。
+     *
+     * v295 设备日志 (2026-10-15 17:15~17:18) 显示 `triggerDownload result=0` 三次都"成功"，
+     * 但 `onDisk` 恒定在 212639B / 150791B / 57150B 一动不动 —— 连用户自己点「查看原图」
+     * （微信亲自下）之后 71 秒仍然没变。这不是"慢"，是**根本没在下载**。
+     *
+     * 现有日志缺三样决定性信息，下一版必须打出来:
+     *  1. 账号目录下到底有几个 32 位目录、`resolveImageFile` 选了哪个
+     *     —— 它用"最近修改时间最大"挑账号，多账号/多用户设备上会挑错，
+     *     于是 bigImgPath 解析到别的账号目录 → 文件不存在 → 回退到 midImgPath(缩略图)，
+     *     我们就对着 212KB 的缩略图死等，微信下的是另一个目录；
+     *  2. bigImgPath / hevcPath / midImgPath 三个字段的原始值（是不是 SERVERID://）；
+     *  3. ImgInfo2 行的 offset/totalLen（微信自己认为下了多少）。
+     */
+    private fun logImageDiagnose(msgSvrId: Long, row: ImgInfoRow, expectedBytes: Long) {
+        val microMsgPath = HostInfo.application.filesDir.asPath.parent / "MicroMsg"
+        val accountDirs = runCatching {
+            microMsgPath.listDirectoryEntries()
+                .filter { Files.isDirectory(it) && it.fileName.toString().length == 32 }
+                .map { "${it.fileName}(${Files.getLastModifiedTime(it).toMillis()})" }
+        }.getOrDefault(emptyList())
+        fun desc(name: String?) = when {
+            name.isNullOrEmpty() -> "(空)"
+            name.startsWith("SERVERID://") -> "SERVERID://… (未落地)"
+            name.length < 4 -> "$name (太短)"
+            else -> runCatching {
+                val p = resolveImageFile(name)
+                if (p == null) "$name → 解析失败"
+                else "$name → ${if (p.isRegularFile()) "${Files.size(p)}B" else "不存在"}"
+            }.getOrDefault("$name → 异常")
+        }
+        val progress = queryImageProgress(row.localId)
+        WeLogger.i(
+            TAG,
+            "诊断 svrId=$msgSvrId localId=${row.localId} expected=${expectedBytes}B | " +
+                    "big=${desc(row.bigImgPath)} | hevc=${desc(row.hevcPath)} | " +
+                    "mid=${desc(row.midImgPath)} | " +
+                    "offset=${progress?.offset ?: -1}/${progress?.totalLen ?: -1} | " +
+                    "账号目录[${accountDirs.joinToString(",")}]"
+        )
+        // v297: 判据已被证伪, 换一轮彻底探针 —— 把图片 XML 的全部属性 + ImgInfo2 整行全列打出来。
+        logImageXmlProbe(msgSvrId, row)
+    }
+
+    /**
+     * v297 探针: 一次性把「原图到底在哪」问清楚。
+     *
+     * v296 日志已经**证伪了 v295/v296 的前提**, 证据是这三组数字:
+     * ```
+     * localId=37956  big → 65740B   offset=65740/65740   hdlength=2919329
+     * localId=37952  big → 80212B   offset=80212/80212   hdlength=3251086
+     * localId=19507  big → 57150B   offset=57150/57150   hdlength=2777401
+     * ```
+     * `offset == totalLen` **恒成立**, 且 `totalLen` 与磁盘字节数一字不差 ——
+     * 微信自己的数据库就说「这几行已经下载完成」。而 `totalLen` 只有 `hdlength` 的 2.1%~2.5%。
+     *
+     * 所以 `triggerDownload` 三次 `result=0` 不是"触发失败", 而是**微信认为这行已完成, 任务被
+     * 静默忽略**(与视频侧 v290 的 `accepted=false` 同一种拒绝)。`hdImgId`/`bigImgPath` 指向的
+     * 是 `cdnbigimgurl` 对应的那张**压缩大图**, 压根不是原图 —— `hdlength` 是发送方的原始字节数,
+     * 接收方微信从未把它落盘, 它不在 `ImgInfo2` 里。
+     *
+     * 用户实测: 点开图片后微信**确实**下到了原图 → 原图存在, 但走的是**另一条 CDN 链路**
+     * (视频侧对称字段是 `cdnrawvideourl`)。现有代码从来没读过图片侧那个字段 ——
+     * `ImageMessage` 模型里只有 bigImgUrl/midImgUrl/thumbUrl, 全是压缩图。
+     *
+     * **不要猜字段名。** 这一轮把 `<img>` 元素的**全部属性**和 ImgInfo2 的**整行所有列**
+     * 原样打出, 下一轮直接定论。
+     */
+    private fun logImageXmlProbe(msgSvrId: Long, row: ImgInfoRow) {
+        val content = runCatching {
+            WeDatabaseApi.rawQuery(
+                "SELECT content FROM message WHERE msgSvrId=? LIMIT 1",
+                arrayOf<Any>(msgSvrId)
+            ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull().orEmpty()
+
+        val imgTag = runCatching {
+            val i = content.indexOf("<img")
+            if (i < 0) "" else content.substring(i, content.indexOf('>', i).let { if (it < 0) i + 1 else it } + 1)
+        }.getOrDefault("")
+        if (imgTag.isEmpty()) {
+            WeLogger.w(TAG, "探针[图片XML] svrId=$msgSvrId: content 里没有 <img> (len=${content.length})")
+        } else {
+            val attrs = Regex("""([\w:]+)="([^"]*)"""").findAll(imgTag)
+                .map { "${it.groupValues[1]}=${it.groupValues[2]}" }
+                .toList()
+            // 属性可能很多, 分两行打, 避免单行过长被截断
+            WeLogger.i(TAG, "探针[图片XML] svrId=$msgSvrId 属性(${attrs.size}) 上半: ${attrs.take(20).joinToString(" ")}")
+            WeLogger.i(TAG, "探针[图片XML] svrId=$msgSvrId 属性(${attrs.size}) 下半: ${attrs.drop(20).joinToString(" ")}")
+            val cdn = attrs.filter { it.startsWith("cdn") || it.contains("aeskey") || it.endsWith("length") }
+            WeLogger.i(TAG, "探针[图片XML] svrId=$msgSvrId CDN/长度字段: ${cdn.joinToString(" ")}")
+
+            // v298: 直接回答「微信到底给了我哪一档画质」—— 不用人肉比对数字。
+            val hevcMid = attrs.firstOrNull { it.startsWith("hevc_mid_size=") }?.substringAfter("=")?.toLongOrNull() ?: -1
+            val bigLen = attrs.firstOrNull { it.startsWith("length=") }?.substringAfter("=")?.toLongOrNull() ?: -1
+            val hdLen = attrs.firstOrNull { it.startsWith("hdlength=") }?.substringAfter("=")?.toLongOrNull() ?: -1
+            val sameUrl = runCatching {
+                val u = { k: String -> attrs.firstOrNull { it.startsWith(k) }?.substringAfter("=") }
+                u("cdnbigimgurl") == u("cdnmidimgurl") && u("cdnbigimgurl") == u("cdnthumburl")
+            }.getOrDefault(false)
+            val path = resolveImageFile(row.bigImgPath)
+            val onDisk = path?.takeIf { it.isRegularFile() }?.let { runCatching { Files.size(it) }.getOrDefault(-1L) } ?: -1L
+            val tier = when {
+                onDisk <= 0L -> "未落盘"
+                hdLen > 0 && onDisk >= hdLen -> "已达原图(hdlength)"
+                bigLen > 0 && onDisk >= bigLen -> "已达大图(length)"
+                hevcMid > 0 && onDisk >= hevcMid -> "仅 HEVC 中间件 ← 未达大图"
+                else -> "低于所有已知档位"
+            }
+            WeLogger.i(
+                TAG,
+                "探针[画质档位] svrId=$msgSvrId 磁盘=${onDisk}B " +
+                        "hevc_mid=${hevcMid}B 大图length=${bigLen}B 原图hdlength=${hdLen}B " +
+                        "三档同CDN=$sameUrl → $tier"
+            )
+        }
+
+        // ImgInfo2 整行所有列 —— 看是否还有我们没读的字段指向原图
+        runCatching {
+            WeDatabaseApi.rawQuery(
+                "SELECT * FROM ImgInfo2 WHERE id=? LIMIT 1",
+                arrayOf<Any>(row.localId)
+            ).use { c ->
+                if (c.moveToFirst()) {
+                    val n = c.columnCount
+                    val parts = (0 until n).map { i ->
+                        val name = c.getColumnName(i)
+                        val v = runCatching { c.getString(i) }.getOrNull()
+                        "$name=${v?.takeIf { it.isNotEmpty() } ?: if (runCatching { c.isNull(i) }.getOrDefault(true)) "null" else "…"}"
+                    }
+                    // 列数可能很多(40+), 分三行打
+                    parts.chunked(15).forEachIndexed { idx, chunk ->
+                        WeLogger.i(TAG, "探针[ImgInfo2整行] svrId=$msgSvrId 第${idx + 1}段: ${chunk.joinToString(" ")}")
+                    }
+                } else {
+                    WeLogger.w(TAG, "探针[ImgInfo2整行] svrId=$msgSvrId localId=${row.localId} 查不到")
+                }
+            }
+        }.onFailure { WeLogger.e(TAG, "探针[ImgInfo2整行] 失败 svrId=$msgSvrId", it) }
+    }
+
+    private fun Path?.sizeOrZero(): Long =
+        this?.let { runCatching { Files.size(it) }.getOrDefault(0L) } ?: 0L
 
     /**
      * 缓存图片: 让微信把大图从 CDN 下载到它自己的 image2/ 存储 (相当于在聊天里点击图片下载)。
@@ -2079,7 +2352,120 @@ object WeMessageApi : ApiFeature(), IResolveDex {
         }
     }
 
+    /**
+     * v298 探针: 摸清 `DownloadImgService` 上到底有哪些重载 / 参数能指定"画质"。
+     *
+     * v297 探针已经把链路问清楚了: `<img>` 只有 18 个属性, `cdnthumburl` / `cdnmidimgurl` /
+     * `cdnbigimgurl` **是同一个 CDN 地址**, `cdnhdheight`/`cdnhdwidth` 都是 0 —— **没有
+     * `cdnrawimgurl` 那样的独立 HD 字段**(视频侧是有的, 见 `cdnrawvideourl`)。
+     * 所以"要哪个画质"只能靠**调用参数**区分, 不能靠换 URL —— 而在参数含义没确认之前,
+     * **不许瞎试**(每个 int/boolean 位都猜一轮等于让用户当试验品)。
+     *
+     * 同时 v297 探针把真正的失败点钉死了:
+     * ```
+     * initial: bigImgPath=SERVERID://…  offset=null    totalLen=null    compressType=1
+     * after  : bigImgPath=7f2bafcd….jpg offset=464806  totalLen=464806  compressType=0
+     * ```
+     * 而消息 XML 里 `hevc_mid_size=464806` —— **正好等于下载后的 totalLen**。也就是说这一版
+     * 下的只是 **HEVC 压缩中间件**, 连 `length=2218605` 的"大图"都不是, 更别说
+     * `hdlength=6102798` 的原图。类文档里那句「该通道**优先下载原图**」至此被证伪。
+     */
+    /**
+     * v299: **v298 的尾参 boolean 实验失败**（`hdFlag=true` 被接受但档位没变），
+     * 说明它不是画质开关。本函数把「猜参数」升级为「抓微信自己的调用」——
+     * 这正是视频侧 `探针[下载任务 gallery.f]` 用过的、被证明有效的模式。
+     *
+     * 三件事:
+     * 1. 把 `o11.j`(ModelImage.DownloadImgService) 上**所有**方法原样打出。
+     *    v298 只过滤了与我们同名的 `b`, 万一 HD 下载是另一个方法名就永远看不见。
+     * 2. 把尾参 `w`(回调接口) 的所有方法打出 —— 回调里可能带画质信息。
+     * 3. **hook `b`, 把每次调用的全部 8 个参数 + 返回值打进日志**, 并用 ThreadLocal
+     *    区分「我们自己发的」和「微信自己发的」。用户点「查看原图」时微信走的必然
+     *    是正确的配方, 那一行就是答案。
+     */
+    private fun installImageDownloadProbe() {
+        if (!probeServiceMembers.compareAndSet(false, true)) return
+        runCatching {
+            val delegate = WeServiceApi.methodDownloadImageServiceDownloadImage
+            val clazz = delegate.method.declaringClass
+            WeLogger.i(TAG, "探针[图片下载类] ${clazz.name} 方法总数=${clazz.declaredMethods.size}")
+            clazz.declaredMethods
+                .sortedWith(compareBy({ it.name }, { it.parameterTypes.size }))
+                .forEach { m ->
+                    WeLogger.i(
+                        TAG,
+                        "探针[类方法] ${m.name}(${m.parameterTypes.joinToString(", ") { it.simpleName }})" +
+                            " -> ${m.returnType.simpleName}"
+                    )
+                }
+
+            val wClass = delegate.method.parameterTypes[5]
+            val cbMethods = (wClass.methods + wClass.declaredMethods).distinctBy { it.toString() }
+            WeLogger.i(TAG, "探针[回调接口] ${wClass.name} 方法数=${cbMethods.size}")
+            cbMethods.forEach { m ->
+                WeLogger.i(
+                    TAG,
+                    "探针[回调方法] ${m.name}(${m.parameterTypes.joinToString(", ") { it.simpleName }})" +
+                        " -> ${m.returnType.simpleName}"
+                )
+            }
+
+            // hook: 抓每一次调用(含微信自己点「查看原图」那次)的真实参数。
+            // 范围 = 我们已知的 b + 所有参数里出现 MsgIdTalker 的方法(下载入口的特征),
+            // 这样即使 HD 走的是另一个方法名也照样抓得到, 又不至于把整个类都 hook 上。
+            // 加上限: 微信可能对列表里每张图都调一次, 不设上限会把日志冲爆。
+            val logged = java.util.concurrent.atomic.AtomicInteger(0)
+            val targets = clazz.declaredMethods.filter { m ->
+                !m.isSynthetic && m.parameterTypes.any { it.name == MSG_ID_TALKER } &&
+                    m.parameterTypes.size <= 10
+            }
+            WeLogger.i(TAG, "探针[hook 目标] 共 ${targets.size} 个: " +
+                targets.joinToString(", ") { "${it.name}/${it.parameterTypes.size}" })
+            targets.forEach { tm ->
+                runCatching {
+                    tm.hookAfter {
+                        if (logged.incrementAndGet() > 300) return@hookAfter
+                        val hp = this
+                        val who = if (ourDownloadCall.get() == true) "我们自己" else "微信侧"
+                        val args = hp.args
+                        val desc = buildString {
+                            append("${hp.method?.name}(")
+                            for (i in 0 until (args?.size ?: 0)) {
+                                if (i > 0) append(", ")
+                                append("$i=").append(describeProbeArg(args?.getOrNull(i)))
+                            }
+                            append(") -> ").append(hp.result)
+                        }
+                        WeLogger.i(TAG, "探针[调用] $who$desc")
+                    }
+                }.onFailure { WeLogger.w(TAG, "探针 hook 失败: ${tm.name}", it) }
+            }
+            WeLogger.i(TAG, "探针已装: 图片下载 ${clazz.name}")
+        }.onFailure { WeLogger.e(TAG, "探针[图片下载] 安装失败", it) }
+    }
+
+    /** 探针用: 把任意参数打成一行可读文本(含 Object 的真实类型, 这是定位画质开关的关键)。 */
+    private fun describeProbeArg(v: Any?): String = when (v) {
+        null -> "null"
+        is Int, is Long, is Short, is Byte, is Boolean, is Float, is Double -> v.toString()
+        is String -> "\"$v\""
+        is Array<*> -> "Array(${v.size})[${v.joinToString(", ") { describeProbeArg(it) }.take(300)}]"
+        is Class<*> -> "Class(${v.name})"
+        else -> {
+            val cn = v.javaClass.name
+            val s = runCatching { v.toString() }.getOrNull()?.take(160)
+            "$cn@${System.identityHashCode(v)}${if (s.isNullOrBlank()) "" else " ($s)"}"
+        }
+    }
+
+    private val probeServiceMembers = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 标记当前线程正在发起的下载是**我们自己**的, 供上面的 hook 区分调用来源。 */
+    private val ourDownloadCall = ThreadLocal.withInitial { false }
+
     private fun triggerDownload(imgLocalId: Long, talker: String): Boolean {
+        installImageDownloadProbe()
+        ourDownloadCall.set(true)
         return try {
             val m = WeServiceApi.methodDownloadImageServiceDownloadImage.method
             val downloadService = m.declaringClass.createInstance()
@@ -2097,12 +2483,23 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                 }
             }
 
-            val result = m.invoke(downloadService, imgLocalId, msgIdTalker, 0, null, 0, listener, -1, false)
-            WeLogger.i(TAG, "triggerDownload result=$result")
+            // v298 实验结论: 尾参 boolean 传 true **不改变画质档位**(仍是 HEVC 中间件),
+            // 所以它不是画质开关。本版退回 false(已知可用的值), 真正的配方靠
+            // 「探针[调用 b] 微信侧」那一行抓微信自己的参数。
+            val hdFlag = false
+            val result = try {
+                m.invoke(downloadService, imgLocalId, msgIdTalker, 0, null, 0, listener, -1, hdFlag)
+            } catch (e: IllegalArgumentException) {
+                WeLogger.w(TAG, "尾参 boolean 不接受 false (${e.message}), 改试 true")
+                m.invoke(downloadService, imgLocalId, msgIdTalker, 0, null, 0, listener, -1, true)
+            }
+            WeLogger.i(TAG, "triggerDownload result=$result hdFlag=$hdFlag localId=$imgLocalId")
             (result as? Int)?.let { it >= 0 } ?: false
         } catch (e: Exception) {
             WeLogger.e(TAG, "triggerDownload failed", e)
             false
+        } finally {
+            ourDownloadCall.set(false)
         }
     }
 
@@ -2133,11 +2530,25 @@ object WeMessageApi : ApiFeature(), IResolveDex {
         // image2/xx/yy/<name> 需要文件名至少 4 个字符
         if (bigImgPath.length < 4) return null
         val microMsgPath = HostInfo.application.filesDir.asPath.parent / "MicroMsg"
-        val accountDir = microMsgPath.listDirectoryEntries()
+        val accountDirs = microMsgPath.listDirectoryEntries()
             .filter { Files.isDirectory(it) && it.fileName.toString().length == 32 }
-            .maxByOrNull { Files.getLastModifiedTime(it).toMillis() }
-            ?: return null
-        return accountDir / "image2" / bigImgPath.take(2) / bigImgPath.substring(2, 4) / bigImgPath
+            .sortedByDescending { Files.getLastModifiedTime(it).toMillis() }
+        if (accountDirs.isEmpty()) return null
+        val rel = listOf("image2", bigImgPath.take(2), bigImgPath.substring(2, 4), bigImgPath)
+            .joinToString("/")
+        // v296: 原实现只取"最近修改时间最大"的那个账号目录就返回, 多账号 / 多用户
+        // (android:userId) 设备上会挑错 —— 于是 bigImgPath 解析到别的账号下 → 文件不存在
+        // → resolveExistingImageFile 回退到 midImgPath(缩略图), 于是我们对着 200KB 的
+        // 缩略图死等3 分钟, 而微信把原图下在另一个目录。
+        // 设备日志 2026-10-15 17:15 证据: onDisk 恒定 212639B/4159123B 不动,
+        // 连用户亲自点「查看原图」后 71 秒仍不变。
+        // 现在**按修改时间顺序挨个试**, 谁有文件用谁; 都没有才返回 null。
+        for (dir in accountDirs) {
+            val p = dir.resolve(rel)
+            if (p.isRegularFile() && p.fileSize() > 0) return p
+        }
+        // 一个都没有时返回最近账号下的路径 (保持旧行为, 让调用方能打出"不存在"的诊断)
+        return accountDirs.first().resolve(rel)
     }
 
     /**

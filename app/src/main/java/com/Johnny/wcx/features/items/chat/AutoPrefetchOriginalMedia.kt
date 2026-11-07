@@ -177,6 +177,104 @@ import java.util.concurrent.ConcurrentHashMap
  * (列名运行时探测), 并要求磁盘字节数不低于 `totalLen`; 拿不到长度信息 (本地图 / GIF /
  * 表结构变化) 时退回老行为, 不把功能卡死。等待策略同步改为进度感知
  * (`IMG_IDLE_TIMEOUT_MS` 45s 无进展才补一次触发, `IMG_MAX_WAIT_MS` 3min 总预算)。
+ *
+ * ### v295: v294 的兜底方向反了, 修回来 + 修重复触发
+ *
+ * 上面 v294 那版的判据写反了方向, 装上去**1 秒**就打「原图已落地」, 比修之前还快:
+ * ```
+ * 15:49:51.137 triggerDownload result=0
+ * 15:49:52.140 ImgInfo2 列探测: totalLen=totalLen offset=offset
+ * 15:49:52.142 image landed: 触发 1 次, 用时 1s             ← 1 秒就宣布成功
+ * 15:51:41.089 无感加载「查看原图」: 查看原图 2MB            ← 112 秒后仍未下好
+ * ```
+ * 因为**下载刚触发时 `ImgInfo2.totalLen` 就是 0** (要等 CDN 回包才填), 正好命中
+ * 「`totalLen <= 0` → 退回『文件存在即算』」那条兜底, 又一次在微信预创建的空壳文件上
+ * 宣布成功。**教训: 拿不到进度 ≠ 可以当成完成, 任何兜底都不能朝「提前宣布成功」的方向退。**
+ *
+ * 现在改用**消息 XML 的 `<img hdlength="...">`** 作权威判据 —— 那正是微信「查看原图 2MB」
+ * 那个数字的来源, 落库即有、不依赖下载进度; 进度观测也改为以**磁盘字节数**为准。
+ *
+ * 另一处: 日志里同一条消息 `start cdn download` 打了 **3 次** —— 本功能与
+ * `AutoCacheImages` 各有各的去重集合 (`inFlight` / `pendingSvrIds`), 彼此看不见, 而
+ * 微信的下载任务被重复触发会互相打断 (视频侧 v290 早已踩过)。去重因此上移到
+ * `WeMessageApi.ensureImageCachedFile` 的 single-flight: 同一张图同一时刻只有一个功能在下,
+ * 其余的搭车等结果。
+ *
+ * ### v296: 账号目录猜错 → 对着缩略图死等
+ *
+ * v295 装上后判据确实对了 (日志能打出 `原图目标大小: expected=4159123B`, 与微信按钮上的
+ * 「3MB」吻合, 也再没有 1~2 秒的假落地), 但**磁盘字节数从头到尾一个数都不涨**:
+ * ```
+ * onDisk=212639/4159123B     (卡住不动, 持续 2 分钟以上)
+ * onDisk=150791/15686378B
+ * onDisk=57150/2777401B
+ * 17:17:03.664 无感加载「查看原图」  ← 用户亲自点了, 微信亲自在下载
+ * 17:18:18.233 onDisk=212639/…      ← 71 秒后仍然一个字节没多
+ * ```
+ * 注意那几个**现存的字节数**(212KB / 150KB / 57KB) —— 那分明是**缩略图**, 不是原图。
+ * 根因: `WeMessageApi.resolveImageFile()` 只取 `MicroMsg` 下**最近修改时间最大**的那个
+ * 32 位目录当账号目录。多账号 / 多用户(Android `userId`, 日志里同时有 `/data/user/0` 与
+ * `/data/user/999`)的设备上会挑错 → `bigImgPath` 解析到别的账号目录下 → 文件不存在 →
+ * `resolveExistingImageFile` 回退到 `midImgPath`(缩略图) → 对着 200KB 的缩略图死等 3 分钟,
+ * 而微信把原图下在了另一个目录。
+ *
+ * **教训: 用「启发式猜出来的目录」当唯一真相, 就必须允许猜错。** 判据再准, 只要落盘路径
+ * 解析错了, 拿到的就是另一个文件 —— 而"那个文件存在且大小对得上 expected"这件事在
+ * 缩略图上恰好也成立(只是小得多)。所以这里不是把判据再收紧一次, 而是**把路径解析改成
+ * 穷举 + 存在性验证**: 按修改时间顺序挨个试所有账号目录, 谁真的有文件用谁。
+ *
+ * 同时补了 `logImageDiagnose`: 把 `big`/`hevc`/`mid` 三个字段的原始值各自解析到哪个文件、
+ * 文件多大、`offset/totalLen`、`MicroMsg` 下有哪几个账号目录及各自修改时间, 一行打完。
+ * 这类"日志里看着像没在动"的问题, 不要再靠猜 —— 让日志把候选集合摊开。
+ *
+ * ### v297: v296 的诊断日志自己把前提证伪了 —— 我们触发的根本不是原图
+ *
+ * v296 诊断日志里的三组数字, 直接否证了 v294/v295/v296 建立的**整个前提**:
+ * ```
+ * localId=37956  big → 65740B   offset=65740/65740   hdlength=2919329
+ * localId=37952  big → 80212B   offset=80212/80212   hdlength=3251086
+ * localId=19507  big → 57150B   offset=57150/57150   hdlength=2777401
+ * ```
+ * **`offset == totalLen` 恒成立**, 且 `totalLen` 与磁盘字节数**一字不差** —— 微信自己的数据库就说
+ * 「这几行已经下载完成」, 而 `totalLen` 只有 `hdlength` 的 2.1%~2.5%。
+ *
+ * **定论**: `hdImgId` / `bigImgPath` 指向的是 `cdnbigimgurl` 对应的**压缩大图**, **压根不是原图**。
+ * `hdlength` 是发送方声明的原始字节数, 接收方微信从未把它落盘 —— 它**不在 `ImgInfo2` 里**。
+ * 所以 `triggerDownload` 三次 `result=0` 不是"触发失败", 而是**微信认为这行已完成、任务被静默忽略**。
+ *
+ * 连带的自我修正: v296 那个「`resolveImageFile` 把账号目录猜错了」的结论**部分不成立** ——
+ * 诊断行里 `big → 65740B` 说明文件**解析对了**且大小自洽, 只是**那张图本来就不是原图**;
+ * 唯一真"不存在"的 localId=37960 反而是最接近原图的 (totalLen=464806, 占 hdlength 的 7.6%)。
+ * **教训: 发现"数值不对"时, 先问「这个数字描述的是不是我要的那个东西」, 再问「为什么不对」。**
+ *
+ * 用户实测: **点开图片后微信确实下到了原图** → 原图存在, 只是走**另一条 CDN 链路**
+ * (视频侧的对称字段是 `cdnrawvideourl`)。而 `ImageMessage` 模型只有
+ * bigImgUrl / midImgUrl / thumbUrl —— **全是压缩图, 从来没读过原图那个字段**。
+ *
+ * v297 因此**不猜字段名**, 只加探针 `logImageXmlProbe`: 把 `<img>` 元素的**全部属性** +
+ * `ImgInfo2` **整行所有列**原样打进日志, 下一轮直接定论。
+ *
+ * 视频侧同一时刻 `accepted=false` 后**零进度日志**、只剩冷却 + 6 轮空转, 与图片侧**同一机制**
+ * (微信在已持有该文件时静默忽略原画质请求)。v297 起: 连续被拒 2 次即**结案**, 不再刷屏;
+ * 首次被拒就打印归因, 不再假装"微信队列里已有同 fileid 任务"而每轮重发。
+ *
+ * ### v298: 尾参 boolean 不是画质开关; 探针本身有盲区
+ * v297 探针问出的答案是**否定性的**: `<img>` 18 个属性里
+ * `cdnthumburl == cdnmidimgurl == cdnbigimgurl`(同一个 CDN 地址)、`cdnhdheight=0
+ * cdnhdwidth=0`(没有 HD 专用字段) —— 图片**没有** `cdnrawimgurl` 那样的独立 HD 资源
+ * (视频侧是有的)。所以"要哪一档画质"只能由**调用参数**决定, 不能靠换 URL。
+ * 而 `ImgInfo2` 整行下载前后对比把失败点钉死: 下完的 464806 **正好等于 `hevc_mid_size`**
+ * —— 微信给的是 HEVC 压缩中间件, 连 `length`(大图)都没到。
+ * v298 试了唯一没利用的开关(尾参 `boolean`): `hdFlag=true` **被接受、不报错, 但档位纹丝不动**,
+ * 于是证伪。**同时暴露探针盲区**: `探针[下载服务方法]` 只过滤了与我们同名的 `b`,
+ * 万一 HD 下载是另一个方法名就永远看不见。
+ *
+ * ### v299: 不猜了, 抓微信自己的调用
+ * 沿视频侧 `探针[下载任务 gallery.f]` 被证明有效的模式: hook `o11.j`
+ * (ModelImage.DownloadImgService) 上**所有参数带 `MsgIdTalker` 的方法**, 把每次调用的
+ * 全部参数(含 `Object` 真实类型) + 返回值打进日志, ThreadLocal 区分「我们自己/微信侧」;
+ * 同时把该类**所有方法**和尾参 `w`(回调接口)的所有方法原样打出。
+ * 用户点「查看原图」时微信走的必然是正确的配方 —— **那一行就是答案**。
  */
 @Feature(
     name = "后台自动加载原图/原视频",
@@ -251,6 +349,21 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
      * 所以"读不出"只能算"信息不足, 稍后重试", 由 [MAX_TOTAL_ATTEMPTS] 兜底防刷屏。
      */
     private const val MAX_TOTAL_ATTEMPTS = 6
+
+    /**
+     * 【v297】原视频下载请求被微信拒绝 (`accepted=false`) 的次数上限。
+     *
+     * 微信在"自己已持有该文件"时会**静默忽略**原画质请求, 返回 false 且零进度 —— 与图片侧
+     * `ImgInfo2` 的 `offset == totalLen`(微信认为已下完) 是**同一个机制**。以前这里把拒绝
+     * 一律归因为"任务在队列里", 于是每轮都重发、每轮被拒, 白占6 轮补偿扫描空转。
+     *
+     * 连续被拒 [MAX_LAUNCH_REJECT] 次即**结案**: 说明微信确实不接受这个请求, 再刷也没意义。
+     * 取 2 而不是 1 —— 单次拒绝仍可能是"微信正在下普通画质"的瞬时状态, 值得再试一次。
+     */
+    private const val MAX_LAUNCH_REJECT = 2
+
+    /** 视频消息在 [settledKeys] 里的键前缀 (图片侧用 "3:", 视频侧用 "43:")。 */
+    private const val PREFETCH_KEY_VIDEO = "43"
 
     /**
      * 【v291】原视频下载写的是**同一个视频文件**: 微信收到视频时自己也在往这个文件里写
@@ -714,6 +827,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
         /** 同一条视频 (CDN fileid) 上次发起的时间戳, 用于 [VIDEO_LAUNCH_COOLDOWN_MS] 冷却。 */
         private val lastLaunchAt = ConcurrentHashMap<String, Long>()
 
+        /** v297: 每个 fileId 被微信拒绝(`accepted=false`)的次数, 用于结案判定。 */
+        private val rejectedLaunches = ConcurrentHashMap<String, Int>()
+
         /** videoinfo(2) 表结构探测结果 (只探一次)。 */
         @Volatile
         private var videoTable: VideoTable? = null
@@ -872,6 +988,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
 
         /** 关闭功能时清掉冷却与表结构缓存, 下次开启重新探测。 */
         fun reset() {
+            logged.clear()
+            lastLaunchAt.clear()
+            rejectedLaunches.clear()
             lastLaunchAt.clear()
             videoTable = null
             videoTableProbed = false
@@ -983,10 +1102,43 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             val accepted = runCatching { r.sessionRun.invoke(session) as? Boolean }.getOrNull()
 
             if (accepted != true && !fileId.isNullOrEmpty()) {
-                // 微信没接这个任务, 几乎总是"同一个 fileid 的任务已经在队列里" —— 也就是微信
-                // 自己正在下普通画质。别按长冷却压满 3 分钟, 让它早一点接上。
+                // v297: 归因改写。v296 之前这里一律归因成"同一个 fileid 的任务已经在队列里,
+                // 让它早一点接上", 于是**每轮都重发、每轮都被拒**, 表现为:
+                //   19:17:48.644 原视频下载已发起: url=2610151446578581 accepted=false
+                //   19:18:05.374 同一条视频刚发起过 (136s 前), 本轮不重复发起
+                //   19:18:15.381 后台下载未完成 43 (via scan, 第 1/6 轮), 留给补偿扫描重试
+                // 之后**零进度日志**, 只剩冷却 + 轮次空转 —— 用户点开视频时微信自己倒是下了原视频。
+                //
+                // 图片侧同一时刻的诊断日志给出了答案(v296): 微信对这类"要原画质"的请求,
+                // 在自己认为"已经持有该文件"时会**静默忽略** —— 表现就是 accepted=false 且零进度。
+                // 所以这里不该再假装它在排队, 而要:
+                //   1. 记下被拒次数, 连续被拒就**结案**, 不再占着 6 轮补偿扫描空转;
+                //   2. 首次被拒时把原因写清楚, 便于下一轮直接定论。
+                val rejected = rejectedLaunches.merge(fileId, 1, Int::plus) ?: 1
+                if (rejected == 1) {
+                    WeLogger.w(
+                        TAG,
+                        "原视频请求被微信拒绝 (accepted=false): fileId=$fileId url=$url。" +
+                                "已发起过但微信未接受 —— 微信在已持有该文件时会静默忽略原画质请求" +
+                                "(与图片侧 totalLen 已完成同一机制)。连续被拒 $MAX_LAUNCH_REJECT 次后结案。"
+                    )
+                }
+                if (rejected >= MAX_LAUNCH_REJECT) {
+                    rejectedLaunches.remove(fileId)
+                    // 结案: 这个 fileId 微信不接, 别再每 3 分钟刷一轮
+                    settledKeys.add("$PREFETCH_KEY_VIDEO:${msgSvrId}")
+                    WeLogger.w(
+                        TAG,
+                        "原视频结案: fileId=$fileId 连续 $MAX_LAUNCH_REJECT 次被微信拒绝, " +
+                                "判定微信不接受该原画质请求, 不再重试 (msgSvrId=$msgSvrId)"
+                    )
+                    return false
+                }
+                // 还没到结案线, 放宽冷却让它早点接上 (但别像以前那样无条件提前)
                 lastLaunchAt[fileId] =
                     System.currentTimeMillis() - (VIDEO_LAUNCH_COOLDOWN_MS - VIDEO_RETRY_COOLDOWN_MS)
+            } else if (accepted == true && !fileId.isNullOrEmpty()) {
+                rejectedLaunches.remove(fileId)
             }
 
             if (logged.add(msgSvrId)) {
