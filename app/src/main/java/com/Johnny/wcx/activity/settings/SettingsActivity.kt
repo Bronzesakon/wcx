@@ -32,9 +32,12 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -49,6 +52,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.composables.icons.materialsymbols.MaterialSymbols
@@ -88,8 +92,11 @@ import com.Johnny.wcx.ui.content.FloatingBottomBarItem
 import com.Johnny.wcx.ui.content.MiuixStackNavigator
 import com.Johnny.wcx.ui.content.liquid.vibrancy
 import com.Johnny.wcx.ui.utils.CommonContextWrapper
+import com.Johnny.wcx.ui.style.AtmosphereBackground
+import com.Johnny.wcx.ui.style.WxPalette
 import com.Johnny.wcx.ui.utils.theme.ModuleTheme
 import com.Johnny.wcx.utils.WeLogger
+import com.Johnny.wcx.utils.android.showToast
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
@@ -112,6 +119,7 @@ import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 import androidx.compose.material3.Icon as M3Icon
 import androidx.compose.material3.Text as M3Text
+import androidx.compose.ui.draw.clipToBounds
 
 val LocalComponentActivity = staticCompositionLocalOf<ComponentActivity> { error("not provided") }
 
@@ -143,8 +151,6 @@ class SettingsActivity : ComponentActivity() {
 //  Feature categories (name -> icon)
 // ---------------------------------------------------------------------------
 
-// 「密友功能」分类刻意放在列表**最后**（隐蔽入口，不显眼）。
-// 设置页搜索会显式排除该分类（见 FeaturesPager），避免随便搜一个词就把密友功能暴露出来。
 val FEATURE_CATEGORIES = listOf(
     "聊天" to MaterialSymbols.Outlined.Chat,
     "联系人与群组" to MaterialSymbols.Outlined.Contacts,
@@ -159,12 +165,11 @@ val FEATURE_CATEGORIES = listOf(
     "视频号" to MaterialSymbols.Outlined.Movie,
     "个人资料" to MaterialSymbols.Outlined.Account_circle,
     "调试" to MaterialSymbols.Outlined.Bug_report,
-    "脚本 (JS)" to MaterialSymbols.Outlined.Terminal,
-    "脚本 (Java)" to MaterialSymbols.Outlined.Terminal,
     "娱乐" to MaterialSymbols.Outlined.Comedy_mask,
     "批量操作" to MaterialSymbols.Outlined.Checklist,
     "首页右上角菜单" to MaterialSymbols.Outlined.Add_circle,
     "联系人详情页面" to MaterialSymbols.Outlined.Contact_page,
+    // 「密友功能」刻意放在列表**最后**（隐蔽入口，不显眼）；搜索页会排除该分类。
     "密友功能" to MaterialSymbols.Outlined.Contacts,
 )
 
@@ -173,28 +178,82 @@ val FEATURE_CATEGORIES = listOf(
 // ---------------------------------------------------------------------------
 
 /** Navigation targets for the Settings activity's stack. */
-private sealed interface SettingsNavTarget {
+internal sealed interface SettingsNavTarget {
     data object Main : SettingsNavTarget
     data class Category(val name: String) : SettingsNavTarget
     data object License : SettingsNavTarget
     data object Acknowledgements : SettingsNavTarget
+    data object HiddenContactsDiagnostics : SettingsNavTarget
+    data object ModuleHealth : SettingsNavTarget
+    data object Logs : SettingsNavTarget
+    data object Settings : SettingsNavTarget
+}
+
+/**
+ * 功能对象（在 Compose 之外）点击后要进子页面时的投递口。
+ * 例如「界面美化 → 主题」：ThemeStore.onClick 只能拿到 Activity，拿不到导航栈。
+ */
+internal object SettingsNavigation {
+    val pending = mutableStateOf<SettingsNavTarget?>(null)
 }
 
 @Composable
 private fun SettingsRoot(onFinish: () -> Unit) {
     val stack = remember { mutableStateListOf<SettingsNavTarget>(SettingsNavTarget.Main) }
 
-    MiuixStackNavigator(stack = stack, onExitRoot = onFinish) { screen, push, pop ->
+    // 接住功能对象的导航请求，避免「点了主题只弹对话框」这种割裂体验。
+    val navRequest = SettingsNavigation.pending.value
+    LaunchedEffect(navRequest) {
+        if (navRequest != null) {
+            stack.add(navRequest)
+            SettingsNavigation.pending.value = null
+        }
+    }
+
+    // 全局返回链（用户要求：任何子页面按返回都逐级回退，而不是直接退到微信主界面）：
+    // 1) Hchat 脚本设置浮层开着 → 先关浮层；
+    // 2) 停在子页面（分类详情/自检/日志等）→ 逐级 pop；
+    // 3) 已在主页 → 交给 MainPagerScreen 内层的 BackHandler（先回 pager 第 0 页再退出）。
+    val rootActivity = LocalComponentActivity.current
+    androidx.activity.compose.BackHandler {
+        if (runCatching { h.Hchat.ui.miuix.MiuixSettingsPage.closeIfOpen(rootActivity) }.getOrDefault(false)) {
+            return@BackHandler
+        }
+        if (stack.size > 1) {
+            stack.removeAt(stack.lastIndex)
+        } else {
+            onFinish()
+        }
+    }
+
+    MiuixStackNavigator(
+        stack = stack,
+        onExitRoot = onFinish,
+        // 覆盖层（Hchat 脚本设置浮层等）优先消费本次返回：只关浮层，不弹栈。
+        interceptBack = {
+            runCatching { h.Hchat.ui.miuix.MiuixSettingsPage.closeIfOpen(rootActivity) }
+                .getOrDefault(false)
+        },
+    ) { screen, push, pop ->
         when (screen) {
             SettingsNavTarget.Main -> MainPagerScreen(
                 onOpenCategory = { push(SettingsNavTarget.Category(it)) },
                 onOpenLicense = { push(SettingsNavTarget.License) },
                 onOpenAcknowledgements = { push(SettingsNavTarget.Acknowledgements) },
+                onOpenModuleHealth = { push(SettingsNavTarget.ModuleHealth) },
+                onOpenLogs = { push(SettingsNavTarget.Logs) },
+                onOpenSettings = { push(SettingsNavTarget.Settings) },
+                onFinish = onFinish,
+                // 只有主界面位于栈顶时才由主界面处理返回（先回 pager 第 0 页/单页模式退出）；
+                // 一旦上面盖了子页面，返回必须由栈导航器逐级 pop，否则侧滑会直接 finish 掉
+                // 整个设置 Activity（表现为「一步退回微信主界面」）。
+                backEnabled = stack.size == 1,
             )
 
             is SettingsNavTarget.Category -> CategoryDetailScreen(
                 categoryName = screen.name,
                 onBack = pop,
+                onOpenHiddenContactsDiagnostics = { push(SettingsNavTarget.HiddenContactsDiagnostics) },
             )
 
             SettingsNavTarget.License -> LicenseScreen(
@@ -202,6 +261,24 @@ private fun SettingsRoot(onFinish: () -> Unit) {
             )
 
             SettingsNavTarget.Acknowledgements -> AcknowledgementsScreen(
+                onBack = pop,
+            )
+
+
+
+
+
+
+            SettingsNavTarget.HiddenContactsDiagnostics -> HiddenContactsDiagnosticsScreen(onBack = pop)
+
+            SettingsNavTarget.ModuleHealth -> ModuleHealthScreen(onBack = pop)
+
+            // 单页模式没有 pager，日志/设置通过子页面进入，返回即回到单页主页
+            SettingsNavTarget.Logs -> LogsScreen(onBack = pop)
+
+            SettingsNavTarget.Settings -> SettingsPager(
+                onOpenLicense = { push(SettingsNavTarget.License) },
+                onOpenAcknowledgements = { push(SettingsNavTarget.Acknowledgements) },
                 onBack = pop,
             )
         }
@@ -213,40 +290,99 @@ private fun MainPagerScreen(
     onOpenCategory: (String) -> Unit,
     onOpenLicense: () -> Unit,
     onOpenAcknowledgements: () -> Unit,
+    onOpenModuleHealth: () -> Unit,
+    onOpenLogs: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onFinish: () -> Unit,
+    backEnabled: Boolean = true,
 ) {
-    val pagerState = rememberPagerState(pageCount = { 5 })
+    val pagerState = rememberPagerState(pageCount = { 4 })
+    val context = LocalContext.current
     val isDragged by pagerState.interactionSource.collectIsDraggedAsState()
     val scope = rememberCoroutineScope()
     val backdrop = rememberLayerBackdrop()
+    var singlePageMode by remember { mutableStateOf(WePrefs.getBoolOrFalse("home_single_page_mode")) }
+    // 返回键兜底：任意 Tab/单页模式都先回到主页（第 0 页），已在主页才退出设置。
+    // 之前没有这层处理，按返回会直接 finish 掉代理 Activity，用户看到的是「退回微信主界面」。
+    androidx.activity.compose.BackHandler(enabled = backEnabled) {
+        // Hchat 脚本设置浮层打开时，先关浮层（不依赖 Xposed 对模块 Activity 的 back hook）。
+        if (runCatching { h.Hchat.ui.miuix.MiuixSettingsPage.closeIfOpen(context) }.getOrDefault(false)) {
+            return@BackHandler
+        }
+        // 单页模式没有 pager，返回键直接退出设置（回到微信）
+        if (singlePageMode) {
+            onFinish()
+            return@BackHandler
+        }
+        if (pagerState.currentPage != 0) {
+            scope.launch { pagerState.animateScrollToPage(0) }
+        } else {
+            onFinish()
+        }
+    }
     val barBottomPadding = 12.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    // 主页样式开关：false = 经典四 Tab（底部玻璃导航）；true = 单页 Dashboard（隐藏底部导航，
+    // 功能分类网格直接铺在主页，日志/设置从主页瓦片进入 —— 参照用户给的 WeChatAI 风格截图）
+    // 切到单页模式时立即回到主页（第 0 页），其余 3 页在单页模式下不可滑动进入。
+    LaunchedEffect(singlePageMode) {
+        if (singlePageMode && pagerState.currentPage != 0) {
+            pagerState.scrollToPage(0)
+        }
+    }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MiuixTheme.colorScheme.background),
-    ) {
+    AtmosphereBackground(modifier = Modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .layerBackdrop(backdrop),
         ) {
-            HorizontalPager(
-                state = pagerState,
-                modifier = Modifier.fillMaxSize(),
-                key = { it },
-            ) { page ->
-                when (page) {
-                    0 -> HomePager(onOpenFeatures = { scope.launch { pagerState.animateScrollToPage(1) } })
-                    1 -> FeaturesPager(onOpenCategory = onOpenCategory)
-                    2 -> ScriptsPager()
-                    3 -> LogsPager()
-                    else -> SettingsPager(onOpenLicense = onOpenLicense, onOpenAcknowledgements = onOpenAcknowledgements)
+            if (singlePageMode) {
+                // 单页模式：根本不创建 pager —— 物理上不存在第 2/3/4 页，
+                // 无论手势/回弹/无障碍滚动都不可能翻到日志、功能、设置页。
+                HomePager(
+                    onOpenFeatures = {},
+                    onOpenModuleHealth = onOpenModuleHealth,
+                    onOpenCategory = onOpenCategory,
+                    singlePageMode = true,
+                    onToggleSinglePage = {
+                        singlePageMode = it
+                        WePrefs.putBool("home_single_page_mode", it)
+                    },
+                    onOpenLogs = onOpenLogs,
+                    onOpenSettings = onOpenSettings,
+                    onOpenScript = { h.Hchat.ui.miuix.MiuixSettingsPage.showScriptPlugin(context) },
+                )
+            } else {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxSize(),
+                    key = { it },
+                ) { page ->
+                    when (page) {
+                        0 -> HomePager(
+                            onOpenFeatures = { scope.launch { pagerState.animateScrollToPage(1) } },
+                            onOpenModuleHealth = onOpenModuleHealth,
+                            onOpenCategory = onOpenCategory,
+                            singlePageMode = false,
+                            onToggleSinglePage = {
+                                singlePageMode = it
+                                WePrefs.putBool("home_single_page_mode", it)
+                            },
+                            onOpenLogs = { scope.launch { pagerState.animateScrollToPage(2) } },
+                            onOpenSettings = { scope.launch { pagerState.animateScrollToPage(3) } },
+                            onOpenScript = { h.Hchat.ui.miuix.MiuixSettingsPage.showScriptPlugin(context) },
+                        )
+                        1 -> FeaturesPager(onOpenCategory = onOpenCategory)
+                        2 -> LogsPager()
+                        else -> SettingsPager(onOpenLicense = onOpenLicense, onOpenAcknowledgements = onOpenAcknowledgements)
+                    }
                 }
             }
         }
 
         val haptic = LocalHapticFeedback.current
 
+        if (!singlePageMode) {
         FloatingBottomBar(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -306,6 +442,7 @@ private fun MainPagerScreen(
                 }
             }
         }
+        }
     }
 }
 
@@ -314,7 +451,6 @@ private data class NavItem(val label: String, val outlined: ImageVector, val fil
 private val TAB_ITEMS = listOf(
     NavItem("主页", MaterialSymbols.Outlined.Home, MaterialSymbols.OutlinedFilled.Home),
     NavItem("功能", MaterialSymbols.Outlined.Tune, MaterialSymbols.OutlinedFilled.Tune),
-    NavItem("脚本", MaterialSymbols.Outlined.Terminal, MaterialSymbols.Outlined.Terminal),
     NavItem("日志", MaterialSymbols.Outlined.Article, MaterialSymbols.OutlinedFilled.Article),
     NavItem("设置", MaterialSymbols.Outlined.Settings, MaterialSymbols.OutlinedFilled.Settings),
 )
@@ -330,6 +466,11 @@ val CONTENT_BOTTOM_INSET = 88.dp
 fun MiuixListScaffold(
     title: String,
     navigationIcon: @Composable (() -> Unit)? = null,
+    // 关闭后顶栏使用不透明底色、列表不再注册为模糊源，用于规避特定页面（内容为单个超高 item）
+    // 在滚动时 backdrop 采样越界导致的顶部灰块。
+    blurTopBar: Boolean = true,
+    // 内容左右内边距。脚本 Tab 内嵌 Hchat 内容（其 SettingsCard 自带 12dp），此处传 0 避免双重内边距。
+    horizontalPadding: Dp = 12.dp,
     content: LazyListScope.() -> Unit,
 ) {
     val scrollBehavior = MiuixScrollBehavior()
@@ -337,21 +478,33 @@ fun MiuixListScaffold(
     // layer through drawBackdrop and paints itself transparent, so scrolled content shows
     // through blurred behind the collapsed bar (InstallerX's useBlur pattern, on miuix-blur glass).
     val barBackdrop = rememberLayerBackdrop()
-    val barTint = MiuixTheme.colorScheme.surface.copy(alpha = 0.67f)
+    // 原来是 0.67 透明的毛玻璃：在 #F2F2F7 灰底上滚动时会变成一块灰糊，
+    // 压在文字上很难看。改成 0.94 近乎不透明，保留一点模糊质感但不糊字。
+    val barTint = MiuixTheme.colorScheme.surface.copy(alpha = 0.94f)
     Scaffold(
+        // 背景统一为氛围渐变底：之前用 miuix 默认白色，分类详情/设置页与主页观感割裂
+        // （用户实测反馈：点进功能页后「一堆白色背景」）。
+        modifier = Modifier
+            .fillMaxSize()
+            .background(WxPalette.pageBackgroundBrush()),
+        containerColor = Color.Transparent,
         topBar = {
             TopAppBar(
-                modifier = Modifier.drawBackdrop(
-                    backdrop = barBackdrop,
-                    shape = { RectangleShape },
-                    effects = {
-                        vibrancy()
-                        blur(24.dp.toPx(), 24.dp.toPx())
-                    },
-                    onDrawSurface = { drawRect(barTint) },
-                ),
+                modifier = if (blurTopBar) {
+                    Modifier.drawBackdrop(
+                        backdrop = barBackdrop,
+                        shape = { RectangleShape },
+                        effects = {
+                            vibrancy()
+                            blur(24.dp.toPx(), 24.dp.toPx())
+                        },
+                        onDrawSurface = { drawRect(barTint) },
+                    )
+                } else {
+                    Modifier
+                },
                 // Transparent so the miuix bar's own opaque surface doesn't hide the blur.
-                color = Color.Transparent,
+                color = if (blurTopBar) Color.Transparent else MiuixTheme.colorScheme.surface,
                 title = title,
                 scrollBehavior = scrollBehavior,
                 navigationIcon = { navigationIcon?.invoke() },
@@ -362,11 +515,12 @@ fun MiuixListScaffold(
         LazyColumn(
             modifier = Modifier
                 .fillMaxHeight()
-                .layerBackdrop(barBackdrop)
+                // 修复「列表页顶部出现异常灰块」：内容超出/回弹时 backdrop 采样会越界绘制。
+                .then(if (blurTopBar) Modifier.clipToBounds().layerBackdrop(barBackdrop) else Modifier)
                 .scrollEndHaptic()
                 .overScrollVertical()
                 .nestedScroll(scrollBehavior.nestedScrollConnection)
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = horizontalPadding),
             contentPadding = innerPadding,
             overscrollEffect = null,
             content = content,
@@ -393,7 +547,7 @@ fun Modifier.groupedCardItem(index: Int, count: Int): Modifier {
     val bottom = index == count - 1
     return fillMaxWidth()
         .squircleSurface(
-            color = MiuixTheme.colorScheme.surfaceContainer,
+            color = WxPalette.cardBackground(),
             topStart = if (top) r else z,
             topEnd = if (top) r else z,
             bottomEnd = if (bottom) r else z,
@@ -439,6 +593,13 @@ fun FeatureRow(
 
     fun toggle(requested: Boolean) {
         item as SwitchFeature
+        // 当前微信版本已不支持该功能时直接拒绝开启并说明原因，而不是让用户开了发现没反应。
+        val unavailable = if (requested) item.unavailableReason else null
+        if (unavailable != null) {
+            WeLogger.w("SettingsActivity", "拒绝开启 ${item.displayName}：$unavailable")
+            showToast(unavailable)
+            return
+        }
         if (item.onBeforeToggle(requested, context)) {
             WePrefs.putBool(configKey, requested)
             item.isEnabled = requested

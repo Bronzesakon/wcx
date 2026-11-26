@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.payment
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import com.Johnny.wcx.R
 
 import android.content.Context
@@ -263,13 +264,13 @@ internal object RedPacketSettings {
                     val count = contactOverrides(contact.wxId).overriddenCount()
                     when {
                         contact.wxId.isGroupChatWxId && count > 0 ->
-                            localizedContext.resources.getQuantityString(
+                            localizedContext.resources.safeGetQuantityString(
                                 R.plurals.automation_group_overrides,
                                 count,
                                 count,
                             )
                         contact.wxId.isGroupChatWxId -> "群聊设置"
-                        count > 0 -> localizedContext.resources.getQuantityString(
+                        count > 0 -> localizedContext.resources.safeGetQuantityString(
                             R.plurals.automation_overrides,
                             count,
                             count,
@@ -391,7 +392,7 @@ internal object RedPacketSettings {
                     if (count == 0) {
                         "跟随群聊全局设置"
                     } else {
-                        localizedContext.resources.getQuantityString(
+                        localizedContext.resources.safeGetQuantityString(
                             R.plurals.automation_overrides,
                             count,
                             count,

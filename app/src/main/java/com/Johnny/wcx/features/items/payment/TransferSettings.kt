@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.payment
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import com.Johnny.wcx.R
 
 import android.content.Context
@@ -259,7 +260,7 @@ internal object TransferSettings {
                         contact.wxId.isGroupChatWxId && own + members > 0 ->
                             "群聊设置 - 已配置"
                         contact.wxId.isGroupChatWxId -> "群聊设置"
-                        own > 0 -> localizedContext.resources.getQuantityString(
+                        own > 0 -> localizedContext.resources.safeGetQuantityString(
                             R.plurals.automation_overrides,
                             own,
                             own,
@@ -377,7 +378,7 @@ internal object TransferSettings {
                     if (count == 0) {
                         "跟随群聊全局设置"
                     } else {
-                        localizedContext.resources.getQuantityString(
+                        localizedContext.resources.safeGetQuantityString(
                             R.plurals.automation_overrides,
                             count,
                             count,

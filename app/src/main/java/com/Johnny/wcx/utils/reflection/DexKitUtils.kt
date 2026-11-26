@@ -8,13 +8,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.result.ClassData
 import org.luckypray.dexkit.result.MethodData
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.seconds
 
 inline val MethodData.asMethod get() = getMethodInstance(ClassLoaders.HOST)
@@ -25,72 +21,127 @@ inline val MethodData.asConstructor get() = getConstructorInstance(ClassLoaders.
 
 private object DexKitHolder {
 
+    private const val TAG = "DexKitHolder"
+
     /**
      * 空闲多久回收 DexKit。
      *
-     * 原值 30s 太短：一次 DexKit 全量查找动辄超过 30 秒，这段时间里不会再有人调用
-     * [get]，定时器就会把**正在被其它线程使用**的 bridge `close()` 掉，
-     * native 层 use-after-free 直接崩微信（表现为"适配到一半微信闪退"）。
-     * 放宽到 120s，并且只要有 [retain] 过的长期持有者就永不回收。
+     * 长扫描通过 [acquire] 持有租约，或由 [retain] 永久 pin 住，因此计时器不会在查询
+     * 进行中关闭 bridge。保留 120 秒空闲窗口，避免一次性查询结束后立刻重建 native 索引。
      */
     private val IDLE_TIMEOUT = 120.seconds
 
-    // SupervisorJob so a cancelled timer job never takes down the whole scope
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mutex = Mutex()
+    private val lock = Any()
 
     private var bridge: DexKitBridge? = null
-    private var idleJob: Job? = null
+    private var activeLeaseCount = 0
+    private var pinned = false
+    private var idleCloseJob: Job? = null
+    private var idleCloseGeneration = 0L
 
-    /** 被长期持有（脚本子系统）时不做空闲回收 */
-    private val pinned = AtomicBoolean(false)
-
-    fun get(): DexKitBridge = runBlocking { obtain() }
-
-    /**
-     * 长期持有 DexKit：置位后 bridge 不再因空闲被回收（幂等）。
-     * 供脚本子系统等需要常驻使用 DexKit 的模块调用。
-     */
-    fun retain(): DexKitBridge = runBlocking {
-        pinned.set(true)
-        obtain()
+    private fun bridgeLocked(): DexKitBridge {
+        val current = bridge
+        return if (current?.isValid == true) {
+            current
+        } else {
+            DexKitBridge.create(HostInfo.appInfo.sourceDir).also {
+                WeLogger.d(TAG, "created DexKit bridge")
+                bridge = it
+            }
+        }
     }
 
-    private suspend fun obtain(): DexKitBridge = mutex.withLock {
-        val existing = bridge
-        val instance = existing ?: DexKitBridge.create(HostInfo.appInfo.sourceDir).also {
-            WeLogger.d("DexKitHolder", "created DexKit bridge")
-            bridge = it
-        }
+    /** Direct bridge access without lease accounting; cancels any pending idle close. */
+    fun peek(): DexKitBridge = synchronized(lock) {
+        cancelIdleCloseLocked()
+        bridgeLocked()
+    }
 
-        // 有新的使用需求，重置空闲回收
-        idleJob?.cancel()
-        idleJob = null
-        if (!pinned.get()) {
-            idleJob = scope.launch {
-                delay(IDLE_TIMEOUT)
-                mutex.withLock {
-                    if (!pinned.get()) {
-                        WeLogger.d("DexKitHolder", "idle timeout reached, closing DexKit")
-                        bridge?.close()
-                        bridge = null
-                        idleJob = null
-                    }
+    fun acquire(): DexKitBridge = synchronized(lock) {
+        cancelIdleCloseLocked()
+        val acquired = bridgeLocked()
+        activeLeaseCount++
+        acquired
+    }
+
+    /** Pin the shared bridge for process-long users such as the background adapter. */
+    fun retain(): DexKitBridge = synchronized(lock) {
+        pinned = true
+        cancelIdleCloseLocked()
+        bridgeLocked()
+    }
+
+    fun release() = synchronized(lock) {
+        check(activeLeaseCount > 0) { "DexKit lease released without a matching acquire" }
+
+        activeLeaseCount--
+        if (activeLeaseCount == 0 && !pinned) scheduleIdleCloseLocked()
+    }
+
+    private fun cancelIdleCloseLocked() {
+        idleCloseGeneration++
+        idleCloseJob?.cancel()
+        idleCloseJob = null
+    }
+
+    private fun scheduleIdleCloseLocked() {
+        check(idleCloseJob == null)
+        check(!pinned && activeLeaseCount == 0)
+        val generation = ++idleCloseGeneration
+
+        idleCloseJob = scope.launch {
+            delay(IDLE_TIMEOUT)
+            synchronized(lock) {
+                if (generation != idleCloseGeneration || activeLeaseCount != 0 || pinned) {
+                    return@synchronized
+                }
+
+                val idleBridge = bridge
+                bridge = null
+                idleCloseJob = null
+
+                if (idleBridge != null) {
+                    WeLogger.d(TAG, "idle timeout reached, closing DexKit")
+                    idleBridge.close()
                 }
             }
         }
-        instance
     }
 }
 
-val DexKit: DexKitBridge get() = DexKitHolder.get()
+/**
+ * Keeps the shared bridge valid for the entire [block]. DexKit result objects must be consumed
+ * inside the block because some of them retain the bridge for follow-up queries.
+ */
+fun <T> withDexKit(block: (DexKitBridge) -> T): T {
+    val dexKit = DexKitHolder.acquire()
+    return try {
+        block(dexKit)
+    } finally {
+        DexKitHolder.release()
+    }
+}
+
+/** Suspending counterpart of [withDexKit]. The lease remains active across suspension points. */
+suspend fun <T> withDexKitSuspending(block: suspend (DexKitBridge) -> T): T {
+    val dexKit = DexKitHolder.acquire()
+    return try {
+        block(dexKit)
+    } finally {
+        DexKitHolder.release()
+    }
+}
+
+/**
+ * Direct bridge access without lease accounting. Used by one-shot scan paths that pass the
+ * bridge around; callers that need bounded lifetime should use [withDexKit] instead.
+ */
+val DexKit: DexKitBridge get() = DexKitHolder.peek()
 
 /**
  * 取得一个长期存活的 DexKit 实例。
  *
- * 脚本子系统原先自行 `DexKitBridge.create(...)` 创建了第二个实例并永久持有，与主适配
- * 用的这一个同时存在。微信 8.x 的 dex 很大，两份索引会把内存顶到 OOM（微信闪退），
- * 也让 native 层承受双份并发查找。现在统一复用同一个实例，并以 pin 的方式保证它
- * 不会被空闲回收（脚本运行时随时需要它）。
+ * 后台适配与脚本子系统复用同一份 native 索引；pin 住后不会因空闲回收被关闭。
  */
 fun retainDexKit(): DexKitBridge = DexKitHolder.retain()

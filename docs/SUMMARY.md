@@ -6,6 +6,7 @@
 * [⚙️ 配置指南](configuration.md)
 * [🔧 模块设置说明](module-settings.md)
 * [🛠️ 开发指南](development.md)
+* [📚 功能目录](SUMMARY.md)
 * [❓ 常见问题](faq.md)
 * [🐛 问题反馈指南](bug-report-guide.md)
 * [⭐ 建议反馈指南](feature-request-guide.md)
@@ -13,8 +14,8 @@
 
 ## 聊天
 
-* [阻止消息撤回 1](liao-tian/zu-zhi-xiao-xi-che-hui-1.md)
-* [阻止消息撤回 3](liao-tian/zu-zhi-xiao-xi-che-hui-3.md)
+* [分类概览](features/chat/README.md)
+* [防撤回](features/chat/anti-message-recall.md)
 * [自动启用发送原图](features/chat/auto-enable-no-compress-on-send-media.md)
 * [自动语音转文字](features/chat/auto-speech-to-text.md)
 * [自动查看原图](features/chat/auto-view-original-media.md)
@@ -53,8 +54,21 @@
 * [显隐全部对话](features/chat/toggle-all-conversations-visibility.md)
 * [虚拟视频通话](features/chat/virtual-voip-video.md)
 
+## 聊天输入栏菜单
+
+* [分类概览](features/chat_input_bar_menu/README.md)
+
+## 首页右上角菜单
+
+* [分类概览](features/home_screen_menu/README.md)
+
+## 音视频通话
+
+* [分类概览](features/voip/README.md)
+
 ## 联系人与群组
 
+* [分类概览](features/contacts/README.md)
 * [自定义好友本地头像](features/contacts/custom-local-friend-avatars.md)
 * [检测单向删除好友](features/contacts/detect-deleted-friends.md)
 * [查看群成员消息历史](features/contacts/display-group-member-messages.md)
@@ -67,8 +81,13 @@
 * [显示微信 ID](features/contacts/show-wx-id-in-contact-details.md)
 * [分裂群组](features/contacts/split-group-chats.md)
 
+## 批量操作
+
+* [分类概览](features/batch/README.md)
+
 ## 朋友圈
 
+* [分类概览](features/moments/README.md)
 * [拦截朋友圈删除](features/moments/anti-moments-delete.md)
 * [朋友圈伪集赞](features/moments/fake-moments-likes.md)
 * [朋友圈底部详细信息](features/moments/display-details.md)
@@ -79,6 +98,7 @@
 
 ## 红包与支付
 
+* [分类概览](features/payment/README.md)
 * [自动抢红包](features/payment/auto-open-red-packets.md)
 * [自动接收转账](features/payment/auto-accept-transfers.md)
 * [指纹支付](features/payment/fingerprint-pay.md)
@@ -88,6 +108,7 @@
 
 ## 界面美化
 
+* [分类概览](features/beautify/README.md)
 * [莫奈引擎](features/beautify/monet-engine.md)
 * [主屏幕添加 FAB](features/beautify/add-main-screen-fab.md)
 * [美化首页底部导航栏](features/beautify/replace-navigation-bar.md)
@@ -100,6 +121,7 @@
 
 ## 系统与隐私
 
+* [分类概览](features/system/README.md)
 * [API 服务器](features/system/api-server.md)
 * [自动批准设备登录](features/system/auto-approve-device-login.md)
 * [清理缓存垃圾](features/system/auto-clean-cache.md)
@@ -128,15 +150,18 @@
 
 ## 通知
 
+* [分类概览](features/notifications/README.md)
 * [通知进化](features/notifications/notifications-evolved.md)
 
 ## 公众号
 
+* [分类概览](features/official_accounts/README.md)
 * [允许公众号网页多开](features/official_accounts/use-multi-webview-for-official-accounts.md)
 * [恢复旧版公众号列表](features/official_accounts/use-legacy-official-accounts-view.md)
 
 ## 小程序
 
+* [分类概览](features/miniapps/README.md)
 * [移除嵌入广告](features/miniapps/remove-embedded-ads.md)
 * [移除开屏广告](features/miniapps/remove-splash-ads.md)
 * [移除视频广告](features/miniapps/remove-video-ads.md)
@@ -146,25 +171,33 @@
 
 ## 视频号
 
+* [分类概览](features/shortvideos/README.md)
 * [禁用评论长度限制](features/shortvideos/disable-comment-size-limit.md)
 * [下载媒体](features/shortvideos/download-media.md)
 
 ## 个人资料
 
+* [分类概览](features/profile/README.md)
 * [设置微信昵称](features/profile/set-profile-nickname.md)
 * [上传透明头像](features/profile/upload-transparent-avatars.md)
 * [移除个性签名限制](features/profile/remove-signature-limits.md)
 
 ## 脚本引擎
 
+* [分类概览](features/scripting_js/README.md)
 * [脚本引擎](features/scripting_js/js-scripting-hook.md)
 * [脚本引擎 API 参考](features/scripting_js/js-api-reference.md)
 * [触发器: 收到消息](features/scripting_js/on-message.md)
 * [触发器: 发起请求](features/scripting_js/on-request.md)
 * [触发器: 收到响应](features/scripting_js/on-response.md)
 
+## 脚本（Java）
+
+* [分类概览](features/scripting_java/README.md)
+
 ## 调试
 
+* [分类概览](features/debug/README.md)
 * [崩溃拦截](features/debug/crash-interceptor.md)
 * [崩溃拦截 (Native)](features/debug/native-crash-interceptor.md)
 * [崩溃日志查看器](features/debug/crash-logs-viewer.md)
@@ -179,9 +212,11 @@
 
 ## 娱乐
 
+* [分类概览](features/entertain/README.md)
 * [清空资料信息](features/entertain/clear-profile-details.md)
 * [防止封号](features/entertain/troll-ban.md)
 
 ## 彩蛋
 
+* [分类概览](features/easter_egg/README.md)
 * [愚人节彩蛋](features/easter_egg/april-fools.md)

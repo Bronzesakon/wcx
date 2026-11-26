@@ -6,8 +6,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Checkbox
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -16,11 +17,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.composables.icons.materialsymbols.MaterialSymbols
@@ -29,6 +33,7 @@ import com.composables.icons.materialsymbols.outlined.Schedule
 import com.Johnny.wcx.features.api.core.WeDatabaseApi
 import com.Johnny.wcx.features.api.core.WeMessageApi
 import com.Johnny.wcx.features.api.core.WeServiceApi
+import com.Johnny.wcx.features.api.core.models.IWeContact
 import com.Johnny.wcx.features.api.core.models.MessageInfo
 import com.Johnny.wcx.features.api.core.models.MessageType
 import com.Johnny.wcx.features.api.ui.WeChatMessageContextMenuApi
@@ -344,76 +349,50 @@ object ScheduledMessageMenu : SwitchFeature(),
         segments: List<MessageSegment>,
         onDismiss: () -> Unit
     ) {
-        var subject by remember { mutableStateOf("") }
-        val timePickerState = rememberTimePickerState(
+        // 与模块端「添加定时任务」共用同一个编辑器组件, 两个入口功能完全一致:
+        // 发送对象(可多选) / 消息段列表 / 添加消息段 / 从收藏添加 / 发送时间 / 每天重复 / 启用。
+        ScheduleTaskEditor(
+            title = "定时发送",
+            initialTargets = listOf(ScheduleTarget(talker, talkerName)),
+            initialSegments = segments,
             initialHour = 10,
             initialMinute = 0,
-            is24Hour = true
-        )
-        var repeatDaily by remember { mutableStateOf(true) }
-
-        AlertDialogContent(
-            title = { Text("定时发送") },
-            text = {
-                DefaultColumn(scrollable = true) {
-                    OutlinedTextField(
-                        value = subject,
-                        onValueChange = { subject = it },
-                        label = { Text("主题（必填）") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-
-                    Spacer(Modifier.height(8.dp))
-                    Text("发送对象", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                    ListItem(
-                        headlineContent = { Text(if (talkerName.isNotBlank()) talkerName else talker) },
-                        supportingContent = { Text(talker) }
-                    )
-
-                    Spacer(Modifier.height(8.dp))
-                    Text("发送时间", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                    TimePicker(state = timePickerState)
-
-                    ListItem(
-                        modifier = Modifier.clickable { repeatDaily = !repeatDaily },
-                        trailingContent = { Switch(checked = repeatDaily, onCheckedChange = null) },
-                        headlineContent = { Text("每天重复") },
-                        supportingContent = { Text(if (repeatDaily) "每天同一时间发送" else "仅发送一次") }
-                    )
-
-                    ListItem(
-                        headlineContent = { Text("内容摘要") },
-                        supportingContent = { Text(segmentsSummary(segments)) }
-                    )
+            initialRepeatDaily = true,
+            initialEnabled = true,
+            subjectRequired = true,
+            onDismiss = onDismiss,
+            onConfirm = { draft ->
+                if (draft.subject.isBlank()) {
+                    showToast("请输入主题")
+                    return@ScheduleTaskEditor
                 }
-            },
-            dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-            confirmButton = {
-                Button(onClick = {
-                    if (subject.isBlank()) {
-                        showToast("请输入主题")
-                        return@Button
-                    }
+                if (draft.targets.isEmpty() || draft.talker.isBlank()) {
+                    showToast("请选择发送对象")
+                    return@ScheduleTaskEditor
+                }
+                if (draft.segments.isEmpty()) {
+                    showToast("请至少添加一个消息段")
+                    return@ScheduleTaskEditor
+                }
+                val schedule = ScheduleConfig(
+                    id = "${System.currentTimeMillis()}",
+                    talker = draft.talker,
+                    talkerName = draft.talkerName,
+                    extraTalkers = draft.extraTalkers,
+                    extraTalkerNames = draft.extraTalkerNames,
+                    subject = draft.subject.trim(),
+                    hour = draft.hour,
+                    minute = draft.minute,
+                    repeatDaily = draft.repeatDaily,
+                    // 关闭"每天重复"即为一次性任务：发送一次后自动停用，避免残留
+                    oneTimeOnly = !draft.repeatDaily,
+                    enabled = draft.enabled,
+                    segments = draft.segments
+                )
 
-                    val schedule = ScheduleConfig(
-                        id = "${System.currentTimeMillis()}",
-                        talker = talker,
-                        talkerName = talkerName,
-                        subject = subject.trim(),
-                        hour = timePickerState.hour,
-                        minute = timePickerState.minute,
-                        repeatDaily = repeatDaily,
-                        // 关闭"每天重复"即为一次性任务：发送一次后自动停用，避免残留
-                        oneTimeOnly = !repeatDaily,
-                        enabled = true,
-                        segments = segments
-                    )
-
-                    ScheduledMessage.addSchedule(schedule)
-                    showToast("定时任务已添加")
-                    onDismiss()
-                }) { Text("确认") }
+                ScheduledMessage.addSchedule(schedule)
+                showToast("定时任务已添加")
+                onDismiss()
             }
         )
     }
@@ -490,11 +469,6 @@ object ScheduledMessageMenu : SwitchFeature(),
 
     // ------------------------------------------------------------------
 
-    private fun segmentsSummary(segments: List<MessageSegment>): String {
-        if (segments.isEmpty()) return "空任务"
-        val typesStr = segments.joinToString("+") { it.type.description }
-        return "${segments.size}段消息: $typesStr"
-    }
 
     /** 兼容旧数据（单段 legacy 字段）的任务摘要 */
     private fun scheduleSummary(schedule: ScheduleConfig): String {

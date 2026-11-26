@@ -21,6 +21,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import com.Johnny.wcx.ui.style.WxPalette
 
 @Composable
 fun AlertDialogContent(
@@ -32,17 +37,21 @@ fun AlertDialogContent(
     dismissButton: (@Composable () -> Unit)? = null,
     fullScreen: Boolean = false
 ) {
+    // 全局弹窗外壳：大圆角 + 极浅马卡龙渐变，所有功能弹窗共用一套观感。
     Surface(
-        shape = if (fullScreen) RectangleShape else MaterialTheme.shapes.extraLarge,
-        tonalElevation = if (fullScreen) 0.dp else 6.dp,
+        shape = if (fullScreen) RectangleShape else RoundedCornerShape(24.dp),
+        color = Color.Transparent,
+        tonalElevation = 0.dp,
         modifier = modifier.then(
-            if (fullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
+            if (fullScreen) Modifier.fillMaxSize()
+            else Modifier.fillMaxWidth().wrapContentHeight()
         )
     ) {
         // 非全屏（浮动 Dialog）时按内容自适应高度，避免内容少时把面板撑到接近全屏；
         // 全屏模式（联系人选择器）仍撑满。
         Column(
             modifier = Modifier
+                .background(Brush.verticalGradient(listOf(Color.White, Color(0xFFF4FAF7))))
                 .then(if (fullScreen) Modifier.fillMaxSize() else Modifier)
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -63,7 +72,10 @@ fun AlertDialogContent(
                     val customStyle = MaterialTheme.typography.headlineSmall.copy(
                         fontWeight = FontWeight.Bold
                     )
-                    CompositionLocalProvider(LocalTextStyle provides customStyle) {
+                    CompositionLocalProvider(
+                        LocalTextStyle provides customStyle,
+                        LocalContentColor provides WxPalette.Primary,
+                    ) {
                         it()
                     }
                 }

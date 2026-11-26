@@ -4,10 +4,17 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
 import android.graphics.Outline
+import android.graphics.Paint
+import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.util.AttributeSet
@@ -21,6 +28,7 @@ import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.WindowInsets
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RelativeLayout
 import android.widget.TextView
@@ -54,14 +62,18 @@ import com.Johnny.wcx.preferences.WePrefs.Companion.prefOption
 import com.Johnny.wcx.ui.content.AlertDialogContent
 import com.Johnny.wcx.ui.content.TextButton
 import com.Johnny.wcx.ui.content.m3.BaseItemContainer
+import com.Johnny.wcx.ui.content.m3.DropDownMenuWidget
+import com.Johnny.wcx.ui.content.m3.DropdownOption
 import com.Johnny.wcx.ui.content.m3.BaseWidget
 import com.Johnny.wcx.ui.content.m3.IntNumberPickerWidget
 import com.Johnny.wcx.ui.content.m3.SegmentedColumn
+import com.Johnny.wcx.ui.content.m3.SwitchWidget
 import com.Johnny.wcx.ui.utils.allViews
 import com.Johnny.wcx.ui.utils.findViewWhich
 import com.Johnny.wcx.ui.utils.findViewsWhich
 import com.Johnny.wcx.ui.utils.showComposeDialog
 import com.Johnny.wcx.utils.WeLogger
+import com.Johnny.wcx.utils.android.isDarkMode
 import com.Johnny.wcx.utils.reflection.int
 import java.lang.reflect.Field
 import java.util.WeakHashMap
@@ -94,6 +106,9 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     private const val MIN_ELEVATION = 0
     private const val MAX_ELEVATION = 16
 
+    private const val HEADER_STYLE_INTEGRATED = "INTEGRATED"
+    private const val HEADER_STYLE_SEPARATED = "SEPARATED"
+
     private const val RECONCILE_LAYOUT = 1
     private const val RECONCILE_TIPS = 1 shl 1
     private const val RECONCILE_QUICK_SELECT = 1 shl 2
@@ -109,6 +124,17 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
 
     private const val BASE_CONVERSATION_ACTIVITY_CLASS =
         "com.tencent.mm.ui.conversation.BaseConversationUI"
+
+    /** 半屏弹窗宿主 (会话内点开新会话等)。窗口顶部带圆角, 标题卡不能贴到最上沿。 */
+    private const val HALF_SCREEN_ACTIVITY_CLASS =
+        "com.tencent.mm.ui.halfscreen.HalfScreenTransparentActivity"
+
+    /** 半屏弹窗顶部圆角高度, 标题卡在此基础上再留出自己配置的 topGap。 */
+    private const val HALF_SCREEN_TOP_GAP_DP = 20
+
+    /** 企业微信会话页，不应应用悬浮标题栏。 */
+    private const val ENTERPRISE_CONVERSATION_UI_CLASS =
+        "com.tencent.mm.ui.conversation.EnterpriseConversationUI"
 
     /** 消息列表所在的内容区宿主, 标题区挂件之外的直接子 View 才需要做成悬浮卡。 */
     private const val CHATTING_SCROLL_LAYOUT_CLASS = "com.tencent.mm.pluginsdk.ui.chat.ChattingScrollLayout"
@@ -193,6 +219,30 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     private var topGapDp by prefOption("floating_chat_header_top_gap", DEFAULT_TOP_GAP)
     private var extraGapDp by prefOption("floating_chat_header_extra_gap", DEFAULT_EXTRA_GAP)
     private var elevationDp by prefOption("floating_chat_header_elevation", DEFAULT_ELEVATION)
+    private var capsuleLengthDp by prefOption("floating_chat_header_capsule_length", 0)
+    private var backgroundTransparency by prefOption("floating_chat_header_background_transparency", 5)
+    /**
+     * 标题栏布局：一体式（整块悬浮卡片）/ 分段式（返回、标题、更多三段独立胶囊 + 顶部渐变遮罩）。
+     * 空字符串表示还没选过，沿用旧键 [legacySegmentedHeader] 的值。
+     */
+    private var headerLayoutStyleName by prefOption("floating_chat_header_layout_style", "")
+
+    /** 旧配置键：升级前用「三段式标题栏」开关设置过的人沿用其状态。 */
+    private var legacySegmentedHeader by prefOption("floating_chat_header_segmented", false)
+
+    // 分段式依赖微信标题栏内部结构，换个微信版本就可能不生效，默认仍是一体式。
+    private val segmentedHeader: Boolean
+        get() = when (headerLayoutStyleName) {
+            HEADER_STYLE_SEPARATED -> true
+            HEADER_STYLE_INTEGRATED -> false
+            else -> legacySegmentedHeader
+        }
+
+    private fun setHeaderLayoutStyle(name: String) {
+        headerLayoutStyleName = name
+        // 同步旧键，回退到旧版本时状态不会错位
+        legacySegmentedHeader = name == HEADER_STYLE_SEPARATED
+    }
 
     /** 每个窗口是否已由本特性启用状态栏 edge-to-edge。 */
     private val edgeToEdgeApplied = WeakHashMap<Window, Boolean>()
@@ -208,6 +258,12 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
 
     /** 每个会话页布局 (ChattingUILayout) 对应的标题栏容器。 */
     private val headerViews = WeakHashMap<View, View>()
+
+    /** 由半屏弹窗承载的会话布局: 标题卡需要额外让出弹窗顶部圆角高度。 */
+    private val halfScreenLayouts = WeakHashMap<View, Boolean>()
+
+    /** 归拢分组页标题栏的原始 topMargin（AppCompat 已把状态栏 inset 算在里面）。 */
+    private val convBoxHeaderBaseTops = WeakHashMap<View, Int>()
 
     /** 标题栏重挂前在根布局里的原始顶部偏移 (含状态栏 inset), 重挂后当 topMargin 的基准。 */
     private val headerTopOffsets = WeakHashMap<View, Int>()
@@ -379,7 +435,222 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     /** 上次实际套用的样式, 配置变化后下一帧自动重刷。 */
     private val headerStyles = WeakHashMap<View, HeaderStyle>()
 
+    /** 三段式标题栏底图（背景 Drawable）, 以及它接管前的原背景。 */
+    private val segmentedHeaders = WeakHashMap<View, SegmentedHeaderDrawable>()
+
+    /** 标题栏上方/背后的渐变遮罩, 让消息从栏后透出来。 */
+    private val headerScrims = WeakHashMap<View, View>()
+    private var scrimGradient: GradientDrawable? = null
+    private var scrimGradientDark: Boolean? = null
+
+    /** 消息列表原始的 clipToPadding, 关闭特性时还原。 */
+    private val chatListClipToPaddings = WeakHashMap<ViewGroup, Boolean>()
+
     private data class HeaderStyle(val cornerRadiusDp: Int, val elevationDp: Int)
+
+    /**
+     * 三段式标题栏底图：返回/更多各一个圆环，中间标题一个胶囊，其余区域透明。
+     *
+     * 画在背景 Drawable 里而不是额外加一个装饰子 View：ActionBarContainer 的 onMeasure
+     * 只测量它认识的那几个子控件，塞进去的 View 会被量成 0×0；背景 Drawable 的 bounds
+     * 天然等于标题栏自身，子控件坐标直接可用，也不需要改任何布局。
+     */
+    private class SegmentedHeaderDrawable(private val host: View) : Drawable() {
+
+        /** 接管前的原背景, 关闭特性时还原。 */
+        val originalBackground: Drawable? = host.background
+
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val rect = RectF()
+
+        override fun setAlpha(alpha: Int) {
+            paint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            paint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+        override fun draw(canvas: Canvas) {
+            if (bounds.width() <= 0 || bounds.height() <= 0) return
+            val group = host as? ViewGroup ?: return
+            val density = host.resources.displayMetrics.density
+            val dark = host.context.isDarkMode
+            val opacity = (100 - backgroundTransparency.coerceIn(0, 100)) * 255 / 100
+            val fill = (opacity shl 24) or (if (dark) 0x242424 else 0xFFFFFF)
+            val stroke = ((opacity * (if (dark) 36 else 31) / 255) shl 24) or
+                (if (dark) 0xFFFFFF else 0x000000)
+
+            val icons = ArrayList<View>(6)
+            val titles = ArrayList<TextView>(3)
+            for (i in 0 until group.childCount) collect(group.getChildAt(i), icons, titles, 0)
+
+            // 回到左/右三分之一区域的就是返回和更多；标题取中间最宽的那条文本
+            val width = bounds.width().toFloat()
+            val leftIcon = icons
+                .filter { centerXInHost(it) < width * 0.35f }
+                .minByOrNull { centerXInHost(it) }
+            val rightIcon = icons
+                .filter { centerXInHost(it) > width * 0.65f }
+                .maxByOrNull { centerXInHost(it) }
+            // 两侧环各自以自己的图标为垂直圆心（共用半径保证大小一致）；
+            // 之前共用一条参考中线，左右图标高度差就会让一侧内容不居中。
+            val commonRadius = minOf(
+                22 * density,
+                bounds.height() / 2f - density,
+                bounds.width() / 2f - density,
+            ).coerceAtLeast(0f)
+            leftIcon?.let { drawIconRing(canvas, it, fill, stroke, density, commonRadius) }
+            rightIcon?.let { drawIconRing(canvas, it, fill, stroke, density, commonRadius) }
+
+            titles
+                .filter { it.width > 0 && !it.text.isNullOrBlank() }
+                .maxByOrNull { it.width.toLong() * it.height }
+                ?.let { drawTitlePill(canvas, it, fill, stroke, density) }
+        }
+
+        private fun collect(
+            view: View,
+            icons: MutableList<View>,
+            titles: MutableList<TextView>,
+            depth: Int,
+        ) {
+            if (depth > 6 || view.visibility != View.VISIBLE) return
+            if (view is ImageView && view.drawable != null) icons += view
+            if (view is TextView && !view.text.isNullOrBlank()) titles += view
+            if (view is ViewGroup) {
+                for (i in 0 until view.childCount) {
+                    collect(view.getChildAt(i), icons, titles, depth + 1)
+                }
+            }
+        }
+
+        /** 子控件坐标是相对直接父容器的, 沿着父链累加到标题栏坐标系。 */
+        private fun offsetInHost(view: View, horizontal: Boolean): Float {
+            var value = 0f
+            var current: View? = view
+            while (current != null && current !== host) {
+                value += if (horizontal) {
+                    current.left + current.translationX
+                } else {
+                    current.top + current.translationY
+                }
+                current = current.parent as? View
+            }
+            return value
+        }
+
+        private fun centerXInHost(view: View): Float =
+            offsetInHost(view, true) + view.width / 2f
+
+        private fun drawIconRing(
+            canvas: Canvas,
+            icon: View,
+            fill: Int,
+            stroke: Int,
+            density: Float,
+            radius: Float,
+        ) {
+            if (radius == 0f) return
+            // 圆心落在图标自身中心（钳进标题栏内，避免被裁剪）。
+            val cx = centerXInHost(icon).coerceIn(
+                bounds.left + radius + density,
+                bounds.right - radius - density,
+            )
+            val rawCy = offsetInHost(icon, false) + icon.height / 2f
+            val cy = rawCy.coerceIn(
+                bounds.top + radius + density,
+                bounds.bottom - radius - density,
+            )
+            paint.style = Paint.Style.FILL
+            paint.color = fill
+            canvas.drawCircle(cx, cy, radius, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = density
+            paint.color = stroke
+            canvas.drawCircle(cx, cy, radius, paint)
+        }
+
+        private fun drawTitlePill(
+            canvas: Canvas,
+            title: TextView,
+            fill: Int,
+            stroke: Int,
+            density: Float,
+        ) {
+            val cy = offsetInHost(title, false) + title.height / 2f
+            val halfHeight = minOf(
+                22 * density,
+                cy - bounds.top - density,
+                bounds.bottom - cy - density,
+            ).coerceAtLeast(0f)
+            if (halfHeight == 0f) return
+
+            // 胶囊水平范围 = 标题文字 ∪ 同一行的兄弟图标（如免打扰铃铛）。
+            // 之前只框文字 + 固定 16dp padding，免打扰图标会落在胶囊外，
+            // 看起来「没有挂在中间段内」。
+            var contentLeft = offsetInHost(title, true)
+            var contentRight = offsetInHost(title, true) + title.width
+            (title.parent as? ViewGroup)?.let { p ->
+                val titleMidY = title.top + title.height / 2
+                for (i in 0 until p.childCount) {
+                    val sib = p.getChildAt(i)
+                    if (sib === title || sib.visibility != View.VISIBLE) continue
+                    if (sib !is ImageView || sib.drawable == null) continue
+                    val sibMidY = sib.top + sib.height / 2
+                    // 只并入与标题垂直居中对齐（同一行）的图标，忽略返回/更多等其它控件。
+                    if (Math.abs(sibMidY - titleMidY) > (sib.height + title.height) / 2f) continue
+                    val l = offsetInHost(sib, true)
+                    val r = l + sib.width
+                    if (l < contentLeft) contentLeft = l
+                    if (r > contentRight) contentRight = r
+                }
+            }
+
+            val pad = 14 * density
+            val left = (contentLeft - pad).coerceAtLeast(bounds.left + density)
+            val right = (contentRight + pad).coerceAtMost(bounds.right - density)
+            if (right <= left) return
+
+            // 胶囊范围按「非对称钳制」：先以内容范围为准，再分别把两端压回安全区。
+            // 之前用「以中心 cx 对称收缩半宽」：群名很长时 cx 被推到右边，
+            // safeRight-cx 变小 → 半宽被砍 → 左端够不到 contentLeft，铃铛被漏在胶囊外，
+            // 而且整段看起来不居中。改为不对称后，长标题只会被右侧截断，左侧始终覆盖内容。
+            val gap = 8 * density
+            val safeLeft = bounds.left + 46 * density + gap
+            val safeRight = bounds.right - 46 * density - gap
+            if (safeRight <= safeLeft) return
+
+            var pillLeft: Float
+            var pillRight: Float
+            if (capsuleLengthDp > 0) {
+                val width = (capsuleLengthDp * density)
+                    .coerceAtMost(safeRight - safeLeft)
+                // 以内容中心为锚点，再整体平移进安全区，宽度保持不变。
+                val anchor = (left + right) / 2f - width / 2f
+                pillLeft = anchor.coerceIn(safeLeft, safeRight - width)
+                pillRight = pillLeft + width
+            } else {
+                pillLeft = left.coerceAtLeast(safeLeft)
+                pillRight = right.coerceAtMost(safeRight)
+            }
+            if (pillRight <= pillLeft) return
+
+            val desiredHeight = 2 * halfHeight
+            rect.set(pillLeft, cy - desiredHeight / 2f, pillRight, cy + desiredHeight / 2f)
+            val radius = rect.height() / 2f
+            paint.style = Paint.Style.FILL
+            paint.color = fill
+            canvas.drawRoundRect(rect, radius, radius, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = density
+            paint.color = stroke
+            canvas.drawRoundRect(rect, radius, radius, paint)
+        }
+    }
 
     override fun onEnable() {
         cacheAnimationGroupFields()
@@ -433,17 +704,45 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         // ConvBox.onCreate 尾部的 FullScreenHelper 会 post 把 actionBarSize 写入
         // layout nn 根布局的 paddingTop。edge-to-edge 下清掉这份根补偿，
         // 再把会话容器 jmc 对齐到标题栏最终下沿，不影响并列的 bjy。
+        // 只在「归拢文件夹」页面执行；企业微信会话页 (EnterpriseConversationUI) 也复用
+        // ConvBoxServiceConversationUI，但它不是归拢页，不应 edge-to-edge。
         CONV_BOX_ACTIVITY_CLASS.toClass().reflekt().firstMethodOrNull {
             name = "onCreate"
             parameters(Bundle::class)
         }?.hookAfter {
             val activity = thisObject as Activity
+            if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return@hookAfter
             val decor = activity.window.decorView
             decor.post {
                 if (!isActive) return@post
                 applyConvBoxEdgeToEdge(activity)
             }
         } ?: WeLogger.w(TAG, "ConvBoxServiceConversationUI.onCreate hook target not found")
+
+        // 容器页进入后微信/AppCompat 会重新派发一次 inset，把标题栏边距改回
+        // (0, statusBar) —— 而我们设的悬浮卡边距是 (side, statusBar+gap)。
+        // 两者交替一帧就是进页时的抖动。这里在 inset 分派的同一个回调里
+        // 立刻把卡边距补回去，使它赶在测量之前生效，坏几何永远不会被布局。
+        runCatching {
+            val fitSystemWindows = Class.forName("androidx.appcompat.widget.ActionBarOverlayLayout")
+                .getMethod("fitSystemWindows", android.graphics.Rect::class.java)
+            fitSystemWindows.hookBefore {
+                val host = thisObject as? View ?: return@hookBefore
+                val activity = host.context.activityOrNull() ?: return@hookBefore
+                if (activity.javaClass.name != CONV_BOX_ACTIVITY_CLASS) return@hookBefore
+                if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return@hookBefore
+                val insets = args.getOrNull(0) as? android.graphics.Rect ?: return@hookBefore
+                if (insets.top != 0) {
+                    insets.top = 0
+                    WeLogger.d(TAG, "convbox fitSystemWindows top inset consumed before layout")
+                }
+            }
+            fitSystemWindows.hookAfter { reapplyConvBoxCardMargins(thisObject as? View) }
+            android.view.View::class.java
+                .getMethod("onApplyWindowInsets", android.view.WindowInsets::class.java)
+                .hookAfter { reapplyConvBoxCardMargins(thisObject as? View) }
+            WeLogger.d(TAG, "convbox inset reapply hooks armed")
+        }.onFailure { WeLogger.w(TAG, "convbox inset reapply hook failed: $it") }
 
         // IdleHandler 首次预加载聊天容器会重包原窗口树；退出聊天后也要
         // 重新收敛列表布局。两条路径最后都调用 resumeMainFragment。
@@ -549,6 +848,17 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     }
 
     private fun trackLayout(layout: View) {
+        // 企业微信会话页不应应用悬浮标题栏/三段式，直接跳过。
+        val activity = layout.context.activityOrNull()
+        if (activity != null && activity.javaClass.name == ENTERPRISE_CONVERSATION_UI_CLASS) {
+            return
+        }
+        // 半屏弹窗：窗口本身带顶部圆角，且不是整屏窗口。
+        // 若照搬会话页的 edge-to-edge + 顶部 padding 清零，标题卡会紧贴圆角上沿。
+        // 标记出来，边距计算时额外让出圆角高度。
+        if (activity != null && activity.javaClass.name == HALF_SCREEN_ACTIVITY_CLASS) {
+            halfScreenLayouts[layout] = true
+        }
         applyStatusBarEdgeToEdge(layout)
         trackStatusBarOffset(layout)
         if (animationGroupFields.isEmpty()) cacheAnimationGroupFields()
@@ -645,7 +955,14 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     private fun applyIfReady(layout: View): Int {
         val header = currentHeader(layout) ?: return 0
         reparentIfNeeded(layout, header)
-        applyCardStyle(header)
+        if (segmentedHeader) {
+            applySegmentedHeader(header)
+            if (windowBarHeaders[layout] != true) applyHeaderScrim(layout, header)
+        } else {
+            restoreSegmentedHeader(header)
+            headerScrims.remove(layout)?.let { (it.parent as? ViewGroup)?.removeView(it) }
+            applyCardStyle(header)
+        }
         applyMargins(layout, header)
         applyHeaderZoneCards(layout, header)
         val tipsCovered = applyHeaderZoneOverlays(layout, header)
@@ -828,6 +1145,103 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     }
 
     /**
+     * 三段式悬浮：标题栏不再是一整块卡片，底图改成返回/标题/更多三个独立形状，
+     * 其余透明；消息从段与段之间的缝隙（以及上方的遮罩层）透出来。
+     */
+    /** 关闭三段式时把标题栏底图还原成接管前的样子，交给 applyCardStyle 重新上卡片样式。 */
+    private fun restoreSegmentedHeader(header: View) {
+        val backdrop = segmentedHeaders.remove(header) ?: return
+        if (header.background === backdrop) header.background = backdrop.originalBackground
+    }
+
+    private fun applySegmentedHeader(header: View) {
+        var backdrop = segmentedHeaders[header]
+        if (backdrop == null || header.background !== backdrop) {
+            backdrop = SegmentedHeaderDrawable(header)
+            segmentedHeaders[header] = backdrop
+            header.background = backdrop
+            headerStyles.remove(header)
+            WeLogger.d(TAG, "applied segmented header backdrop")
+        }
+        // 整块卡片的裁剪/阴影必须去掉, 否则透明区域也会被裁成一块
+        if (header.elevation != 0f) header.elevation = 0f
+        if (header.clipToOutline) header.clipToOutline = false
+        if (header.outlineProvider != null) header.outlineProvider = null
+        clearBarBackgrounds(header)
+    }
+
+    /** 标题栏内部承载背景的容器（ActionBarView 等）也要透明，否则会盖住三段底图。 */
+    private fun clearBarBackgrounds(header: View) {
+        // 标题栏外面的 ActionBarOverlayLayout 同样带着主题灰底：三段卡片的缝隙和
+        // 卡片上方的留白会把它露出来（返回转场时那条灰带）。它只包住标题栏，
+        // 清掉后透出页面底色，不会影响列表区域。
+        val overlay = header.parent as? ViewGroup
+        if (overlay != null && overlay.javaClass.name.contains("ActionBarOverlayLayout") &&
+            overlay.background != null
+        ) {
+            overlay.background = null
+        }
+        val group = header as? ViewGroup ?: return
+        for (i in 0 until group.childCount) {
+            val child = group.getChildAt(i)
+            if (child !is ViewGroup || child.background == null) continue
+            child.background = null
+            for (j in 0 until child.childCount) {
+                val grand = child.getChildAt(j)
+                if (grand is ViewGroup && grand.background != null) grand.background = null
+            }
+        }
+    }
+
+    /**
+     * 标题栏上方/背后的渐变遮罩：从栏顶的颜色向下淡出到透明，
+     * 配合消息列表 clipToPadding=false，滚动时消息会从遮罩下（以及标题栏缝隙里）透出来。
+     */
+    private fun applyHeaderScrim(layout: View, header: View) {
+        val root = header.parent as? ViewGroup ?: return
+        // 尚未重挂（标题栏还在 ChattingUILayout 里）时先不做，坐标对不上
+        if (root === layout) return
+        var scrim = headerScrims[layout]
+        if (scrim == null || scrim.parent !== root) {
+            scrim?.let { (it.parent as? ViewGroup)?.removeView(it) }
+            scrim = object : View(root.context) {
+                override fun draw(canvas: android.graphics.Canvas) {
+                    // 遮罩重挂在聊天布局之外，不能沿用外部容器的可见性。
+                    if (layout.isShown && header.isShown) super.draw(canvas)
+                }
+            }.apply {
+                isClickable = false
+                isFocusable = false
+            }
+            val index = root.indexOfChild(header).coerceAtLeast(0)
+            root.addView(
+                scrim,
+                index,
+                RelativeLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0),
+            )
+            headerScrims[layout] = scrim
+        }
+        val density = header.resources.displayMetrics.density
+        val topMargin = (header.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
+        val height = (topMargin + header.height + (extraGapDp * density).toInt()).coerceAtLeast(0)
+        val lp = scrim.layoutParams as? RelativeLayout.LayoutParams ?: return
+        if (lp.height != height) {
+            lp.height = height
+            scrim.layoutParams = lp
+        }
+        val dark = scrim.context.isDarkMode
+        if (scrimGradient == null || scrimGradientDark != dark) {
+            val top = if (dark) 0xB3101010.toInt() else 0xB3EDEDED.toInt()
+            scrimGradient = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(top, Color.TRANSPARENT),
+            )
+            scrimGradientDark = dark
+        }
+        if (scrim.background !== scrimGradient) scrim.background = scrimGradient
+    }
+
+    /**
      * 提示条卡自己的样式: 投影/裁剪的轮廓只覆盖卡片区域, 而不是整组。
      *
      * 轮廓由一个可变高度的 TipsBarCardOutline 驱动: 展开/折叠动画期间高度跟着动画走,
@@ -865,6 +1279,12 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         } else {
             layout.top + layout.paddingTop +
                 statusBarOffset(layout) + (topGapDp * density).toInt()
+        }.let { base ->
+            if (halfScreenLayouts[layout] == true) {
+                base + (HALF_SCREEN_TOP_GAP_DP * density).toInt()
+            } else {
+                base
+            }
         }
         if (lp.leftMargin != sidePx || lp.rightMargin != sidePx || lp.topMargin != topPx) {
             lp.leftMargin = sidePx
@@ -1646,6 +2066,113 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         else -> null
     }
 
+    /** 只在「归拢文件夹」打开的 ConvBox 页生效；其它类名/页面直接返回。 */
+    private fun reapplyConvBoxCardMargins(host: View?) {
+        if (!isActive || host == null) return
+        if (!host.javaClass.name.contains("ActionBarOverlayLayout")) return
+        val activity = host.context.activityOrNull() ?: return
+        if (!CONV_BOX_ACTIVITY_CLASS.toClass().isInstance(activity)) return
+        if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return
+        val bar = host.findViewWhich<View> {
+            it.javaClass.name == ACTION_BAR_CONTAINER_CLASS
+        } ?: return
+        if (bar.layoutParams !is ViewGroup.MarginLayoutParams) return
+        if (applyConvBoxHeaderMargins(bar)) {
+            WeLogger.d(TAG, "convbox card margins reapplied after inset dispatch")
+        }
+        // inset 重派发同时会把 EdgeToEdgeWrapperLayout 的顶部 padding/色块带回来，
+        // 那就是返回时状态栏那条灰带。同一个回调里一起清零。
+        val contentRoot = activity.findViewById<ViewGroup>(android.R.id.content)?.getChildAt(0)
+        val wrapper = contentRoot?.findEdgeToEdgeWrapper()
+        if (wrapper != null && wrapper.paddingTop != 0) {
+            wrapper.setPadding(wrapper.paddingLeft, 0, wrapper.paddingRight, wrapper.paddingBottom)
+        }
+    }
+
+    /**
+     * 只在「归拢文件夹」打开的 ConvBoxServiceConversationUI 生效；其他类名/页面直接返回。
+     * 桌面/后台返回后窗口会退回非沉浸模式，重申明 edge-to-edge 避免标题栏下移。
+     */
+    internal fun reapplyConvBoxEdgeToEdge(activity: Activity) {
+        if (activity.javaClass.name != CONV_BOX_ACTIVITY_CLASS) return
+        if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return
+        reassertConvBoxTopInset(activity)
+        // 从成员会话/桌面回来时，微信会在 resume 之后还会再改一次 inset 与状态栏底色，
+        // 只重中一次会晚于它。这里在接下来半秒内再兜底几次（幂等，代价极小）。
+        val decor = activity.window?.decorView ?: return
+        listOf(60L, 200L, 500L, 900L).forEach { delay ->
+            decor.postDelayed({ if (isActive) reassertConvBoxTopInset(activity) }, delay)
+        }
+    }
+
+    /** 把归拢页的状态栏区域拉回沉浸状态：窗口级开关 + 状态栏色 + 所有顶部 padding 清零。 */
+    private fun reassertConvBoxTopInset(activity: Activity) {
+        if (activity.javaClass.name != CONV_BOX_ACTIVITY_CLASS) return
+        if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return
+        val window = activity.window ?: return
+        runCatching {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            edgeToEdgeApplied[window] = true
+            // 恢复微信原本的沉浸式主题：状态栏透明，由页面自身背景透出。
+            window.statusBarColor = Color.TRANSPARENT
+            val contentRoot = activity.findViewById<ViewGroup>(android.R.id.content)?.getChildAt(0) ?: return
+            // 容器页窗口/内容根的默认底色是主题灰，返回转场时会在标题卡上方露出一条灰带。
+            // 用与三段式标题卡一致的面色铺满（浅色白、深色近黑）。
+            val surface = convBoxSurfaceColor(activity)
+            window.decorView.setBackgroundColor(surface)
+            // 窗口层背景也要铺上：转场首帧可能还没画到 View 背景，露出的就是它。
+            runCatching { window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(surface)) }
+            contentRoot.setBackgroundColor(surface)
+            zeroChatLayoutTopPadding(contentRoot)
+            // 灰带/下移的另一半：微信回归后台时把状态栏高度写成根链路上的 padding 或 topMargin，
+            // 导致整页（包括三段式标题栏）下移一层。沉浸态下这一值应为 0。
+            val decorView = window.decorView
+            // ConvBox 复用的是会话页根布局 ChattingUILayout，它自带 #EDEDED 灰底。
+            // 三段式卡片上方留白和卡片缝隙露出的就是这层（返回转场时那条全宽横带）。
+            val chatRoot = decorView.findViewWhich<View> {
+                it.javaClass.name == "com.tencent.mm.pluginsdk.ui.chat.ChattingUILayout"
+            }
+            if (chatRoot != null) {
+                val bg = chatRoot.background
+                if (bg !is android.graphics.drawable.ColorDrawable || bg.color != surface) {
+                    chatRoot.setBackgroundColor(surface)
+                }
+            }
+            var node: View? = contentRoot
+            var guard = 0
+            while (node != null && node !== decorView && guard++ < 8) {
+                if (node.paddingTop != 0) {
+                    node.setPadding(node.paddingLeft, 0, node.paddingRight, node.paddingBottom)
+                }
+                val lp = node.layoutParams
+                if (lp is ViewGroup.MarginLayoutParams && lp.topMargin != 0) {
+                    lp.topMargin = 0
+                    node.layoutParams = lp
+                }
+                node = node.parent as? View
+            }
+            // 灰色闪屏的来源：EdgeToEdgeWrapperLayout 的 paddingTop + 自带的状态栏色块。
+            // 它会被微信在返回时重新写回，所以每次都清零，不能只做一次。
+            val wrapper = contentRoot.findEdgeToEdgeWrapper()
+            if (wrapper != null) {
+                if (wrapper.paddingTop != 0) {
+                    wrapper.setPadding(wrapper.paddingLeft, 0, wrapper.paddingRight, wrapper.paddingBottom)
+                }
+                runCatching {
+                    wrapper.javaClass.getMethod("setStatusBarColor", Int::class.javaPrimitiveType)
+                        .invoke(wrapper, Color.TRANSPARENT)
+                }
+            }
+            // 返回时微信还会把标题栏卡边距改回全宽 (0,statusBar)；若那次 inset 没派发，
+            // 标题栏就停在坏几何上。这里每次重申明都补一次（applyConvBoxHeaderMargins 幂等）。
+            val titleBar = decorView.findViewWhich<View> {
+                it.javaClass.name == ACTION_BAR_CONTAINER_CLASS
+            }
+            if (titleBar != null) applyConvBoxHeaderMargins(titleBar)
+            WeLogger.d(TAG, "convbox edge-to-edge reapplied on resume")
+        }.onFailure { WeLogger.w(TAG, "reapply edge-to-edge failed: $it") }
+    }
+
     private fun applyConvBoxEdgeToEdge(activity: Activity) {
         val window = activity.window
         val decor = window.decorView
@@ -1657,12 +2184,16 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         edgeToEdgeApplied[window] = true
         runCatching { window.statusBarColor = Color.TRANSPARENT }
         zeroChatLayoutTopPadding(contentRoot)
-        settleConvBoxLayout(activity, contentRoot)
+        // 归拢分组页复用 ConvBoxServiceConversationUI，标题栏同样做成悬浮卡。
+        // 原生的「服务号会话盒」也走这个 Activity，所以按 intent 里的文件夹 id 区分，
+        // 只改「对话归拢」打开的页面。
+        val cardHeader = ConversationAggregation.folderIdFromIntent(activity.intent) != null
+        settleConvBoxLayout(activity, contentRoot, cardHeader)
         decor.requestApplyInsets()
     }
 
     /** ConvBox 的标题栏和列表位于 ActionBarOverlayLayout 的两个容器分支。 */
-    private fun settleConvBoxLayout(activity: Activity, contentRoot: View) {
+    private fun settleConvBoxLayout(activity: Activity, contentRoot: View, cardHeader: Boolean) {
         val decor = activity.window.decorView
         val conversationHost = (contentRoot as ViewGroup).getChildAt(0)
         val listener = object : ViewTreeObserver.OnPreDrawListener {
@@ -1676,6 +2207,15 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
                 val titleBar = decor.findViewWhich<View> {
                     it.javaClass.name == ACTION_BAR_CONTAINER_CLASS
                 } ?: return true
+                if (cardHeader) {
+                    if (segmentedHeader) applySegmentedHeader(titleBar) else {
+                        restoreSegmentedHeader(titleBar)
+                        applyCardStyle(titleBar)
+                    }
+                    // 等标题栏量出高度再取基准：此时 AppCompat 已经把状态栏 inset 写进
+                    // topMargin，取到后再加间隙不会和 inset 重复。
+                    if (titleBar.height > 0 && applyConvBoxHeaderMargins(titleBar)) return false
+                }
                 if (titleBar.height <= 0 || contentRoot.height <= 0) return true
 
                 // 保留 AppCompat 对标题栏的正常 inset 处理，只把 jmc 移到最终下沿。
@@ -1697,6 +2237,85 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
             }
         }
         decor.viewTreeObserver.addOnPreDrawListener(listener)
+    }
+
+    /**
+     * 归拢分组页的标题卡留白。
+     *
+     * topMargin 的基准用微信自己给的值（AppCompat 已经把状态栏 inset 写进去了），
+     * 只在此基础上加一个间隙；直接写 inset + gap 会和 AppCompat 的 inset 重复叠加。
+     * 但微信派发 inset 时会把这部分清零（状态栏透明后标题卡就会顶到状态栏上），
+     * 所以基准不小于当前状态栏高度。
+     */
+    private fun applyConvBoxHeaderMargins(header: View): Boolean {
+        val lp = header.layoutParams as? ViewGroup.MarginLayoutParams ?: return false
+        val density = header.resources.displayMetrics.density
+        val sidePx = (sideMarginDp * density).toInt()
+        val baseTop = convBoxHeaderBaseTops.getOrPut(header) { lp.topMargin }
+        val topPx = maxOf(baseTop, statusBarHeightOf(header)) + (topGapDp * density).toInt()
+        if (lp.leftMargin == sidePx && lp.rightMargin == sidePx && lp.topMargin == topPx) {
+            return false
+        }
+        lp.leftMargin = sidePx
+        lp.rightMargin = sidePx
+        lp.topMargin = topPx
+        header.layoutParams = lp
+        WeLogger.d(TAG, "convbox header card margins: side=${sideMarginDp}dp top=${topGapDp}dp")
+        return true
+    }
+
+    /** 只改 lp 字段、不触发 requestLayout：调用点通常正处在 requestLayout 的 before 钩子里。 */
+    internal fun fixConvBoxHeaderMargins(header: View) {
+        val lp = header.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        val density = header.resources.displayMetrics.density
+        val sidePx = (sideMarginDp * density).toInt()
+        val baseTop = convBoxHeaderBaseTops.getOrPut(header) { lp.topMargin }
+        val topPx = maxOf(baseTop, statusBarHeightOf(header)) + (topGapDp * density).toInt()
+        lp.leftMargin = sidePx
+        lp.rightMargin = sidePx
+        lp.topMargin = topPx
+    }
+
+    /** 归拢页标题卡边距被微信改写后，立即写回目标值（供转场稳定器调用）。 */
+    internal fun reassertConvBoxHeaderMargins(activity: Activity) {
+        if (activity.javaClass.name != CONV_BOX_ACTIVITY_CLASS) return
+        if (ConversationAggregation.folderIdFromIntent(activity.intent) == null) return
+        val decor = activity.window?.decorView ?: return
+        val bar = decor.findViewWhich<View> {
+            it.javaClass.name == ACTION_BAR_CONTAINER_CLASS
+        } ?: return
+        applyConvBoxHeaderMargins(bar)
+    }
+
+    /** 容器页面底色（浅色白 / 深色近黑）。 */
+    internal fun convBoxSurface(activity: Activity): Int = convBoxSurfaceColor(activity)
+
+    /** 容器页的页面底色：浅色主题白、深色主题近黑，与三段式标题卡一致。 */
+    private fun convBoxSurfaceColor(activity: Activity): Int {
+        val night = (activity.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        return if (night) Color.rgb(0x19, 0x19, 0x19) else Color.WHITE
+    }
+
+    /** 当前窗口的状态栏高度：优先取真实 inset，退回到系统 dimen。 */
+    private fun statusBarHeightOf(view: View): Int {
+        val fromInsets = runCatching {
+            val insets = view.rootWindowInsets ?: return@runCatching 0
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                insets.getInsets(android.view.WindowInsets.Type.statusBars()).top
+            } else {
+                @Suppress("DEPRECATION")
+                val top = insets.systemWindowInsetTop
+                top
+            }
+        }.getOrDefault(0)
+        if (fromInsets > 0) return fromInsets
+        return runCatching {
+            val res = view.resources
+            val id = res.getIdentifier("status_bar_height", "dimen", "android")
+            if (id != 0) res.getDimensionPixelSize(id) else 0
+        }.getOrDefault(0)
     }
 
     // ---- 状态栏 edge-to-edge ----
@@ -1793,6 +2412,13 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         if (headerTopOffsets[layout] == null) return
         if (header.height <= 0) return
         val recycler = layout.chatRecycler() ?: return
+        // 消息要能从顶部留白区（遮罩/标题栏后）透出来，不能按 padding 裁剪
+        (recycler as? ViewGroup)?.let { group ->
+            if (!chatListClipToPaddings.containsKey(group)) {
+                chatListClipToPaddings[group] = group.clipToPadding
+            }
+            if (group.clipToPadding) group.clipToPadding = false
+        }
         val base = chatListBasePaddings.getOrPut(recycler) { recycler.paddingTop }
         val density = layout.resources.displayMetrics.density
         val overlayBottom = overlayCardBottoms[layout]
@@ -1971,6 +2597,9 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
     }
 
     private fun disposeTracker(layout: View) {
+        headerScrims.remove(layout)?.let { scrim ->
+            (scrim.parent as? ViewGroup)?.removeView(scrim)
+        }
         statusBarPreDraws.remove(layout)?.let { listener ->
             runCatching { layout.viewTreeObserver.removeOnPreDrawListener(listener) }
         }
@@ -2114,6 +2743,18 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
         tipsBarCardOutlineHeights.clear()
         tipsBarFoldHeights.clear()
         chatListBasePaddings.clear()
+        chatListClipToPaddings.entries.toList().forEach { (group, original) ->
+            group.clipToPadding = original
+        }
+        chatListClipToPaddings.clear()
+        headerScrims.values.toList().forEach { (it.parent as? ViewGroup)?.removeView(it) }
+        headerScrims.clear()
+        segmentedHeaders.forEach { (header, drawable) ->
+            if (header.background === drawable) header.background = drawable.originalBackground
+        }
+        segmentedHeaders.clear()
+        scrimGradient = null
+        scrimGradientDark = null
         reparentBlocked.clear()
         lookupWarned.clear()
         headerStyles.clear()
@@ -2130,6 +2771,8 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
             var topGap by remember { mutableIntStateOf(topGapDp) }
             var extraGap by remember { mutableIntStateOf(extraGapDp) }
             var elevation by remember { mutableIntStateOf(elevationDp) }
+            var capsuleLength by remember { mutableIntStateOf(capsuleLengthDp) }
+            var transparency by remember { mutableIntStateOf(backgroundTransparency) }
 
             AlertDialogContent(
                 title = { Text("悬浮标题栏") },
@@ -2142,6 +2785,58 @@ object FloatingChatHeader : ClickableFeature(), IResolveDex {
                                     title = "改动在重新进入聊天后生效",
                                     description = "标题栏及标题下方的置顶消息等卡片均以悬浮卡片显示",
                                 )
+                            }
+                            item {
+                                BaseItemContainer {
+                                    DropDownMenuWidget(
+                                        title = "标题栏布局",
+                                        description = "一体式：整块悬浮卡片；分段式：返回 / 标题 / 更多分成三段独立胶囊",
+                                        value = if (segmentedHeader) HEADER_STYLE_SEPARATED else HEADER_STYLE_INTEGRATED,
+                                        options = listOf(
+                                            DropdownOption(HEADER_STYLE_INTEGRATED, "一体式"),
+                                            DropdownOption(HEADER_STYLE_SEPARATED, "分段式"),
+                                        ),
+                                        onValueChange = { value ->
+                                            setHeaderLayoutStyle(value)
+                                            segmentedHeaders.keys.toList().forEach { view -> view.invalidate() }
+                                            scheduleAllLayouts(RECONCILE_LAYOUT)
+                                        },
+                                    )
+                                }
+                            }
+                            item {
+                                BaseItemContainer {
+                                    IntNumberPickerWidget(
+                                        title = "中间胶囊长度（0 为自动）",
+                                        value = capsuleLength,
+                                        startInt = 0,
+                                        endInt = 320,
+                                        stepSize = 4,
+                                        valueSuffix = "dp",
+                                        onValueChange = {
+                                            capsuleLength = it
+                                            capsuleLengthDp = it
+                                            segmentedHeaders.keys.toList().forEach { view -> view.invalidate() }
+                                        },
+                                    )
+                                }
+                            }
+                            item {
+                                BaseItemContainer {
+                                    IntNumberPickerWidget(
+                                        title = "三段式背景透明度",
+                                        value = transparency,
+                                        startInt = 0,
+                                        endInt = 100,
+                                        stepSize = 1,
+                                        valueSuffix = "%",
+                                        onValueChange = {
+                                            transparency = it
+                                            backgroundTransparency = it
+                                            segmentedHeaders.keys.toList().forEach { view -> view.invalidate() }
+                                        },
+                                    )
+                                }
                             }
                             item {
                                 BaseItemContainer {

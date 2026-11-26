@@ -54,8 +54,8 @@ object RepeatMessages : SwitchFeature(), WeChatMessageContextMenuApi.IMenuItemsP
                     val context = view.context
 
                     CoroutineScope(Dispatchers.IO).launch {
-                        val sent = repeatMessage(msgInfo)
-                        showToastSuspend(context, if (sent) "已复读" else "复读失败!")
+                        val reason = repeatMessageWithReason(msgInfo)
+                        showToastSuspend(context, reason ?: "已复读")
                     }
                 }
             )
@@ -63,47 +63,103 @@ object RepeatMessages : SwitchFeature(), WeChatMessageContextMenuApi.IMenuItemsP
     }
 
     @Suppress("DEPRECATION")
-    fun repeatMessage(msgInfo: MessageInfo): Boolean {
+    fun repeatMessage(msgInfo: MessageInfo): Boolean = repeatMessageWithReason(msgInfo) == null
+
+    /**
+     * 复读一条消息；成功返回 null，失败返回可直接展示给用户的原因。
+     *
+     * 原来所有失败路径都只返回 false，界面上永远是同一句「复读失败!」，
+     * 分不清是「没下载」「路径解析不了」还是「微信拒绝发送」。这里把三类原因分开报。
+     */
+    @Suppress("DEPRECATION")
+    fun repeatMessageWithReason(msgInfo: MessageInfo): String? {
+        // 微信刚启动时模块还在后台扫 dex，发送组件没定位好，这时复读必然失败一次。
+        // 先等一小会儿（最多 8 秒），比直接甩一句「复读失败」有用。
+        if (!WeMessageApi.awaitSendReady()) {
+            return "模块正在解析微信（发送组件未就绪），请稍后重试"
+        }
         return runCatching {
             when (msgInfo.type) {
-                MessageType.TEXT -> WeMessageApi.sendText(msgInfo.talker, msgInfo.actualContent)
+                MessageType.TEXT ->
+                    if (WeMessageApi.sendText(msgInfo.talker, msgInfo.actualContent)) null
+                    else "文本发送被微信拒绝"
+
                 MessageType.IMAGE -> repeatImage(msgInfo)
-                MessageType.VOICE -> repeatVoice(msgInfo)
+
+                MessageType.VOICE -> {
+                    val encPath = msgInfo.imagePath
+                    if (encPath.isNullOrBlank()) {
+                        "语音未下载（消息里没有文件引用）"
+                    } else {
+                        val voicePath = WeMessageApi.getVoiceFullPath(encPath)
+                        when {
+                            voicePath.isBlank() -> "语音路径解析失败：$encPath"
+                            !java.io.File(voicePath).let { it.isFile && it.length() > 0 } ->
+                                "语音文件不存在（可能未下载）：$voicePath"
+                            else -> {
+                                val durationMs = AudioUtils.getDurationMs(voicePath).toInt()
+                                if (WeMessageApi.sendVoice(msgInfo.talker, voicePath, durationMs)) null
+                                else "语音发送失败（时长 ${durationMs}ms）"
+                            }
+                        }
+                    }
+                }
+
                 MessageType.VIDEO, MessageType.MICRO_VIDEO -> repeatVideo(msgInfo)
-                MessageType.STICKER, MessageType.SO_GOU_EMOJI -> repeatEmoji(msgInfo)
-                MessageType.APP -> WeMessageApi.sendXmlAppMsg(msgInfo.talker, msgInfo.actualContent)
-                MessageType.QUOTE -> WeMessageApi.sendText(msgInfo.talker, msgInfo.quoteMsgActualContent!!)
-                else -> false
+
+                MessageType.STICKER, MessageType.SO_GOU_EMOJI -> {
+                    val md5 = emojiMd5(msgInfo)
+                    when {
+                        md5.isNullOrBlank() -> "表情 md5 解析失败"
+                        WeMessageApi.sendEmojiByMd5(msgInfo.talker, md5) -> null
+                        else -> "表情发送失败（md5=$md5）"
+                    }
+                }
+
+                MessageType.APP ->
+                    if (WeMessageApi.sendXmlAppMsg(msgInfo.talker, msgInfo.actualContent)) null
+                    else "卡片消息发送失败"
+
+                MessageType.QUOTE -> {
+                    val quote = msgInfo.quoteMsgActualContent
+                    when {
+                        quote.isNullOrBlank() -> "引用消息内容为空"
+                        WeMessageApi.sendText(msgInfo.talker, quote) -> null
+                        else -> "引用消息发送失败"
+                    }
+                }
+
+                else -> "不支持的消息类型（type=${msgInfo.typeCode}）"
             }
         }.getOrElse {
             WeLogger.e(TAG, "failed to repeat message: type=${msgInfo.typeCode}", it)
-            false
+            "异常：" + (it.message ?: it.javaClass.simpleName)
         }
     }
 
-    private fun repeatImage(msgInfo: MessageInfo): Boolean {
-        val md5 = WeServiceApi.getImageMd5FromMsgInfo(msgInfo)
+    private fun repeatImage(msgInfo: MessageInfo): String? {
+        val md5 = runCatching { WeServiceApi.getImageMd5FromMsgInfo(msgInfo) }.getOrNull()
+        if (md5.isNullOrBlank()) return "图片 md5 解析失败"
         WeMessageApi.sendImageByMd5(msgInfo.talker, md5, null)
-        return true
+        return null
     }
 
-    private fun repeatVoice(msgInfo: MessageInfo): Boolean {
-        val encPath = msgInfo.imagePath ?: return false
-        val voicePath = WeMessageApi.getVoiceFullPath(encPath)
-        val durationMs = AudioUtils.getDurationMs(voicePath).toInt()
-        return WeMessageApi.sendVoice(msgInfo.talker, voicePath, durationMs)
+    private fun repeatVideo(msgInfo: MessageInfo): String? {
+        val mp4Path = runCatching { WeServiceApi.getVideoMp4PathFromMsgInfo(msgInfo) }
+            .getOrElse {
+                WeLogger.e(TAG, "restoreMp4Path failed", it)
+                return "视频路径解析失败：" + (it.message ?: it.javaClass.simpleName)
+            }
+        if (mp4Path.isBlank()) return "视频未下载（微信没有给出本地 mp4 路径）"
+        if (!java.io.File(mp4Path).let { it.isFile && it.length() > 0 }) {
+            return "视频文件不存在（可能未下载完）：$mp4Path"
+        }
+        return if (WeMessageApi.sendVideo(msgInfo.talker, mp4Path)) null else "视频发送失败"
     }
 
-    private fun repeatVideo(msgInfo: MessageInfo): Boolean {
-        val mp4Path = WeServiceApi.getVideoMp4PathFromMsgInfo(msgInfo)
-        return WeMessageApi.sendVideo(msgInfo.talker, mp4Path)
-    }
-
-    private fun repeatEmoji(msgInfo: MessageInfo): Boolean {
-        val md5 = msgInfo.imagePath
-            ?: XmlUtils.extractXmlAttr(msgInfo.content, "md5").takeIf { it.isNotBlank() }
-            ?: XmlUtils.extractXmlTag(msgInfo.content, "md5").takeIf { it.isNotBlank() }
-            ?: return false
-        return WeMessageApi.sendEmojiByMd5(msgInfo.talker, md5)
+    private fun emojiMd5(msgInfo: MessageInfo): String? {
+        return msgInfo.imagePath?.takeIf { it.isNotBlank() }
+            ?: XmlUtils.extractXmlAttr(msgInfo.content, "md5")?.takeIf { it.isNotBlank() }
+            ?: XmlUtils.extractXmlTag(msgInfo.content, "md5")?.takeIf { it.isNotBlank() }
     }
 }

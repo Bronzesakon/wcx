@@ -96,26 +96,21 @@ object TabTheme : ClickableFeature() {
     private const val TAG = "TabTheme"
     private const val OVERLAY_TAG_PREFIX = "wcx_tab_theme_"
 
+    /** Tab 索引 -> 背景 ImageView（挂在各 Tab 页容器里）。 */
+    private val bgImages = HashMap<Int, ImageView>()
+
+    /** 已被我们抠成透明的标题栏 View（含其直接子 View），用于持续拦截微信的重设。 */
+    private val transparentBars = java.util.IdentityHashMap<View, Boolean>()
+
+    @Volatile
+    private var barGuardInstalled = false
+
     private val themesDir by lazy { (KnownPaths.moduleData / "tab_themes").createDirsSafe() }
     private val currentThemeDir by lazy { (themesDir / "current").createDirsSafe() }
 
     private var tabThemeEnabled by prefOption("tab_theme_enabled", false)
-    private var opacity by prefOption("tab_theme_opacity", 0.15f) // 兼容旧版本全局透明度
-    private var opacityTab0 by prefOption("tab_theme_opacity_0", -1f)
-    private var opacityTab1 by prefOption("tab_theme_opacity_1", -1f)
-    private var opacityTab2 by prefOption("tab_theme_opacity_2", -1f)
-    private var opacityTab3 by prefOption("tab_theme_opacity_3", -1f)
-    private fun opacityForTab(index: Int): Float {
-        val saved = when (index) { 0 -> opacityTab0; 1 -> opacityTab1; 2 -> opacityTab2; else -> opacityTab3 }
-        return (if (saved in 0f..1f) saved else opacity).coerceIn(0.05f, 0.6f)
-    }
-    private fun saveTabOpacity(index: Int, value: Float) {
-        when (index) { 0 -> opacityTab0 = value; 1 -> opacityTab1 = value; 2 -> opacityTab2 = value; else -> opacityTab3 = value }
-    }
+    private var opacity by prefOption("tab_theme_opacity", 0.15f)
     private var transparentStatusBar by prefOption("tab_theme_transparent_status_bar", true)
-
-    /** 聊天页隔离开关：开启后 Tab 背景只在主页/通讯录/发现/我四个 Tab 界面生效，聊天界面不生效。 */
-    private var chatOnlyEnabled by prefOption("tab_theme_chat_only", true)
 
     @Serializable
     data class TabThemeConfig(
@@ -153,145 +148,212 @@ object TabTheme : ClickableFeature() {
     }
 
     override fun onEnable() {
+        WeLogger.i(TAG, "onEnable: tabThemeEnabled=" + tabThemeEnabled)
         if (!tabThemeEnabled) return
         applyTheme()
     }
 
     /**
-     * 检测当前前台 Activity 是否为聊天会话页面。
-     * 聊天会话页面内，模块全局主题背景应强制失效，避免与用户自定义聊天背景重叠。
+     * 把标题栏（ActionBar 及其内部容器）的底色设成透明，露出下面 Tab 页里的背景图。
+     * Tab 页容器实测是全屏 1080x2400，背景其实已经铺满；只是被标题栏这块不透明底色盖住。
+     * 抠掉底色后，标题文字与图标仍在自己那一层，背景就能透上来。
      */
-    private fun isChatActivityForeground(): Boolean {
-        return try {
-            val atClass = Class.forName("android.app.ActivityThread")
-            val currentAtMethod = atClass.getDeclaredMethod("currentActivityThread")
-            val at = currentAtMethod.invoke(null)
-            val activitiesField = atClass.getDeclaredField("mActivities")
-            activitiesField.isAccessible = true
-            val activities = activitiesField.get(at) as? Map<*, *> ?: return false
+    private val loggedBarClasses = HashSet<String>()
 
-            for (record in activities.values) {
-                val activity = record?.javaClass?.getDeclaredField("activity")
-                    ?.apply { isAccessible = true }
-                    ?.get(record) as? Activity ?: continue
-                if (!activity.isFinishing && activity.javaClass.name.contains("ChattingUI")) {
-                    return true
+    private fun makeTopBarsTransparent(root: ViewGroup, depth: Int = 0) {
+        if (depth > 12) return
+        for (i in 0 until root.childCount) {
+            val child = root.getChildAt(i)
+            val cn = child.javaClass.name
+            val looksLikeBar = cn.contains("ActionBar") || cn.contains("Toolbar") ||
+                cn.endsWith("MMActionBar") || cn.contains("TitleBar")
+            if (looksLikeBar) {
+                runCatching { child.background = null }
+                transparentBars[child] = true
+                if (child is ViewGroup) {
+                    for (j in 0 until child.childCount) {
+                        val sub = child.getChildAt(j)
+                        runCatching { sub.background = null }
+                        transparentBars[sub] = true
+                    }
+                }
+                // 只在首次发现时打日志，避免每次重抠都刷屏
+                if (!loggedBarClasses.contains(cn)) {
+                    loggedBarClasses.add(cn)
+                    WeLogger.i(TAG, "title bar made transparent: " + cn)
                 }
             }
-            false
-        } catch (e: Throwable) {
-            WeLogger.d(TAG, "检测聊天Activity失败: ${e.message}")
-            false
+            if (child is ViewGroup) makeTopBarsTransparent(child, depth + 1)
+        }
+    }
+
+    /**
+     * 持续拦截微信对标题栏的底色重设。
+     *
+     * 微信在界面恢复时会重新给 ActionBar 设白底，光抠一次只能维持到下一次恢复。
+     * 这里按「我们抠过的 View」精确匹配（IdentityHashMap），直接吞掉 setBackground* 调用，
+     * 其它 View 一次哈希查询就放行，开销可忽略。
+     */
+    private fun installBarBackgroundGuard() {
+        if (barGuardInstalled) return
+        barGuardInstalled = true
+        for (setterName in arrayOf(
+            "setBackgroundColor",
+            "setBackground",
+            "setBackgroundDrawable",
+            "setBackgroundResource",
+        )) {
+            runCatching {
+                View::class.java.reflekt()
+                    .firstMethodOrNull { name = setterName; parameterCount = 1 }
+                    ?.hookBefore {
+                        val v = thisObject as? View ?: return@hookBefore
+                        if (transparentBars[v] == true) {
+                            result = null
+                        }
+                    }
+                WeLogger.i(TAG, "bar bg guard installed: " + setterName)
+            }.onFailure {
+                WeLogger.w(TAG, "install guard " + setterName + " failed: " + (it.message ?: ""))
+            }
         }
     }
 
     private fun applyTheme() {
+        WeLogger.i(TAG, "applyTheme: installing LauncherUI doOnCreate hook")
         WeMainActivityBeautifyApi.methodDoOnCreate.hookAfter {
             try {
-            val activity = thisObject.reflekt()
-                .firstField { type = "com.tencent.mm.ui.MMFragmentActivity" }
-                .get()!! as Activity
-            // 主题只属于 LauncherUI 的四个主 Tab，绝不能在 ChattingUI 等子页面创建全屏图片层。
-            if (activity.javaClass.name != "com.tencent.mm.ui.LauncherUI") return@hookAfter
+                val activity = thisObject.reflekt()
+                    .firstField { type = "com.tencent.mm.ui.MMFragmentActivity" }
+                    .get()!! as Activity
+                val viewPager = thisObject.reflekt()
+                    .firstField { name = "mViewPager" }
+                    .get()!! as ViewGroup
+                val tabsAdapter = thisObject.reflekt()
+                    .firstField { name = "mTabsAdapter" }
+                    .get()!!
+                WeLogger.i(TAG, "doOnCreate fired: " + activity.javaClass.name)
 
-            val viewPager = thisObject.reflekt()
-                .firstField { name = "mViewPager" }
-                .get()!! as ViewGroup
-            val tabsAdapter = thisObject.reflekt()
-                .firstField { name = "mTabsAdapter" }
-                .get()!!
+                if (transparentStatusBar) applyImmersiveStatusBar(activity)
 
-            val currentTabState = mutableIntStateOf(0)
-            tabsAdapter.reflekt()
-                .firstMethod { name = "onPageScrolled" }
-                .hookBefore {
-                    val position = args[0] as Int
-                    val positionOffset = args[1] as Float
-                    if (positionOffset == 0f) {
-                        currentTabState.intValue = position
+                val decor = activity.window?.decorView as? ViewGroup ?: return@hookAfter
+                val hostName = activity.javaClass.name
+
+                runCatching { makeTopBarsTransparent(decor) }
+                installBarBackgroundGuard()
+
+                // 微信在恢复界面时会重建/重设标题栏，这里每次宿主回到前台都重新抠一遍，
+                // 配合上面的 setBackground* 拦截，保证「进出聊天页/通讯录/下拉小程序」之后不再变白。
+                runCatching {
+                    Activity::class.java.reflekt()
+                        .firstMethodOrNull { name = "onResume"; parameterCount = 0 }
+                        ?.hookAfter {
+                            val a = thisObject as? Activity ?: return@hookAfter
+                            if (a.javaClass.name != hostName) return@hookAfter
+                            val root = a.window?.decorView as? ViewGroup ?: return@hookAfter
+                            runCatching { makeTopBarsTransparent(root) }
+                        }
+                    WeLogger.i(TAG, "title bar refresh hook installed")
+                }.onFailure {
+                    WeLogger.w(TAG, "hook onResume for bar refresh failed: " + (it.message ?: ""))
+                }
+
+                bgImages.clear()
+
+                fun decoratePage(page: View, pos: Int) {
+                    val group = page as? ViewGroup ?: return
+                    val tagName = OVERLAY_TAG_PREFIX + "bg"
+                    val file = getTabBackgroundFile(pos)
+                    val existing = group.findViewWithTag<ImageView>(tagName)
+                    if (!file.exists()) {
+                        if (existing != null) group.removeView(existing)
+                        bgImages.remove(pos)
+                        return
                     }
-                }
-
-            val lifecycleOwner = LifecycleOwnerProvider.lifecycleOwner
-
-            // 沉浸式全屏渲染：将背景加到 decorView，覆盖状态栏和导航栏
-            if (transparentStatusBar) {
-                applyImmersiveStatusBar(activity)
-            }
-
-            val decor = activity.window?.decorView as? ViewGroup ?: return@hookAfter
-
-            val config = loadConfig()
-
-            // 检查是否已有背景容器，避免重复添加
-            val existingTag = "${OVERLAY_TAG_PREFIX}container"
-            var bgContainer = decor.findViewWithTag<android.widget.FrameLayout>(existingTag)
-            if (bgContainer == null) {
-                bgContainer = android.widget.FrameLayout(activity).apply {
-                    tag = existingTag
-                    setLifecycleOwner(lifecycleOwner)
-                    layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                    isClickable = false
-                    isFocusable = false
-                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                }
-                // 放在 decor 内容视图后面，避免新建的 ImageView 覆盖微信页面/会话内容。
-                decor.addView(bgContainer, 0)
-            } else if (decor.indexOfChild(bgContainer) > 0) {
-                // 兼容旧版本已创建且位于顶层的背景容器：重新放到内容层下面。
-                val oldLayoutParams = bgContainer.layoutParams
-                decor.removeView(bgContainer)
-                decor.addView(bgContainer, 0, oldLayoutParams)
-            }
-
-            val tabImageViews = mutableMapOf<Int, ImageView>()
-
-            for (tabIndex in 0..3) {
-                val tabFile = getTabBackgroundFile(tabIndex)
-                if (tabFile.exists()) {
-                    val iv = ImageView(activity).apply {
-                        tag = "${OVERLAY_TAG_PREFIX}tab_$tabIndex"
+                    if (existing != null) {
+                        existing.alpha = opacity.coerceIn(0f, 1f)
+                        bgImages[pos] = existing
+                        return
+                    }
+                    val iv = ImageView(group.context).apply {
+                        tag = tagName
                         scaleType = ImageView.ScaleType.CENTER_CROP
-                        visibility = if (tabIndex == 0) View.VISIBLE else View.GONE
                         layoutParams = ViewGroup.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
+                            ViewGroup.LayoutParams.MATCH_PARENT,
                         )
-                        load(tabFile.toFile()) {
-                            crossfade(true)
+                        setLifecycleOwner(LifecycleOwnerProvider.lifecycleOwner)
+                        load(file.toFile()) {
+                            crossfade(false)
                             memoryCachePolicy(CachePolicy.DISABLED)
                             diskCachePolicy(CachePolicy.DISABLED)
                         }
-                        alpha = opacityForTab(tabIndex)
+                        alpha = opacity.coerceIn(0f, 1f)
+                        isClickable = false
+                        isFocusable = false
+                        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     }
-                    bgContainer.addView(iv)
-                    tabImageViews[tabIndex] = iv
+                    group.addView(iv)
+                    bgImages[pos] = iv
+                    val loc = IntArray(2)
+                    group.getLocationInWindow(loc)
+                    WeLogger.i(
+                        TAG,
+                        "tab bg #" + pos + " added to " + group.javaClass.simpleName +
+                            " size=" + group.width + "x" + group.height +
+                            " y=" + loc[1],
+                    )
                 }
-            }
 
-            // 页面切换时检测是否为聊天会话页面，是则隐藏模块主题背景
-            tabsAdapter.reflekt()
-                .firstMethod { name = "onPageSelected" }
-                .hookAfter {
-                    try {
-                        val position = args[0] as Int
-                        val inChatPage = chatOnlyEnabled && isChatActivityForeground()
-                        tabImageViews.forEach { (idx, iv) ->
-                            if (inChatPage) {
-                                // 聊天会话页面内，模块全局主题背景强制失效
-                                iv.visibility = View.GONE
-                            } else {
-                                iv.visibility = if (idx == position) View.VISIBLE else View.GONE
-                            }
-                        }
-                    } catch (e: Throwable) {
-                        WeLogger.e(TAG, "onPageSelected hook 异常", e)
+                fun decorateAll() {
+                    for (i2 in 0 until viewPager.childCount) {
+                        val child = viewPager.getChildAt(i2)
+                        val idx = viewPager.indexOfChild(child)
+                        if (idx in 0..3) decoratePage(child, idx)
                     }
                 }
+
+                decorateAll()
+                for (delay in longArrayOf(300L, 1200L, 3000L)) {
+                    viewPager.postDelayed({ runCatching { decorateAll() } }, delay)
+                }
+                WeLogger.i(TAG, "bg attached to pages, count=" + bgImages.size)
+
+                for (spec in arrayOf("addView" to 3, "addViewInLayout" to 3, "addViewInLayout" to 4)) {
+                    runCatching {
+                        viewPager.reflekt()
+                            .firstMethodOrNull { name = spec.first; parameterCount = spec.second }
+                            ?.hookAfter {
+                                val child = args.getOrNull(0) as? View
+                                val container = thisObject as? ViewGroup
+                                if (child != null && container != null) {
+                                    val idx = container.indexOfChild(child)
+                                    if (idx in 0..3) decoratePage(child, idx)
+                                }
+                            }
+                    }
+                }
+
+                // 切 Tab 时微信会更新标题栏内容并重设底色。
+                // 立刻抠一次不够——切页动画结束、页面 attach 完成后微信可能又设回去，
+                // 所以再补几次延迟重抠（通讯录/发现页尤其明显）。
+                fun refreshBars() {
+                    runCatching {
+                        val root = activity.window?.decorView as? ViewGroup
+                        if (root != null) makeTopBarsTransparent(root)
+                    }
+                }
+
+                tabsAdapter.reflekt()
+                    .firstMethodOrNull { name = "onPageSelected"; parameterCount = 1 }
+                    ?.hookAfter {
+                        runCatching { decorateAll() }
+                        refreshBars()
+                        val decorForDelay = activity.window?.decorView
+                        for (delay in longArrayOf(150L, 400L, 900L, 1600L)) {
+                            decorForDelay?.postDelayed({ refreshBars() }, delay)
+                        }
+                    }
             } catch (e: Throwable) {
                 WeLogger.e(TAG, "applyTheme hookAfter 异常", e)
             }
@@ -388,11 +450,8 @@ object TabTheme : ClickableFeature() {
         onSaveAs: () -> Unit
     ) {
         var enabledState by remember { mutableStateOf(tabThemeEnabled) }
-        val opacityStates = remember {
-            mutableStateMapOf<Int, Float>().apply { for (i in 0..3) put(i, opacityForTab(i)) }
-        }
+        var opacityState by remember { mutableFloatStateOf(opacity) }
         var transparentStatusBarState by remember { mutableStateOf(transparentStatusBar) }
-        var chatOnlyState by remember { mutableStateOf(chatOnlyEnabled) }
 
         // Reactive state: track which tabs have images, initialized from disk
         val hasImageStates = remember {
@@ -421,18 +480,15 @@ object TabTheme : ClickableFeature() {
                     )
 
                     Text(
-                        text = "各 Tab 背景透明度",
+                        text = "透明度: ${(opacityState * 100).toInt()}%",
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier.padding(top = 8.dp)
                     )
-                    tabNames.forEach { (index, name) ->
-                        Text("$name：${((opacityStates[index] ?: opacity) * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
-                        Slider(
-                            value = opacityStates[index] ?: opacity,
-                            onValueChange = { opacityStates[index] = it },
-                            valueRange = 0.05f..0.6f
-                        )
-                    }
+                    Slider(
+                        value = opacityState,
+                        onValueChange = { opacityState = it },
+                        valueRange = 0.05f..0.6f
+                    )
 
                     ListItem(
                         modifier = Modifier.clickable {
@@ -443,13 +499,6 @@ object TabTheme : ClickableFeature() {
                         },
                         headlineContent = { Text("沉浸式全屏") },
                         supportingContent = { Text("背景完整铺满屏幕，消除上下白条") }
-                    )
-
-                    ListItem(
-                        modifier = Modifier.clickable { chatOnlyState = !chatOnlyState },
-                        trailingContent = { Switch(checked = chatOnlyState, onCheckedChange = null) },
-                        headlineContent = { Text("聊天页不生效") },
-                        supportingContent = { Text("Tab 背景仅作用于主页/通讯录/发现/我四页，聊天界面不显示") }
                     )
 
                     Text(
@@ -498,11 +547,8 @@ object TabTheme : ClickableFeature() {
             confirmButton = {
                 Button(onClick = {
                     tabThemeEnabled = enabledState
-                    // 继续写入旧全局值以兼容旧版本；新版本分别保存四个 Tab 的透明度。
-                    opacity = opacityStates[0] ?: opacity
-                    for (index in 0..3) saveTabOpacity(index, opacityStates[index] ?: opacity)
+                    opacity = opacityState
                     transparentStatusBar = transparentStatusBarState
-                    chatOnlyEnabled = chatOnlyState
                     if (enabledState) {
                         showToast("设置已保存，重启微信生效")
                     } else {

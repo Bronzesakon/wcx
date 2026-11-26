@@ -6,6 +6,7 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.Outline
 import android.os.Bundle
 import android.view.MotionEvent
@@ -15,6 +16,7 @@ import android.view.ViewOutlineProvider
 import android.view.Window
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RelativeLayout
 import android.widget.TextView
@@ -58,6 +60,7 @@ import okhttp3.OkHttpClient
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import android.graphics.Color as AndroidColor
@@ -244,21 +247,58 @@ object HomeSidePanel : SwitchFeature() {
         val payPlugin: Class<*>,
     )
 
-    /** 静默反射查找微信钱包缓存符号；8.0.65~8.0.71 有效，8.0.76 有变化时返回 null（仅跳过余额）。 */
+    /**
+     * 静默反射查找微信钱包缓存符号。
+     *
+     * 缓存类的混淆名跨版本会变（8.0.65~8.0.71 是 m1，8.0.79/8.0.80 是 j1），
+     * 所以不写死名字，改为按结构特征校验：同时具备
+     *   i(2 参) -> Object   读缓存
+     *   j(2 参) -> void     写缓存（回调里能拿到余额）
+     * 再加「支付插件类里有方法返回该缓存类」做交叉确认。
+     * 找不到就返回 null，仅跳过余额行，不影响侧边栏其它功能。
+     */
     private fun resolveWalletSymbolsReflexively(): WalletSymbols? = runCatching {
-        val cacheClass = Class.forName("com.tencent.mm.wallet_core.model.m1")
-        val read = cacheClass.declaredMethods.firstOrNull {
-            it.name == "i" && it.parameterCount == 2 && it.returnType == Any::class.java
+        val cacheCandidates = arrayOf(
+            "com.tencent.mm.wallet_core.model.j1",
+            "com.tencent.mm.wallet_core.model.m1",
+        )
+        var cacheClass: Class<*>? = null
+        var readMethod: java.lang.reflect.Method? = null
+        var writeMethod: java.lang.reflect.Method? = null
+        for (name in cacheCandidates) {
+            val c = runCatching { Class.forName(name) }.getOrNull() ?: continue
+            val r = c.declaredMethods.firstOrNull {
+                it.name == "i" && it.parameterCount == 2 && it.returnType == Any::class.java
+            }
+            val w = c.declaredMethods.firstOrNull {
+                it.name == "j" && it.parameterCount == 2 && it.returnType == Void.TYPE
+            }
+            if (r != null && w != null) {
+                cacheClass = c
+                readMethod = r
+                writeMethod = w
+                break
+            }
         }
-        val write = cacheClass.declaredMethods.firstOrNull {
-            it.name == "j" && it.parameterCount == 2 && it.returnType == Void.TYPE
+        val cache = cacheClass
+        val read = readMethod
+        val write = writeMethod
+        if (cache == null || read == null || write == null) {
+            WeLogger.w(TAG, "wallet cache class not found in candidates")
+            return@runCatching null
         }
-        if (read == null || write == null) return@runCatching null
-        val payPlugin = Class.forName("com.tencent.mm.plugin.wxpay.g")
-        val hasCacheAccessor = payPlugin.declaredMethods.any { it.returnType == cacheClass }
-        if (!hasCacheAccessor) return@runCatching null
-        WalletSymbols(read, write, payPlugin)
-    }.getOrNull()
+
+        val pay = runCatching { Class.forName("com.tencent.mm.plugin.wxpay.g") }.getOrNull()
+        if (pay == null || pay.declaredMethods.none { it.returnType == cache }) {
+            WeLogger.w(TAG, "wallet pay plugin class not resolved")
+            return@runCatching null
+        }
+        WeLogger.i(TAG, "wallet symbols resolved: cache=" + cache.name + ", pay=" + pay.name)
+        WalletSymbols(read, write, pay)
+    }.getOrElse {
+        WeLogger.w(TAG, "resolveWalletSymbolsReflexively failed: " + (it.message ?: ""))
+        null
+    }
 
     internal fun uninstallPanel() {
         sessions.values.mapNotNull { it.get() }.forEach { it.detach() }
@@ -361,6 +401,13 @@ object HomeSidePanel : SwitchFeature() {
         private val overlayRoot = HomeSidePanelOverlayLayout(activity).also { it.session = this }
         private val dimView = View(activity)
         private val panelView = ComposeView(activity)
+        private val panelBgView = ImageView(activity).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            alpha = 0f
+        }
         private val stateScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         private val layoutStore = HomeSidePanelLayoutStore
         private val cityIndex = HomeSidePanelCityIndex(activity)
@@ -490,6 +537,14 @@ object HomeSidePanel : SwitchFeature() {
                     FrameLayout.LayoutParams.MATCH_PARENT,
                 )
             )
+            // 侧滑栏背景图：放在 panelView 下面，面板内容本身没有不透明底色，能透出来。
+            overlayRoot.addView(
+                panelBgView,
+                FrameLayout.LayoutParams(
+                    drawerWidthPx,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                )
+            )
             overlayRoot.addView(
                 panelView,
                 FrameLayout.LayoutParams(
@@ -497,6 +552,7 @@ object HomeSidePanel : SwitchFeature() {
                     FrameLayout.LayoutParams.MATCH_PARENT,
                 )
             )
+            applyPanelBackground()
 
             parent.addView(
                 contentWrapper,
@@ -903,15 +959,20 @@ object HomeSidePanel : SwitchFeature() {
             event: MotionEvent,
             allowPanelPassthrough: Boolean,
         ): Boolean {
+            // 修复「侧边栏菜单点击无效」：面板内且接近完全展开时，把触摸事件整体放行给内容。
+            // 原实现要求 renderedProgress >= 0.98f 且仅放行 DOWN/UP/CANCEL，导致手指轻微移动
+            // 产生的 MOVE 会被拦截，子 View 随即收到 ACTION_CANCEL，clickable 不触发。
+            // 现在：面板内只要未进入拖拽（!dragging）就一律放行，保证点击可靠；
+            // 拖动关闭仍可通过面板外区域/关闭按钮完成。
             if (
                 allowPanelPassthrough &&
                 isInsidePanel(event.x) &&
-                renderedProgress >= 0.98f &&
-                homeSidePanelShouldPassFullyOpenTouchToChild(event.actionMasked)
+                renderedProgress >= 0.90f &&
+                !dragging
             ) {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
                     beginGesture(event)
-                } else if (!dragging) {
+                } else {
                     gesture.onCancel()
                 }
                 return false
@@ -1326,8 +1387,12 @@ object HomeSidePanel : SwitchFeature() {
             contentWrapper.scaleY = transform.scale
             contentWrapper.translationX = transform.translationXPx
             contentWrapper.translationY = transform.translationYPx
-            outlineProvider.radiusPx = 28.dpToPx(activity).toFloat() * transform.easedProgress
-            contentWrapper.invalidateOutline()
+            // invalidateOutline 每帧调用会重算轮廓阴影，半径变化不到半个像素就别刷。
+            val radiusPx = 28.dpToPx(activity).toFloat() * transform.easedProgress
+            if (abs(outlineProvider.radiusPx - radiusPx) > 0.5f) {
+                outlineProvider.radiusPx = radiusPx
+                contentWrapper.invalidateOutline()
+            }
 
             if (p > CLOSED_EPSILON) {
                 fabHostView?.let { moveFabHostIntoContentWrapper(it) }
@@ -1340,7 +1405,19 @@ object HomeSidePanel : SwitchFeature() {
             panelView.translationX = -drawerWidthPx * (1f - p)
             overlayRoot.isClickable = p > CLOSED_EPSILON || dragging
             overlayRoot.visibility = if (p > CLOSED_EPSILON || dragging) View.VISIBLE else View.GONE
-            overlayRoot.bringToFront()
+            // bringToFront() 每次都会在父容器里摘掉再插回去并触发 requestLayout，
+            // 放进逐帧动画里就是持续掉帧。只在刚变可见时抬一次。
+            if (becameVisible) overlayRoot.bringToFront()
+        }
+
+        /** 侧滑栏背景图（主题包里的 wallpaper_panel.png），透明度由 theme_panel_alpha 控制。 */
+        /**
+         * 侧滑栏背景图曾取自「主题工坊」的自定义主题包（ThemePack）。
+         * 主题已回退到「主题商城」+ 6 款内置主题，不再有主题包，这里直接保持无背景。
+         */
+        private fun applyPanelBackground() {
+            panelBgView.setImageDrawable(null)
+            panelBgView.alpha = 0f
         }
 
         private fun updateDrawerWidth(): Boolean {
@@ -1354,6 +1431,10 @@ object HomeSidePanel : SwitchFeature() {
             params.width = drawerWidthPx
             params.height = FrameLayout.LayoutParams.MATCH_PARENT
             panelView.layoutParams = params
+            (panelBgView.layoutParams as? FrameLayout.LayoutParams)?.let { bgParams ->
+                bgParams.width = drawerWidthPx
+                panelBgView.layoutParams = bgParams
+            }
             return true
         }
 

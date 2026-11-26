@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.contacts
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import android.content.Context
 import androidx.annotation.StringRes
 
@@ -10,11 +11,11 @@ internal fun localizedContactsQuantity(
     vararg formatArgs: Any,
 ): String {
     val app = android.app.ActivityThread.currentApplication() ?: return id.toString()
-    return app.resources.getQuantityString(id, quantity, *formatArgs)
+    return app.resources.safeGetQuantityString(id, quantity, *formatArgs)
 }
 
 internal fun Context.localizedContactsQuantity(
     @StringRes id: Int,
     quantity: Int,
     vararg formatArgs: Any,
-): String = resources.getQuantityString(id, quantity, *formatArgs)
+): String = resources.safeGetQuantityString(id, quantity, *formatArgs)

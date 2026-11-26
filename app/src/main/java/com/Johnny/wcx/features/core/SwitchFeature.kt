@@ -1,11 +1,17 @@
 package com.Johnny.wcx.features.core
 
 import android.content.Context
+import com.Johnny.wcx.constants.Preferences
 import com.Johnny.wcx.preferences.WePrefs
 import com.Johnny.wcx.utils.TargetProcesses
 import com.Johnny.wcx.utils.WeLogger
 
 abstract class SwitchFeature : BaseFeature() {
+
+    companion object {
+        /** 带分类总开关的分类名（见 [Preferences.hiddenContactsMasterEnabled]）。 */
+        const val CATEGORY_WITH_MASTER_SWITCH = "密友功能"
+    }
 
     /** Default state when the user has never toggled this feature. */
     protected open val defaultEnabled: Boolean = false
@@ -20,6 +26,8 @@ abstract class SwitchFeature : BaseFeature() {
 
     final override fun startup() {
         if (!shouldLoadInCurrentProcess) return
+        // 「密友功能」分类有总开关：关掉总开关时整个分类都不加载（各功能自身开关状态保留）。
+        if (CATEGORY_WITH_MASTER_SWITCH in categories && !Preferences.hiddenContactsMasterEnabled) return
         _isEnabled = WePrefs.getBoolOrDef(name, defaultEnabled)
         if (shouldEnableOnStartup) enable()
     }
