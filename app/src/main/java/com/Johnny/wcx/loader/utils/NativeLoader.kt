@@ -22,6 +22,9 @@ object NativeLoader {
 
         MMKV.initialize(hostCtx, mmkvDir.toString())
 
-        MMKV.mmkvWithID(WePrefs.PREFS_NAME, MMKV.MULTI_PROCESS_MODE)
+        // 使用基于包名的独立 MMKV ID，防止主微信和分身（user 999）配置混淆
+        // 例如：com.tencent.mm → "wekit_prefs_com_tencent_mm"，分身自动隔离
+        val safeId = WePrefs.PREFS_NAME + "_" + hostCtx.packageName.replace(".", "_")
+        MMKV.mmkvWithID(safeId, MMKV.MULTI_PROCESS_MODE)
     }
 }

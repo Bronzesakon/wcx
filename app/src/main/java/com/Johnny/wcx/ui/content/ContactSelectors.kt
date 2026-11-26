@@ -1090,7 +1090,7 @@ fun ContactsSelector(
             }
             selectedWxIds = newSelection
         },
-        fillHeight = fullScreen,
+        fullScreen = fullScreen,
         hintText = if (showMultiSelectHint) {
             "可多选：勾选多个联系人/群，可一次发送给所有选中对象"
         } else null

@@ -205,6 +205,12 @@ class MessageInfo(val instance: Any) {
 
         /** 文件是否已就绪、可下载。 */
         val isDownloadable get() = appMsgType == 6 || appMsgType == 130
+
+        /** 是不是一条文件消息（已就绪或仍在传）；用于过滤链接/引用/转发等其它 appmsg。 */
+        val isFileAppMsg get() = appMsgType == 6 || appMsgType == 130 || isSenderUploading
+
+        /** content 里是否存在 `<msg><appmsg>`；用于区分“确凿非文件”与“类型读不出”。 */
+        val looksLikeAppMsg get() = runCatching { xml.getByPath("msg.appmsg") != null }.getOrDefault(false)
     }
 
     class ImageMessage(xmlStr: String) {

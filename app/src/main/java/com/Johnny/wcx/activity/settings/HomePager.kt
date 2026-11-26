@@ -256,6 +256,8 @@ fun HomePager(
     var latestVersion by remember { mutableStateOf<String?>(null) }
     var isLatest by remember { mutableStateOf(false) }
     var isChecking by remember { mutableStateOf(true) }
+    // 本 fork 关闭了应用内更新检查 (AppUpdater.UPDATE_CHECK_ENABLED=false), 用于 UI 如实显示
+    var updateCheckDisabled by remember { mutableStateOf(false) }
 
     // 设备信息：微信版本和运行环境在重组间保持稳定
     val wechatVersion = remember { safeGetWeChatVersionInfo(context) }
@@ -271,6 +273,7 @@ fun HomePager(
         if (isChecking && !force) return
         scope.launch {
             isChecking = true
+            updateCheckDisabled = false
             runCatching {
                 when (val result = AppUpdater.checkForUpdate()) {
                     is UpdateResult.UpdateAvailable -> {
@@ -281,6 +284,11 @@ fun HomePager(
                     is UpdateResult.UpToDate -> {
                         latestVersion = null
                         isLatest = true
+                    }
+                    is UpdateResult.Disabled -> {
+                        updateCheckDisabled = true
+                        latestVersion = null
+                        isLatest = false
                     }
                     is UpdateResult.Error -> {
                         // GitHub 未认证接口是 60 次/小时/IP 共享限流，返回 403 属于正常现象。
@@ -346,7 +354,13 @@ fun HomePager(
         // ---- 大状态卡片 ----
         item {
             Spacer(Modifier.height(8.dp))
-            ActivationCard(latestVersion, isLatest, isChecking, onRefresh = ::checkUpdateNow)
+            ActivationCard(
+                latestVersion = latestVersion,
+                isLatest = isLatest,
+                isChecking = isChecking,
+                updateCheckDisabled = updateCheckDisabled,
+                onRefresh = ::checkUpdateNow,
+            )
         }
 
         // ---- 统计：三格彩灯（已启用 / 全部 / 分类），前两格点击弹清单，第三格跳功能页 ----
@@ -575,6 +589,7 @@ private fun ActivationCard(
     latestVersion: String?,
     isLatest: Boolean,
     isChecking: Boolean,
+    updateCheckDisabled: Boolean,
     onRefresh: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -593,6 +608,7 @@ private fun ActivationCard(
     }
     val statusText = when {
         isChecking -> "检查中"
+        updateCheckDisabled -> "已关闭更新检查"
         isLatest -> "已是最新"
         latestVersion != null -> "有更新"
         else -> "检查失败"
@@ -665,18 +681,18 @@ private fun ActivationCard(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            // 刷新按钮：点击手动检查更新（检查中禁用防抖）
+            // 刷新按钮：检查中或更新检查关闭时禁用。
             Box(
                 modifier = Modifier
                     .size(52.dp)
                     .clip(CircleShape)
                     .background(WxPalette.accentBrush())
-                    .clickable(enabled = !isChecking) { onRefresh() },
+                    .clickable(enabled = !isChecking && !updateCheckDisabled) { onRefresh() },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = MaterialSymbols.Outlined.Refresh,
-                    contentDescription = "检查更新",
+                    contentDescription = if (updateCheckDisabled) "更新检查已关闭" else "检查更新",
                     tint = Color.White,
                     modifier = Modifier.size(24.dp),
                 )

@@ -1,13 +1,22 @@
 package com.Johnny.wcx.features.items.chat
 
 import android.app.AlarmManager
+import android.app.Activity
+import android.app.Application
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.PowerManager
+import android.os.Process
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
@@ -84,6 +93,11 @@ object ScheduledMessage : ClickableFeature() {
      * 就补发一次当天漏掉的任务。原实现只有 15 分钟, 用户几小时后才打开微信就会整天漏发。
      */
     private const val CATCHUP_WINDOW_MS = 12 * 60 * 60 * 1000L
+    /** 普通重排允许的迟到窗口; 冷启动补发仍使用 12 小时宽限。 */
+    private const val RETRY_WINDOW_MS = 5 * 60 * 1000L
+    /** 精确窗前提前唤醒专用线程, 避免 delay 唤醒本身成为迟到源。 */
+    private const val PREWAKE_LEAD_MS = 250L
+    private const val PREWAKE_WAKE_LOCK_TIMEOUT_MS = 2_000L
     /** 守护轮询间隔: 进程内存活时兜底扫描到点任务, 同时补回丢失的进程内定时器 */
     private const val MONITOR_INTERVAL_MS = 30_000L
     /** 单段发送失败后的重试等待 */
@@ -149,11 +163,17 @@ object ScheduledMessage : ClickableFeature() {
         var lastFiredDate: String = "",
         /** 当天已尝试发送的次数, 成功或跨天时归零; 用于限制失败重试次数 */
         var fireAttempts: Int = 0,
+        /** fireAttempts 所属日期; 旧数据为空时按新的一天处理 */
+        var fireAttemptDate: String = "",
         /**
          * 当天已经成功收到消息的接收方。
          * 多接收方任务里部分失败需要重试时, 跳过这些已成功的接收方, 避免重复发送。
          */
-        var sentTargets: List<String> = emptyList()
+        var sentTargets: List<String> = emptyList(),
+        /** 每个接收方已成功提交的消息段索引; 重试只补未提交或明确失败的段 */
+        var sentSegments: Map<String, List<Int>> = emptyMap(),
+        /** 持久化闹钟 requestCode; 进程重启后复用, 避免旧闹钟变孤儿 */
+        var alarmRequestCode: Int = 0
     ) : java.io.Serializable {
         /** 任务的全部发送对象 (第一个是 talker, 其余是额外勾选的) */
         fun targetTalkers(): List<String> {
@@ -190,18 +210,27 @@ object ScheduledMessage : ClickableFeature() {
 
     private var schedules: List<ScheduleConfig>
         get() {
+            val version = storageVersion
+            cachedSchedules?.takeIf { cachedSchedulesVersion == version }?.let { return it }
             val raw = schedulesJson
-            if (raw.isNotBlank()) {
-                return runCatching { json.decodeFromString<List<ScheduleConfig>>(raw) }
+            val decoded = if (raw.isNotBlank()) {
+                runCatching { json.decodeFromString<List<ScheduleConfig>>(raw) }
                     .onFailure { WeLogger.e(TAG, "failed to parse schedules json", it) }
                     .getOrDefault(emptyList())
+            } else {
+                migrateLegacySchedules()
             }
-            return migrateLegacySchedules()
+            cachedSchedules = decoded
+            cachedSchedulesVersion = version
+            return decoded
         }
         set(value) {
             schedulesJson = runCatching { json.encodeToString(value) }
                 .onFailure { WeLogger.e(TAG, "failed to encode schedules json", it) }
                 .getOrDefault("[]")
+            storageVersion++
+            cachedSchedules = value
+            cachedSchedulesVersion = storageVersion
         }
 
     private fun migrateLegacySchedules(): List<ScheduleConfig> {
@@ -221,6 +250,17 @@ object ScheduledMessage : ClickableFeature() {
      */
     private val storageLock = Any()
 
+    /** 写入存储时递增; 触发热路径据此避免无条件第二次 JSON 解码。 */
+    @Volatile
+    private var storageVersion = 0L
+    /** 当前版本对应的内存快照; 热路径不再解码 JSON。 */
+    @Volatile
+    private var cachedSchedules: List<ScheduleConfig>? = null
+    @Volatile
+    private var cachedSchedulesVersion = -1L
+    @Volatile
+    private var currentDayKey: String = LocalDate.now().toString()
+
     /**
      * 闹钟 requestCode 分配表。
      * 原实现直接用 schedule.id.hashCode() 作 requestCode: 不同 id 一旦哈希相撞,
@@ -231,42 +271,83 @@ object ScheduledMessage : ClickableFeature() {
     private var alarmCodeSeq by prefOption("scheduled_alarm_code_seq", 1000)
 
     private val activeAlarms = ConcurrentHashMap<String, PendingIntent>()
-    private val timerJobs = ConcurrentHashMap<String, Job>()
+    private val timerStates = ConcurrentHashMap<String, TimerState>()
 
-    /** 统一作用域: 子协程失败不会连坐取消其它任务的定时器 */
+    /** 媒体/多接收人等长任务仍在 IO; 单文本走专用调度线程。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var monitorJob: Job? = null
+    private val activeSendJobs = ConcurrentHashMap<String, Job>()
     // 在途互斥: 进程内定时器与 AlarmManager 闹钟会在同一时刻先后触发,
     // 时间守卫只能挡"提前触发"; 若第一个触发者正在发送(媒体解析/下载可能耗时数十秒),
     // 第二个触发者重读任务时 nextSendTime 尚未推进, 守卫照样放行 → 重复发送。
-    // 发送开始前占位、结束后释放, 保证同一任务同一时刻只有一个触发者在执行。
     private val triggering = ConcurrentHashMap.newKeySet<String>()
     private lateinit var alarmReceiver: BroadcastReceiver
+    private lateinit var recoveryReceiver: BroadcastReceiver
+
+    private var schedulerThread: HandlerThread? = null
+    private var schedulerHandler: Handler? = null
+    private var monitorRunnable: Runnable? = null
+    /** 仅调度线程读写: 多个任务同时临近时只提权一次。 */
+    private var schedulerPriorityDepth = 0
+    private var schedulerOriginalPriority = Process.THREAD_PRIORITY_DEFAULT
+    private val queueTimingStats = ScheduledMessageTimingStats(256)
+
+    private class TimerState(val token: Any) {
+        var prepared = false
+        var wakeLock: PowerManager.WakeLock? = null
+    }
+
+    private val recoveryCallbacks = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(activity: Activity) = recoverSchedules("resume")
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+        override fun onActivityStarted(activity: Activity) {}
+        override fun onActivityPaused(activity: Activity) {}
+        override fun onActivityStopped(activity: Activity) {}
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+        override fun onActivityDestroyed(activity: Activity) {}
+    }
+
+    private fun recoverSchedules(source: String) {
+        if (!isActive) return
+        refreshDayKey()
+        val handler = schedulerHandler ?: return
+        handler.post { if (isActive) sweepSchedules(source) }
+    }
 
     override fun onEnable() {
+        startSchedulerThread()
+        refreshDayKey()
         alarmReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val scheduleId = intent?.getStringExtra(EXTRA_SCHEDULE_ID) ?: return
-                // goAsync: 声明本次广播需要延长生命周期, 避免 onReceive 返回后
-                // 系统提前回收广播上下文导致发送中途被中断
+                val receivedAtMs = System.currentTimeMillis()
+                val receivedAtNs = SystemClock.elapsedRealtimeNanos()
                 val pending = goAsync()
-                scope.launch {
+                val handler = schedulerHandler
+                if (handler == null) {
+                    runCatching { pending.finish() }
+                    return
+                }
+                handler.post {
                     try {
-                        handleScheduleTrigger(scheduleId)
+                        handleScheduleTrigger(scheduleId, "alarm", receivedAtMs, receivedAtNs)
                     } finally {
                         runCatching { pending.finish() }
                     }
                 }
             }
         }
+        recoveryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                recoverSchedules(intent?.action ?: "recovery")
+            }
+        }
 
         runCatching {
-            val filter = IntentFilter(ALARM_ACTION)
-            // Android 13+ 必须声明接收器导出标志，否则注册抛 SecurityException
+            // 自有闹钟只允许本应用触发, 防止外部伪造 action 造成重复发送。
             ContextCompat.registerReceiver(
                 HostInfo.application,
                 alarmReceiver,
-                filter,
+                IntentFilter(ALARM_ACTION),
                 ContextCompat.RECEIVER_NOT_EXPORTED
             )
         }.onFailure {
@@ -274,42 +355,113 @@ object ScheduledMessage : ClickableFeature() {
         }
 
         runCatching {
-            // 注意: 先取一次快照再逐个排期, 不要边遍历边改存储
-            val enabled = synchronized(storageLock) { schedules }.filter { it.enabled }
-            enabled.forEach { schedule ->
-                // 冷启动允许补发当天漏掉的任务（宽限窗仅此一处使用）
-                scheduleAlarm(schedule, allowCatchUp = true)
+            // 系统广播来自 system UID; NOT_EXPORTED 可能收不到, 单独用 EXPORTED 注册。
+            val recoveryFilter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_TIME_CHANGED)
+                addAction(Intent.ACTION_TIMEZONE_CHANGED)
             }
+            ContextCompat.registerReceiver(
+                HostInfo.application,
+                recoveryReceiver,
+                recoveryFilter,
+                ContextCompat.RECEIVER_EXPORTED
+            )
+        }.onFailure {
+            WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to register schedule recovery receiver", it)
+        }
+
+        runCatching { HostInfo.application.registerActivityLifecycleCallbacks(recoveryCallbacks) }
+            .onFailure { WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to register schedule recovery", it) }
+
+        // 先预热再挂任务: 到点任务可能立刻补发, 不能把首次 dex 解析留在热路径。
+        runCatching { WeMessageApi.warmUpTextSend() }
+            .onFailure { WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} warm up text send handles failed", it) }
+
+        runCatching {
+            val enabled = synchronized(storageLock) { schedules }.filter { it.enabled }
+            cleanupOrphanAlarms(enabled)
+            enabled.forEach { scheduleAlarm(it, allowCatchUp = true) }
         }.onFailure {
             WeLogger.e(TAG, "failed to schedule alarms", it)
         }
-
-        startMonitor()
+        scheduleMonitor()
     }
 
     /**
-     * 守护轮询: 进程内存活时兜底扫描。
-     * 进程内定时器用 delay 计时, 一旦 job 因异常/取消而消失、或设备深度休眠期间
-     * 计时未推进, 到点了也没人触发; 这里每 30 秒按墙上时钟复查一次,
-     * 到点即触发, 并顺手补回丢失的定时器。
+     * v310 只持久化 requestCode 序列, 不持久化 id→code; 升级/进程重启后旧 PendingIntent
+     * 可能变成孤儿并再次触发。这里在启用时按序列范围清理一次, 只保留已持久化的当前 code。
      */
-    private fun startMonitor() {
-        monitorJob?.cancel()
-        monitorJob = scope.launch {
-            while (isActive) {
-                try {
-                    delay(MONITOR_INTERVAL_MS)
-                    sweepSchedules()
-                } catch (e: CancellationException) {
-                    return@launch
-                } catch (e: Throwable) {
-                    WeLogger.e(TAG, "monitor loop error", e)
-                }
-            }
+    private fun cleanupOrphanAlarms(schedules: List<ScheduleConfig>) {
+        if (alarmCodeSeq <= 1000 || schedules.isEmpty()) return
+        val context = HostInfo.application
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val maxCode = alarmCodeSeq.coerceAtMost(1000 + 2048)
+        val keepCodes = schedules.mapNotNull { it.alarmRequestCode.takeIf { code -> code > 0 } }.toSet()
+        val intent = Intent(ALARM_ACTION).setPackage(context.packageName)
+        for (code in 1001..maxCode) {
+            if (code in keepCodes) continue
+            val pi = PendingIntent.getBroadcast(
+                context,
+                code,
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            ) ?: continue
+            runCatching { alarmManager.cancel(pi) }
+            pi.cancel()
         }
     }
 
-    private fun sweepSchedules() {
+    private fun startSchedulerThread() {
+        stopSchedulerThread()
+        val thread = HandlerThread("wekit-scheduled-message").also { it.start() }
+        schedulerThread = thread
+        schedulerHandler = Handler(thread.looper)
+    }
+
+    private fun stopSchedulerThread() {
+        monitorRunnable?.let { schedulerHandler?.removeCallbacks(it) }
+        monitorRunnable = null
+        timerStates.values.forEach { schedulerHandler?.removeCallbacksAndMessages(it.token) }
+        timerStates.clear()
+        schedulerHandler?.removeCallbacksAndMessages(null)
+        schedulerHandler = null
+        schedulerPriorityDepth = 0
+        schedulerThread?.quitSafely()
+        schedulerThread = null
+    }
+
+    /** 最近任务感知的守护轮询; 普通任务 30 秒, 临近任务自动提高检查频率。 */
+    private fun scheduleMonitor() {
+        if (!isActive) return
+        val handler = schedulerHandler ?: return
+        monitorRunnable?.let { handler.removeCallbacks(it) }
+        val runnable = object : Runnable {
+            override fun run() {
+                monitorRunnable = null
+                if (!isActive) return
+                refreshDayKey()
+                sweepSchedules("monitor")
+                scheduleMonitor()
+            }
+        }
+        monitorRunnable = runnable
+        val now = System.currentTimeMillis()
+        val next = runCatching { synchronized(storageLock) { schedules } }
+            .getOrDefault(emptyList())
+            .filter { it.enabled && it.nextSendTime > now }
+            .minOfOrNull { it.nextSendTime }
+        val delayMs = when {
+            next == null -> MONITOR_INTERVAL_MS
+            next <= now -> 0L
+            else -> minOf(MONITOR_INTERVAL_MS, maxOf(1_000L, next - now - 1_000L))
+        }
+        handler.postDelayed(runnable, delayMs)
+    }
+
+    private fun sweepSchedules(source: String) {
+        if (!isActive) return
         val now = System.currentTimeMillis()
         val list = runCatching { synchronized(storageLock) { schedules } }
             .onFailure { WeLogger.e(TAG, "failed to read schedules in monitor", it) }
@@ -317,17 +469,9 @@ object ScheduledMessage : ClickableFeature() {
         list.filter { it.enabled }.forEach { schedule ->
             runCatching {
                 when {
-                    // 到点未触发(定时器丢失/休眠错过): 立即执行
-                    schedule.nextSendTime in 1..now -> {
-                        WeLogger.i(TAG, "monitor: ${schedule.id} overdue (next=${schedule.nextSendTime}), triggering now")
-                        scope.launch { handleScheduleTrigger(schedule.id) }
-                    }
-                    // 定时器缺失(异常退出)但还没到点: 重新挂上
-                    schedule.nextSendTime > now && timerJobs[schedule.id]?.isActive != true -> {
-                        WeLogger.i(TAG, "monitor: re-arm in-process timer for ${schedule.id}")
+                    schedule.nextSendTime in 1..now -> handleScheduleTrigger(schedule.id, source)
+                    schedule.nextSendTime > now && !timerStates.containsKey(schedule.id) ->
                         scheduleInProcess(schedule)
-                    }
-                    // 从未排过期(存储被清理/新增任务时进程忙): 重新计算
                     schedule.nextSendTime <= 0 -> scheduleAlarm(schedule, allowCatchUp = true)
                 }
             }.onFailure {
@@ -337,68 +481,74 @@ object ScheduledMessage : ClickableFeature() {
     }
 
     override fun onDisable() {
-        monitorJob?.cancel()
-        monitorJob = null
+        activeSendJobs.values.forEach { it.cancel() }
+        activeSendJobs.clear()
         activeAlarms.values.forEach { it.cancel() }
         activeAlarms.clear()
-        timerJobs.values.forEach { it.cancel() }
-        timerJobs.clear()
+        timerStates.keys.forEach { releaseTimerResources(it, restorePriority = false) }
+        runCatching { HostInfo.application.unregisterActivityLifecycleCallbacks(recoveryCallbacks) }
+            .onFailure { WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to unregister schedule recovery", it) }
         runCatching {
             HostInfo.application.unregisterReceiver(alarmReceiver)
         }.onFailure {
             WeLogger.e(TAG, "failed to unregister alarm receiver", it)
         }
+        runCatching {
+            HostInfo.application.unregisterReceiver(recoveryReceiver)
+        }.onFailure {
+            WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to unregister recovery receiver", it)
+        }
+        stopSchedulerThread()
     }
 
-    /**
-     * 为每个任务分配稳定唯一的闹钟 requestCode 并持久化。
-     * 不能再用 id.hashCode(): 哈希相撞时两个任务共用一个 PendingIntent,
-     * FLAG_UPDATE_CURRENT 会让后者顶掉前者, 被顶掉的那个从此收不到闹钟。
-     */
-    private fun requestCodeFor(scheduleId: String): Int {
-        alarmCodes[scheduleId]?.let { return it }
+    private fun requestCodeFor(schedule: ScheduleConfig): Int {
+        alarmCodes[schedule.id]?.let { return it }
+        if (schedule.alarmRequestCode > 0) {
+            alarmCodes[schedule.id] = schedule.alarmRequestCode
+            return schedule.alarmRequestCode
+        }
         return synchronized(storageLock) {
-            alarmCodes[scheduleId] ?: run {
+            alarmCodes[schedule.id] ?: run {
                 val code = alarmCodeSeq + 1
                 alarmCodeSeq = code
-                alarmCodes[scheduleId] = code
+                schedule.alarmRequestCode = code
+                alarmCodes[schedule.id] = code
+                updateSchedule(schedule)
                 code
             }
         }
     }
 
     private fun scheduleAlarm(schedule: ScheduleConfig, allowCatchUp: Boolean = false) {
+        if (!isActive) return
         val context = HostInfo.application
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val requestCode = requestCodeFor(schedule)
         val intent = Intent(ALARM_ACTION).apply {
+            setPackage(context.packageName)
             putExtra(EXTRA_SCHEDULE_ID, schedule.id)
         }
-
         val pendingIntent = PendingIntent.getBroadcast(
             context,
-            requestCodeFor(schedule.id),
+            requestCode,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         val triggerTime = calculateNextTriggerTime(schedule, allowCatchUp)
         if (triggerTime <= 0) {
-            // 单次任务已过窗口期 / 重试次数用尽: 关掉它,
-            // 否则任务会一直挂在"已启用"却永远不再触发, 用户以为它还在工作
             if (schedule.enabled) {
                 schedule.enabled = false
                 synchronized(storageLock) { updateSchedule(schedule) }
                 cancelAlarm(schedule)
-                WeLogger.i(TAG, "schedule ${schedule.id} retired: no further trigger time")
+                WeLogger.i(TAG, "${WeLogger.FORK_LOG_PREFIX} schedule ${schedule.id} retired: no further trigger time")
             }
             return
         }
         schedule.nextSendTime = triggerTime
         synchronized(storageLock) { updateSchedule(schedule) }
 
-        // 进程内定时器：只要微信进程存活就保证准点触发，不受系统闹钟权限/省电策略影响
         scheduleInProcess(schedule)
-
         runCatching {
             val exactAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
                     alarmManager.canScheduleExactAlarms()
@@ -409,18 +559,21 @@ object ScheduledMessage : ClickableFeature() {
                     pendingIntent
                 )
             } else {
-                // 未授予精确闹钟权限：退化为不精确闹钟，系统会尽量在相近时间触发
                 alarmManager.setAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerTime,
                     pendingIntent
                 )
             }
-
             activeAlarms[schedule.id] = pendingIntent
+            WeLogger.i(
+                TAG,
+                "${WeLogger.FORK_LOG_PREFIX} armed ${schedule.id}: next=$triggerTime, exact=$exactAllowed, " +
+                        "wall=${System.currentTimeMillis()}, elapsed=${SystemClock.elapsedRealtime()}, " +
+                        "uptime=${SystemClock.uptimeMillis()}"
+            )
         }.onFailure {
-            WeLogger.e(TAG, "failed to set exact alarm for schedule ${schedule.id}", it)
-            // 最后兜底：精确闹钟被拒绝时再尝试一次不精确闹钟
+            WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to set alarm for schedule ${schedule.id}", it)
             runCatching {
                 alarmManager.setAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
@@ -428,6 +581,7 @@ object ScheduledMessage : ClickableFeature() {
                     pendingIntent
                 )
                 activeAlarms[schedule.id] = pendingIntent
+                WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} armed ${schedule.id}: next=$triggerTime, fallback=inexact")
             }.onFailure { e2 ->
                 WeLogger.e(TAG, "fallback alarm also failed for ${schedule.id}", e2)
             }
@@ -435,30 +589,127 @@ object ScheduledMessage : ClickableFeature() {
     }
 
     /**
-     * 进程内准点定时器：微信进程存活时按 nextSendTime 用 delay 触发，
-     * 与 AlarmManager 互为冗余（配合 handleScheduleTrigger 的时间守卫去重，不会重复发送）。
+     * 专用 HandlerThread 上的墙钟定时器: T-250ms 唤醒并短时提权, T-100ms 进入有界自旋。
+     * 深睡/改时间后每次等待都重读墙钟; 与 AlarmManager 互为冗余。
      */
     private fun scheduleInProcess(schedule: ScheduleConfig) {
-        timerJobs.remove(schedule.id)?.cancel()
+        val handler = schedulerHandler ?: return
+        cancelTimer(schedule.id)
         val next = schedule.nextSendTime
-        val delayMs = next - System.currentTimeMillis()
-        if (delayMs <= 0) return
-        val job = scope.launch {
-            try {
-                // 深度休眠期间 delay 依赖的单调时钟不会推进, 醒来时可能已经过点了;
-                // 过点也照常触发, 由 handleScheduleTrigger 内部的时间守卫与去重兜底
-                delay(delayMs)
-                handleScheduleTrigger(schedule.id)
-            } catch (e: CancellationException) {
-                // 任务被取消（停用/删除/重设闹钟）
-            } catch (e: Throwable) {
-                WeLogger.e(TAG, "in-process timer failed for ${schedule.id}", e)
+        if (next <= System.currentTimeMillis()) {
+            handler.post { handleScheduleTrigger(schedule.id, "timer") }
+            return
+        }
+        val state = TimerState(Any())
+        timerStates[schedule.id] = state
+        val deadline = ScheduledMessageDeadline(next)
+        val timer = object : Runnable {
+            override fun run() {
+                if (!isActive || timerStates[schedule.id] !== state) return
+                val waitMs = deadline.nextWaitMillis(
+                    System.currentTimeMillis(),
+                    System.nanoTime()
+                )
+                when {
+                    waitMs == 0L -> {
+                        timerStates.remove(schedule.id, state)
+                        releaseTimerResources(schedule.id, restorePriority = true, expected = state)
+                        handleScheduleTrigger(schedule.id, "timer")
+                        scheduleMonitor()
+                    }
+                    waitMs > 0L -> handler.postAtTime(
+                        this,
+                        state.token,
+                        SystemClock.uptimeMillis() + waitMs
+                    )
+                    else -> {
+                        // 最后 100ms 在同一个 Runnable 内有界自旋, 避免 Handler 队列往返。
+                        while (isActive && timerStates[schedule.id] === state &&
+                            deadline.nextWaitMillis(System.currentTimeMillis(), System.nanoTime()) == -1L
+                        ) {
+                            // busy wait is intentionally bounded by ScheduledMessageDeadline
+                        }
+                        if (isActive && timerStates[schedule.id] === state) {
+                            handler.postAtTime(this, state.token, SystemClock.uptimeMillis())
+                        }
+                    }
+                }
             }
         }
-        timerJobs[schedule.id] = job
+        val wake = object : Runnable {
+            override fun run() {
+                if (!isActive || timerStates[schedule.id] !== state) return
+                prepareTimerThread(state)
+                handler.post(timer)
+            }
+        }
+        val wakeDelayMs = maxOf(0L, next - System.currentTimeMillis() - PREWAKE_LEAD_MS)
+        handler.postAtTime(wake, state.token, SystemClock.uptimeMillis() + wakeDelayMs)
     }
 
-    private fun todayKey(): String = LocalDate.now().toString()
+    private fun prepareTimerThread(state: TimerState) {
+        if (state.prepared) return
+        state.prepared = true
+        runCatching {
+            if (schedulerPriorityDepth == 0) {
+                schedulerOriginalPriority = Process.getThreadPriority(Process.myTid())
+                Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
+            }
+            schedulerPriorityDepth++
+        }.onFailure { WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} scheduler thread priority unavailable", it) }
+
+        val context = HostInfo.application
+        if (context.checkSelfPermission(android.Manifest.permission.WAKE_LOCK) != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        runCatching {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return@runCatching
+            state.wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wcx:scheduled-message").apply {
+                setReferenceCounted(false)
+                acquire(PREWAKE_WAKE_LOCK_TIMEOUT_MS)
+            }
+        }.onFailure {
+            WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} scheduled-message WakeLock unavailable", it)
+        }
+    }
+
+    private fun releaseTimerResources(
+        scheduleId: String,
+        restorePriority: Boolean,
+        expected: TimerState? = null,
+    ) {
+        val state = timerStates.remove(scheduleId) ?: expected ?: return
+        if (expected != null && state !== expected) return
+        runCatching { state.wakeLock?.takeIf { it.isHeld }?.release() }
+        state.wakeLock = null
+        if (state.prepared && restorePriority) {
+            val restore = Runnable {
+                if (schedulerPriorityDepth > 0) schedulerPriorityDepth--
+                if (schedulerPriorityDepth == 0) {
+                    runCatching { Process.setThreadPriority(schedulerOriginalPriority) }
+                }
+            }
+            val handler = schedulerHandler
+            if (schedulerThread === Thread.currentThread() || handler == null) {
+                restore.run()
+            } else {
+                handler.post(restore)
+            }
+        }
+        schedulerHandler?.removeCallbacksAndMessages(state.token)
+    }
+
+    private fun cancelTimer(scheduleId: String) {
+        releaseTimerResources(scheduleId, restorePriority = true)
+    }
+
+    private fun refreshDayKey(): String {
+        val today = LocalDate.now().toString()
+        if (currentDayKey != today) currentDayKey = today
+        return currentDayKey
+    }
+
+    private fun todayKey(): String = currentDayKey
 
     private fun tomorrowTarget(schedule: ScheduleConfig): Long {
         val targetTime = LocalTime.of(schedule.hour, schedule.minute)
@@ -473,93 +724,220 @@ object ScheduledMessage : ClickableFeature() {
 
     private fun calculateNextTriggerTime(schedule: ScheduleConfig, allowCatchUp: Boolean): Long {
         val now = System.currentTimeMillis()
+        val today = refreshDayKey()
         val todayTarget = todayTargetOf(schedule)
 
         if (todayTarget > now) return todayTarget
 
-        val missed = now - todayTarget
-        // 只有"确实排过闹钟且已经过点"才算漏发, 才允许补发。
-        // nextSendTime==0 表示这个任务从未排过期(新建 / 首次升级 / 存储被清理),
-        // 此时凭空补发一条几小时前的旧消息只会吓用户一跳, 直接按明天(或作废)处理。
+        // nextSendTime==0 表示从未排期; 不要凭空补发几小时前的旧任务。
         val wasScheduled = schedule.nextSendTime > 0 && schedule.nextSendTime <= now
         if (!wasScheduled) {
             return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
         }
-        // 当天已经成功发过 -> 只能等明天(重复任务)或作废(单次任务)。
-        // 这条判据取代了原来的 15 分钟窗口: 现在哪怕用户隔了几个小时才打开微信,
-        // 只要当天还没发成功就补发一次, 而发过的绝不会二次补发。
-        if (schedule.lastFiredDate == todayKey()) {
+        if (ScheduledMessagePlan.alreadyFiredToday(schedule.lastFiredDate, today)) {
             return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
         }
-        // 试过太多次仍失败 -> 今天不再折腾, 避免半夜疯狂重试
-        if (schedule.fireAttempts >= MAX_FIRE_ATTEMPTS) {
-            WeLogger.w(TAG, "schedule ${schedule.id} exhausted ${schedule.fireAttempts} attempts today, giving up")
+        if (!ScheduledMessagePlan.canFire(
+                schedule.fireAttemptDate,
+                schedule.fireAttempts,
+                today,
+                MAX_FIRE_ATTEMPTS
+            )
+        ) {
+            WeLogger.w(TAG, "schedule ${schedule.id} exhausted attempts today, giving up")
             return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
         }
-        // 超出补发窗口(比如隔天甚至更晚才拉起微信) -> 按明天/作废处理
-        if (missed > CATCHUP_WINDOW_MS) {
+        val windowMs = if (allowCatchUp) CATCHUP_WINDOW_MS else RETRY_WINDOW_MS
+        if (!ScheduledMessagePlan.isWithinCatchupWindow(now, schedule.nextSendTime, windowMs)) {
             return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
         }
-        // 当天应发而未发: 重复任务立刻补发, 单次任务稍作退避后重试
-        return if (schedule.repeatDaily) now + 2000L else now + ONETIME_RETRY_DELAY_MS
+        return ScheduledMessagePlan.retryAt(
+            now,
+            schedule.repeatDaily,
+            2_000L,
+            ONETIME_RETRY_DELAY_MS
+        )
     }
 
-    private suspend fun handleScheduleTrigger(scheduleId: String) {
+    private fun handleScheduleTrigger(
+        scheduleId: String,
+        source: String,
+        receivedAtMs: Long = 0,
+        receivedAtNs: Long = 0,
+    ) {
+        if (!isActive) return
+        val entryNs = SystemClock.elapsedRealtimeNanos()
+        val entryUptimeMs = SystemClock.uptimeMillis()
+        val nowMs = System.currentTimeMillis()
+        val version = storageVersion
         val schedule = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
-
         if (!schedule.enabled) return
 
-        // 时间守卫：进程内定时器与闹钟可能先后触发，只允许到点后执行，避免重复发送
-        val nowMs = System.currentTimeMillis()
-        if (schedule.nextSendTime > 0 && nowMs < schedule.nextSendTime - 2000) {
-            WeLogger.i(TAG, "trigger for ${schedule.id} fired too early, skipping (next=${schedule.nextSendTime}, now=$nowMs)")
+        // 只允许到点后执行; 过早广播直接丢弃, 不进入热路径。
+        if (schedule.nextSendTime > 0 && nowMs < schedule.nextSendTime - 2_000L) {
+            WeLogger.i(
+                TAG,
+                "${WeLogger.FORK_LOG_PREFIX} trigger for ${schedule.id} too early, skipping " +
+                        "(next=${schedule.nextSendTime}, now=$nowMs, source=$source)"
+            )
             return
         }
-        WeLogger.i(TAG, "scheduled trigger fired for ${schedule.id} (next=${schedule.nextSendTime}, now=$nowMs)")
-
         if (!triggering.add(scheduleId)) {
-            WeLogger.i(TAG, "trigger for ${schedule.id} already in flight, skipping duplicate")
+            WeLogger.i(TAG, "${WeLogger.FORK_LOG_PREFIX} trigger for ${schedule.id} already in flight, skipping duplicate")
             return
         }
         try {
-            // 当天已成功发过: 只推进排期, 不再重复发送
-            if (schedule.lastFiredDate == todayKey()) {
-                WeLogger.i(TAG, "schedule ${schedule.id} already fired today, advancing schedule only")
-                advanceAfterTrigger(schedule, sentOk = true)
+            // 版本未变时复用首份快照, 避免第二次 JSON 解码; 并发写入才重读。
+            val fresh = synchronized(storageLock) {
+                if (storageVersion == version) schedule else schedules.find { it.id == scheduleId }
+            } ?: return
+            if (!fresh.enabled || !isActive) return
+            if (fresh.nextSendTime != schedule.nextSendTime) return
+
+            val today = refreshDayKey()
+            if (ScheduledMessagePlan.alreadyFiredToday(fresh.lastFiredDate, today)) {
+                advanceAfterTrigger(fresh, sentOk = true)
+                return
+            }
+            if (!ScheduledMessagePlan.canFire(
+                    fresh.fireAttemptDate,
+                    fresh.fireAttempts,
+                    today,
+                    MAX_FIRE_ATTEMPTS
+                )
+            ) {
+                WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} schedule ${fresh.id} exhausted attempts today")
+                advanceAfterTrigger(fresh, sentOk = false)
                 return
             }
 
-            schedule.fireAttempts += 1
-            // 跨天重置"当天已成功的接收方", 否则昨天的记录会让今天直接跳过发送
-            if (schedule.lastFiredDate != todayKey() && schedule.sentTargets.isNotEmpty()) {
-                schedule.sentTargets = emptyList()
+            val oldCompletedOnPastDay = fresh.fireAttemptDate.isEmpty() &&
+                    fresh.lastFiredDate.isNotEmpty() && fresh.lastFiredDate != today
+            val newDay = (fresh.fireAttemptDate.isNotEmpty() && fresh.fireAttemptDate != today) ||
+                    oldCompletedOnPastDay
+            if (newDay) {
+                fresh.sentTargets = emptyList()
+                fresh.sentSegments = emptyMap()
             }
-            val sentOk = runCatching {
-                if (schedule.segments.isNotEmpty()) {
-                    sendSegments(schedule)
-                } else {
-                    sendLegacySingle(schedule)
-                }
-            }.onFailure {
-                WeLogger.e(TAG, "failed to send scheduled message for ${schedule.id}", it)
-            }.getOrDefault(false)
+            fresh.fireAttempts = ScheduledMessagePlan.effectiveFireAttempts(
+                fresh.fireAttemptDate,
+                fresh.fireAttempts,
+                today
+            ) + 1
+            fresh.fireAttemptDate = today
 
-            if (sentOk) {
-                schedule.lastFiredDate = todayKey()
-                schedule.fireAttempts = 0
-                WeLogger.i(TAG, "scheduled message sent to ${schedule.targetTalkers()}")
-            } else {
-                WeLogger.w(
-                    TAG,
-                    "scheduled message to ${schedule.targetTalkers()} incomplete " +
-                            "(attempt ${schedule.fireAttempts}/$MAX_FIRE_ATTEMPTS, " +
-                            "sent=${schedule.sentTargets})"
-                )
+            val targets = fresh.targetTalkers()
+            val fastText = when {
+                fresh.segments.size == 1 &&
+                        (fresh.segments[0].type == MessageType.TEXT || fresh.segments[0].type == MessageType.LINK) &&
+                        targets.size == 1 -> fresh.segments[0].content
+                fresh.segments.isEmpty() &&
+                        (fresh.messageType == MessageType.TEXT || fresh.messageType == MessageType.LINK) &&
+                        targets.size == 1 -> fresh.content
+                else -> null
             }
-            advanceAfterTrigger(schedule, sentOk)
-        } finally {
+            if (fastText != null) {
+                val target = targets.first()
+                val probe = sendTextSafelyProbe(target, fastText)
+                queueTimingStats.add(probe.measuredNs)
+                if (probe.accepted) markLegacySegmentSent(fresh, target, 0)
+                finishTrigger(
+                    schedule = fresh,
+                    sentOk = probe.accepted,
+                    source = source,
+                    targetNextSendTime = schedule.nextSendTime,
+                    entryNs = entryNs,
+                    entryUptimeMs = entryUptimeMs,
+                    receivedAtMs = receivedAtMs,
+                    receivedAtNs = receivedAtNs,
+                    getterNs = probe.getterNs,
+                    constructNs = probe.constructNs,
+                    queueNs = probe.queueNs,
+                    queueMeasured = true,
+                    queueEndWallMs = probe.queueEndWallMs,
+                )
+            } else {
+                val job = scope.launch {
+                    try {
+                        val sentOk = if (fresh.segments.isNotEmpty()) {
+                            sendSegments(fresh)
+                        } else {
+                            sendLegacySingle(fresh)
+                        }
+                        finishTrigger(
+                            schedule = fresh,
+                            sentOk = sentOk,
+                            source = source,
+                            targetNextSendTime = schedule.nextSendTime,
+                            entryNs = entryNs,
+                            entryUptimeMs = entryUptimeMs,
+                            receivedAtMs = receivedAtMs,
+                            receivedAtNs = receivedAtNs,
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} complex schedule ${fresh.id} failed", e)
+                    } finally {
+                        triggering.remove(scheduleId)
+                        activeSendJobs.remove(scheduleId)
+                    }
+                }
+                activeSendJobs[scheduleId] = job
+            }
+        } catch (e: Throwable) {
             triggering.remove(scheduleId)
+            WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} schedule trigger ${schedule.id} failed", e)
         }
+    }
+
+    private fun finishTrigger(
+        schedule: ScheduleConfig,
+        sentOk: Boolean,
+        source: String,
+        targetNextSendTime: Long,
+        entryNs: Long,
+        entryUptimeMs: Long,
+        receivedAtMs: Long,
+        receivedAtNs: Long,
+        getterNs: Long = 0,
+        constructNs: Long = 0,
+        queueNs: Long = 0,
+        queueMeasured: Boolean = false,
+        queueEndWallMs: Long = 0,
+    ) {
+        val persistStartNs = SystemClock.elapsedRealtimeNanos()
+        if (sentOk) {
+            schedule.lastFiredDate = todayKey()
+            schedule.fireAttempts = 0
+        }
+        advanceAfterTrigger(schedule, sentOk)
+        val persistUs = (SystemClock.elapsedRealtimeNanos() - persistStartNs) / 1_000L
+        val endWallMs = System.currentTimeMillis()
+        val dispatchUs = if (receivedAtNs > 0) (entryNs - receivedAtNs) / 1_000L else -1L
+        val entryToQueueText = if (queueMeasured) {
+            "${(getterNs + constructNs + queueNs) / 1_000L}us"
+        } else {
+            "n/a"
+        }
+        val queueCallText = if (queueMeasured) "${queueNs / 1_000L}us" else "n/a"
+        val getterText = if (queueMeasured) "${getterNs / 1_000L}us" else "n/a"
+        val constructText = if (queueMeasured) "${constructNs / 1_000L}us" else "n/a"
+        val queueDriftText = if (queueEndWallMs > 0) "${queueEndWallMs - targetNextSendTime}ms" else "n/a"
+        WeLogger.i(
+            TAG,
+            "${WeLogger.FORK_LOG_PREFIX} trigger ${schedule.id} probe: source=$source, " +
+                    "queueDrift=$queueDriftText, finishDrift=${endWallMs - targetNextSendTime}ms, " +
+                    "dispatch=${dispatchUs}us, " +
+                    "entryToQueue=$entryToQueueText, queueCall=$queueCallText, getter=$getterText, " +
+                    "construct=$constructText, persist=${persistUs}us, " +
+                    "sent=$sentOk, alarmReceivedAt=$receivedAtMs, wall=$endWallMs, " +
+                    "elapsed=${entryNs / 1_000_000L}, uptime=$entryUptimeMs, " +
+                    "p50=${queueTimingStats.percentile(50.0) / 1_000L}us, " +
+                    "p95=${queueTimingStats.percentile(95.0) / 1_000L}us, " +
+                    "p99=${queueTimingStats.percentile(99.0) / 1_000L}us, " +
+                    "max=${queueTimingStats.max() / 1_000L}us"
+        )
     }
 
     /**
@@ -578,60 +956,115 @@ object ScheduledMessage : ClickableFeature() {
             WeLogger.e(TAG, "schedule ${schedule.id} has no target talker")
             return false
         }
-        for (target in targets) {
-            if (target in schedule.sentTargets) {
-                WeLogger.i(TAG, "schedule ${schedule.id}: target $target already succeeded today, skipping")
+        for ((targetIndex, target) in targets.withIndex()) {
+            if (!isActive) return false
+            if (target in schedule.sentTargets ||
+                ScheduledMessageProgress.isTargetComplete(schedule.sentSegments, target, schedule.segments.size)
+            ) {
+                markTargetComplete(schedule, target, schedule.segments.size)
                 continue
             }
             val ok = sendSegmentsTo(schedule, target)
             if (ok) {
-                schedule.sentTargets = (schedule.sentTargets + target).distinct()
+                markTargetComplete(schedule, target, schedule.segments.size)
             } else {
-                WeLogger.e(TAG, "schedule ${schedule.id}: target $target failed")
+                WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} schedule ${schedule.id}: target $target failed")
                 allOk = false
             }
-            delay(TARGET_GAP_MS)
+            if (targetIndex < targets.lastIndex) delay(TARGET_GAP_MS)
         }
         return allOk
     }
 
-    /** 把全部消息段发给单个接收方; 单段失败退避重试一次。 */
+    /** 把尚未成功提交的消息段发给单个接收方; 已成功段直接跳过。 */
     private suspend fun sendSegmentsTo(schedule: ScheduleConfig, target: String): Boolean {
         var allOk = true
         schedule.segments.forEachIndexed { index, segment ->
+            if (!isActive) return false
+            if (ScheduledMessageProgress.isSegmentSent(schedule.sentSegments, target, index)) {
+                return@forEachIndexed
+            }
             val ok = runCatching { sendSegment(target, segment) }
                 .onFailure { WeLogger.e(TAG, "segment $index (${segment.type}) threw", it) }
                 .getOrDefault(false)
             if (!ok) {
-                WeLogger.w(TAG, "segment $index (${segment.type}) failed, retrying once")
+                WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} segment $index (${segment.type}) failed, retrying once")
                 delay(SEGMENT_RETRY_DELAY_MS)
                 val retried = runCatching { sendSegment(target, segment) }
                     .onFailure { WeLogger.e(TAG, "segment $index (${segment.type}) retry threw", it) }
                     .getOrDefault(false)
                 if (!retried) {
-                    WeLogger.e(TAG, "segment $index (${segment.type}) gave up for ${schedule.id}")
+                    WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} segment $index (${segment.type}) gave up for ${schedule.id}")
                     allOk = false
+                    return@forEachIndexed
                 }
             }
-            if (index < schedule.segments.size - 1) {
-                delay(500)
-            }
+            markSegmentSent(schedule, target, index)
+            if (index < schedule.segments.lastIndex) delay(500)
         }
         return allOk
+    }
+
+    private fun markSegmentSent(schedule: ScheduleConfig, target: String, segmentIndex: Int) {
+        val merged = synchronized(storageLock) {
+            val current = schedules.find { it.id == schedule.id } ?: return
+            if (!current.enabled) return
+            current.sentSegments = ScheduledMessageProgress.markSegmentSent(
+                current.sentSegments,
+                target,
+                segmentIndex
+            )
+            updateSchedule(current)
+            current.sentSegments
+        }
+        schedule.sentSegments = merged
+    }
+
+    private fun markTargetComplete(schedule: ScheduleConfig, target: String, segmentCount: Int) {
+        synchronized(storageLock) {
+            val current = schedules.find { it.id == schedule.id } ?: return
+            if (!current.enabled) return
+            if (!ScheduledMessageProgress.isTargetComplete(current.sentSegments, target, segmentCount)) return
+            if (target !in current.sentTargets) {
+                current.sentTargets = (current.sentTargets + target).distinct()
+                updateSchedule(current)
+            }
+            schedule.sentTargets = current.sentTargets
+        }
+    }
+
+    private fun markLegacySegmentSent(schedule: ScheduleConfig, target: String, segmentIndex: Int) {
+        markSegmentSent(schedule, target, segmentIndex)
+        markTargetComplete(schedule, target, 1)
     }
 
     /** 触发结束后的收尾: 落库 -> 单次任务关闭 -> 重排下一次(含失败重试) */
     private fun advanceAfterTrigger(schedule: ScheduleConfig, sentOk: Boolean) {
         runCatching {
-            if (schedule.oneTimeOnly && sentOk) {
-                schedule.enabled = false
-            }
-            synchronized(storageLock) { updateSchedule(schedule) }
-            if (schedule.oneTimeOnly && sentOk) {
+            val current = synchronized(storageLock) {
+                val stored = schedules.find { it.id == schedule.id } ?: return@synchronized null
+                if (!stored.enabled) return@synchronized null
+                stored.lastFiredDate = schedule.lastFiredDate
+                stored.fireAttempts = schedule.fireAttempts
+                stored.fireAttemptDate = schedule.fireAttemptDate
+                stored.sentTargets = schedule.sentTargets
+                stored.sentSegments = schedule.sentSegments
+                if (schedule.oneTimeOnly && sentOk) stored.enabled = false
+                updateSchedule(stored)
+                stored
+            } ?: run {
                 cancelAlarm(schedule)
                 return
             }
-            scheduleAlarm(schedule)
+            if (!isActive || !current.enabled) {
+                cancelAlarm(current)
+                return
+            }
+            if (current.oneTimeOnly && sentOk) {
+                cancelAlarm(current)
+                return
+            }
+            scheduleAlarm(current)
         }.onFailure {
             WeLogger.e(TAG, "failed to advance schedule ${schedule.id}", it)
         }
@@ -645,7 +1078,7 @@ object ScheduledMessage : ClickableFeature() {
             MessageType.IMAGE -> {
                 when {
                     segment.filePath.isNotBlank() ->
-                        runCatching { WeMessageApi.sendImage(talker, segment.filePath); true }
+                        runCatching { WeMessageApi.sendImage(talker, segment.filePath) }
                             .onFailure { WeLogger.e(TAG, "send image failed (path=${segment.filePath})", it) }
                             .getOrDefault(false)
                     segment.content.startsWith(DEFERRED_IMAGE_PREFIX) -> {
@@ -664,7 +1097,7 @@ object ScheduledMessage : ClickableFeature() {
             }
             MessageType.VOICE -> {
                 if (segment.filePath.isNotBlank()) {
-                    runCatching { WeMessageApi.sendVoice(talker, segment.filePath, segment.duration); true }
+                    runCatching { WeMessageApi.sendVoice(talker, segment.filePath, segment.duration) }
                         .onFailure { WeLogger.e(TAG, "send voice failed (path=${segment.filePath})", it) }
                         .getOrDefault(false)
                 } else if (segment.srcSvrId > 0 || segment.srcMsgId > 0) {
@@ -676,7 +1109,7 @@ object ScheduledMessage : ClickableFeature() {
             }
             MessageType.VIDEO -> {
                 if (segment.filePath.isNotBlank()) {
-                    runCatching { WeMessageApi.sendVideo(talker, segment.filePath); true }
+                    runCatching { WeMessageApi.sendVideo(talker, segment.filePath) }
                         .onFailure { WeLogger.e(TAG, "send video failed (path=${segment.filePath})", it) }
                         .getOrDefault(false)
                 } else if (segment.srcSvrId > 0 || segment.srcMsgId > 0) {
@@ -690,7 +1123,7 @@ object ScheduledMessage : ClickableFeature() {
                 when {
                     segment.filePath.isNotBlank() -> {
                         val fileName = segment.filePath.substringAfterLast('/')
-                        runCatching { WeMessageApi.sendFile(talker, segment.filePath, fileName); true }
+                        runCatching { WeMessageApi.sendFile(talker, segment.filePath, fileName) }
                             .onFailure { WeLogger.e(TAG, "send file failed (path=${segment.filePath})", it) }
                             .getOrDefault(false)
                     }
@@ -725,15 +1158,19 @@ object ScheduledMessage : ClickableFeature() {
         }.getOrDefault(false)
     }
 
-    private fun sendTextSafely(talker: String, content: String): Boolean {
+    private fun sendTextSafelyProbe(talker: String, content: String): WeMessageApi.TextSendProbe {
         if (content.isBlank()) {
-            // 空文本段视为无需发送, 不算失败
-            return true
+            return WeMessageApi.TextSendProbe(true, 0L, 0L, 0L, 0L)
         }
-        return runCatching { WeMessageApi.sendText(talker, content); true }
+        return runCatching { WeMessageApi.sendTextProbe(talker, content) }
             .onFailure { WeLogger.e(TAG, "send text failed (talker=$talker)", it) }
-            .getOrDefault(false)
+            .getOrElse {
+                WeMessageApi.TextSendProbe(false, 0L, 0L, 0L, 0L)
+            }
     }
+
+    private fun sendTextSafely(talker: String, content: String): Boolean =
+        sendTextSafelyProbe(talker, content).accepted
 
     /**
      * 复读式发送: 按引用重建权威消息对象后, 走与 ForwardMessages(转发) 完全相同的通道
@@ -769,7 +1206,7 @@ object ScheduledMessage : ClickableFeature() {
         // 本地缓存已清理等场景: 退回 CDN 下载
         val path = svrId.takeIf { it > 0 }?.let { WeMessageApi.downloadImage(it) }
         if (path != null) {
-            return runCatching { WeMessageApi.sendImage(talker, path); true }
+            return runCatching { WeMessageApi.sendImage(talker, path) }
                 .onFailure { WeLogger.e(TAG, "send image failed (path=$path)", it) }
                 .getOrDefault(false)
         }
@@ -793,7 +1230,6 @@ object ScheduledMessage : ClickableFeature() {
                 ?: AudioUtils.getDurationMs(voicePath).toInt()
             if (durationMs <= 0) error("voice duration unavailable at send time: $voicePath")
             WeMessageApi.sendVoice(talker, voicePath, durationMs)
-            true
         }.onFailure {
             WeLogger.e(TAG, "repeat-path voice failed (svrId=${segment.srcSvrId})", it)
         }.getOrDefault(false)
@@ -811,7 +1247,6 @@ object ScheduledMessage : ClickableFeature() {
             if (mp4Path.isBlank()) error("video mp4 path blank")
             if (!java.io.File(mp4Path).exists()) error("video mp4 not on disk at send time: $mp4Path")
             WeMessageApi.sendVideo(talker, mp4Path)
-            true
         }.onFailure {
             WeLogger.e(TAG, "repeat-path video failed (svrId=${segment.srcSvrId})", it)
         }.getOrDefault(false)
@@ -826,7 +1261,6 @@ object ScheduledMessage : ClickableFeature() {
         return runCatching {
             val path = WeMessageApi.downloadFile(instance) ?: error("file download failed at send time")
             WeMessageApi.sendFile(talker, path, path.substringAfterLast('/'))
-            true
         }.onFailure {
             WeLogger.e(TAG, "repeat-path file failed (svrId=${segment.srcSvrId})", it)
         }.getOrDefault(false)
@@ -840,19 +1274,22 @@ object ScheduledMessage : ClickableFeature() {
             return false
         }
         var allOk = true
-        for (target in targets) {
-            if (target in schedule.sentTargets) {
-                WeLogger.i(TAG, "legacy schedule ${schedule.id}: target $target already succeeded today, skipping")
+        for ((targetIndex, target) in targets.withIndex()) {
+            if (!isActive) return false
+            if (target in schedule.sentTargets ||
+                ScheduledMessageProgress.isTargetComplete(schedule.sentSegments, target, 1)
+            ) {
+                markLegacySegmentSent(schedule, target, 0)
                 continue
             }
             val ok = sendLegacySingleTo(schedule, target)
             if (ok) {
-                schedule.sentTargets = (schedule.sentTargets + target).distinct()
+                markLegacySegmentSent(schedule, target, 0)
             } else {
-                WeLogger.e(TAG, "legacy schedule ${schedule.id}: target $target failed")
+                WeLogger.e(TAG, "${WeLogger.FORK_LOG_PREFIX} legacy schedule ${schedule.id}: target $target failed")
                 allOk = false
             }
-            delay(TARGET_GAP_MS)
+            if (targetIndex < targets.lastIndex) delay(TARGET_GAP_MS)
         }
         return allOk
     }
@@ -867,7 +1304,7 @@ object ScheduledMessage : ClickableFeature() {
                     WeLogger.e(TAG, "legacy image schedule has no file path")
                     return false
                 }
-                runCatching { WeMessageApi.sendImage(talker, schedule.filePath); true }
+                runCatching { WeMessageApi.sendImage(talker, schedule.filePath) }
                     .onFailure { WeLogger.e(TAG, "legacy image send failed", it) }
                     .getOrDefault(false)
             }
@@ -876,7 +1313,7 @@ object ScheduledMessage : ClickableFeature() {
                     WeLogger.e(TAG, "legacy voice schedule has no file path")
                     return false
                 }
-                runCatching { WeMessageApi.sendVoice(talker, schedule.filePath, schedule.duration); true }
+                runCatching { WeMessageApi.sendVoice(talker, schedule.filePath, schedule.duration) }
                     .onFailure { WeLogger.e(TAG, "legacy voice send failed", it) }
                     .getOrDefault(false)
             }
@@ -885,7 +1322,7 @@ object ScheduledMessage : ClickableFeature() {
                     WeLogger.e(TAG, "legacy video schedule has no file path")
                     return false
                 }
-                runCatching { WeMessageApi.sendVideo(talker, schedule.filePath); true }
+                runCatching { WeMessageApi.sendVideo(talker, schedule.filePath) }
                     .onFailure { WeLogger.e(TAG, "legacy video send failed", it) }
                     .getOrDefault(false)
             }
@@ -895,7 +1332,7 @@ object ScheduledMessage : ClickableFeature() {
                     return false
                 }
                 val fileName = schedule.filePath.substringAfterLast('/')
-                runCatching { WeMessageApi.sendFile(talker, schedule.filePath, fileName); true }
+                runCatching { WeMessageApi.sendFile(talker, schedule.filePath, fileName) }
                     .onFailure { WeLogger.e(TAG, "legacy file send failed", it) }
                     .getOrDefault(false)
             }
@@ -907,8 +1344,20 @@ object ScheduledMessage : ClickableFeature() {
     }
 
     private fun cancelAlarm(schedule: ScheduleConfig) {
-        timerJobs.remove(schedule.id)?.cancel()
-        val pi = activeAlarms.remove(schedule.id) ?: return
+        cancelTimer(schedule.id)
+        val pi = activeAlarms.remove(schedule.id) ?: run {
+            if (schedule.alarmRequestCode <= 0) return
+            val intent = Intent(ALARM_ACTION).apply {
+                setPackage(HostInfo.application.packageName)
+                putExtra(EXTRA_SCHEDULE_ID, schedule.id)
+            }
+            PendingIntent.getBroadcast(
+                HostInfo.application,
+                schedule.alarmRequestCode,
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            )
+        } ?: return
         pi.cancel()
         runCatching {
             val am = HostInfo.application.getSystemService(Context.ALARM_SERVICE) as AlarmManager

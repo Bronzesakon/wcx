@@ -39,6 +39,8 @@ android {
 
     val commitCount = getCommitCount()
     val gitHash = getGitHash()
+    // fork 的 build.yml 注入发布标签；应用内更新检查继续保持关闭。
+    val ciReleaseTag = providers.environmentVariable("WCX_RELEASE_TAG").orElse("").get()
 
     defaultConfig {
         applicationId = libs.versions.namespace.get()
@@ -52,6 +54,7 @@ android {
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
+        buildConfigField("String", "RELEASE_TAG", "\"${ciReleaseTag.replace("\"", "\\\"")}\"")
         buildConfigField("long", "BUILD_TIMESTAMP", "${System.currentTimeMillis()}L")
         buildConfigField("boolean", "BEAUTIFY_ENABLED", "true")
     }
@@ -60,7 +63,11 @@ android {
         abi {
             reset()
             isEnable = true
-            include("arm64-v8a", "armeabi-v7a")
+            // 可用 -Pwcx.abi=arm64-v8a 覆盖（CI 精简构建用）；默认全部 ABI
+            val abiFilter = (project.findProperty("wcx.abi") as String?)
+                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?: listOf("arm64-v8a", "armeabi-v7a")
+            include(*abiFilter.toTypedArray())
             isUniversalApk = false
         }
     }
@@ -98,29 +105,40 @@ android {
     //   2. gradle 属性同名 key
     //   3. 默认 keystore：~/wcx-keystore.jks → ~/.wcx/wcx-keystore.jks → <rootProject>/wcx-keystore.jks
     //      （alias=wcx，store/key 密码 wcx-store-pass，与历史交付 APK 一致）
-    //   4. 都找不到 → release 不签名（已禁用 debug 兜底；用户要求永远用仓库固定签名，
-    //      由 CI 的「Verify APK signatures」步骤校验产物签名）
+    //   4. 未配置密钥时 release 不签名（已禁用 debug 兜底；用户要求永远用仓库固定签名，
+    //      由 CI 的「Verify APK signatures」步骤校验产物签名）。
+    //      发布 CI 必须传 -Pwcx.requireReleaseSigning=true，并由 build.yml 验签。
+    // 显式配置的路径无效时立即失败，避免错误路径静默生成另一张证书的 APK。
     // ────────────────────────────────────────────────────────────────────────
     @Suppress("LocalVariableName")
     signingConfigs {
         fun resolveProp(name: String): String? =
-            System.getenv(name) ?: runCatching { project.property(name) }.getOrNull() as? String?
+            System.getenv(name)?.takeIf { it.isNotBlank() }
+                ?: (project.findProperty(name) as? String)?.takeIf { it.isNotBlank() }
 
         val home = System.getProperty("user.home") ?: ""
         val defaultStore = listOf("$home/wcx-keystore.jks", "$home/.wcx/wcx-keystore.jks")
-            .firstOrNull { File(it).exists() }
-            ?: rootProject.file("wcx-keystore.jks").takeIf { it.exists() }?.absolutePath
+            .firstOrNull { File(it).isFile }
+            ?: rootProject.file("wcx-keystore.jks").takeIf { it.isFile }?.absolutePath
 
-        val _storeFile = resolveProp("WEKIT_KEYSTORE_FILE") ?: defaultStore
+        val configuredStore = resolveProp("WEKIT_KEYSTORE_FILE")
+        val _storeFile = configuredStore ?: defaultStore
         val _storePassword = resolveProp("WEKIT_KEYSTORE_PASSWORD") ?: "wcx-store-pass"
         val _keyAlias = resolveProp("WEKIT_KEY_ALIAS") ?: "wcx"
         val _keyPassword = resolveProp("WEKIT_KEY_PASSWORD") ?: "wcx-store-pass"
 
-        val storeExists = _storeFile != null && File(_storeFile).exists()
+        val store = _storeFile?.let { file(it) }
+        val storeExists = store?.isFile == true
+        require(configuredStore == null || storeExists) {
+            "WEKIT_KEYSTORE_FILE must point to an existing keystore; refusing debug signing fallback"
+        }
+        require(providers.gradleProperty("wcx.requireReleaseSigning").orNull != "true" || storeExists) {
+            "Release signing is required, but no keystore was found"
+        }
         if (storeExists) {
             create("release") {
                 foundKeystore = true
-                storeFile = file(_storeFile)
+                storeFile = store
                 storePassword = _storePassword
                 keyAlias = _keyAlias
                 keyPassword = _keyPassword
