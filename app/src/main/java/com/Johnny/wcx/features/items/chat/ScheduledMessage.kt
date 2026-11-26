@@ -281,6 +281,7 @@ object ScheduledMessage : ClickableFeature() {
     // 第二个触发者重读任务时 nextSendTime 尚未推进, 守卫照样放行 → 重复发送。
     private val triggering = ConcurrentHashMap.newKeySet<String>()
     private lateinit var alarmReceiver: BroadcastReceiver
+    private lateinit var recoveryReceiver: BroadcastReceiver
 
     private var schedulerThread: HandlerThread? = null
     private var schedulerHandler: Handler? = null
@@ -317,12 +318,7 @@ object ScheduledMessage : ClickableFeature() {
         refreshDayKey()
         alarmReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                val action = intent?.action ?: return
-                if (action != ALARM_ACTION) {
-                    recoverSchedules(action)
-                    return
-                }
-                val scheduleId = intent.getStringExtra(EXTRA_SCHEDULE_ID) ?: return
+                val scheduleId = intent?.getStringExtra(EXTRA_SCHEDULE_ID) ?: return
                 val receivedAtMs = System.currentTimeMillis()
                 val receivedAtNs = SystemClock.elapsedRealtimeNanos()
                 val pending = goAsync()
@@ -340,9 +336,27 @@ object ScheduledMessage : ClickableFeature() {
                 }
             }
         }
+        recoveryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                recoverSchedules(intent?.action ?: "recovery")
+            }
+        }
 
         runCatching {
-            val filter = IntentFilter(ALARM_ACTION).apply {
+            // 自有闹钟只允许本应用触发, 防止外部伪造 action 造成重复发送。
+            ContextCompat.registerReceiver(
+                HostInfo.application,
+                alarmReceiver,
+                IntentFilter(ALARM_ACTION),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }.onFailure {
+            WeLogger.e(TAG, "failed to register alarm receiver", it)
+        }
+
+        runCatching {
+            // 系统广播来自 system UID; NOT_EXPORTED 可能收不到, 单独用 EXPORTED 注册。
+            val recoveryFilter = IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_USER_PRESENT)
                 addAction(Intent.ACTION_TIME_CHANGED)
@@ -350,12 +364,12 @@ object ScheduledMessage : ClickableFeature() {
             }
             ContextCompat.registerReceiver(
                 HostInfo.application,
-                alarmReceiver,
-                filter,
-                ContextCompat.RECEIVER_NOT_EXPORTED
+                recoveryReceiver,
+                recoveryFilter,
+                ContextCompat.RECEIVER_EXPORTED
             )
         }.onFailure {
-            WeLogger.e(TAG, "failed to register alarm receiver", it)
+            WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to register schedule recovery receiver", it)
         }
 
         runCatching { HostInfo.application.registerActivityLifecycleCallbacks(recoveryCallbacks) }
@@ -478,6 +492,11 @@ object ScheduledMessage : ClickableFeature() {
             HostInfo.application.unregisterReceiver(alarmReceiver)
         }.onFailure {
             WeLogger.e(TAG, "failed to unregister alarm receiver", it)
+        }
+        runCatching {
+            HostInfo.application.unregisterReceiver(recoveryReceiver)
+        }.onFailure {
+            WeLogger.w(TAG, "${WeLogger.FORK_LOG_PREFIX} failed to unregister recovery receiver", it)
         }
         stopSchedulerThread()
     }
