@@ -43,6 +43,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
       - name: Record timestamps (UTC+8)
         shell: bash
         run: |
