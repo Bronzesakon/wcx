@@ -59,6 +59,10 @@ object HideContactsNotifications : ApiFeature(), IResolveDex {
 
     private const val TAG = "HideContactsNotifications"
 
+    private const val CHANNEL_ID_TEAM = "wcx_team_summary"
+    private const val NOTIFY_ID_TEAM = 20251024
+    private const val KEY_TEAM_PENDING = "wcx_team_pending"
+
     /**
      * `com.tencent.mm.booter.notification.x.d(x self, String talker, String content, int msgType,
      * int tipsFlag, boolean isRevokeMessage)` — `static void`, so `args[1]` is the talker and
@@ -138,6 +142,76 @@ object HideContactsNotifications : ApiFeature(), IResolveDex {
      *
      * `HideContacts.temporarilyShown` is intentionally *not* consulted — see the class KDoc.
      */
+    /**
+     * 「密友消息震动」：通知被吞掉时补一次短震动，让用户知道名单内有人发消息。
+     *
+     * 震动是选配（默认关），失败一律静默——通知抑制本身不能被它影响。
+     * 用 application context 取 Vibrator，只调一次 createOneShot，不持有引用。
+     */
+    private fun vibrateIfRequested() {
+        if (!WePrefs.getBoolOrDef(HideContacts.SURFACE_VIBRATE, false)) return
+        runCatching {
+            val ctx = com.Johnny.wcx.utils.HostInfo.application
+            val vibrator = ctx.getSystemService(android.content.Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+                ?: return
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    android.os.VibrationEffect.createOneShot(
+                        180L,
+                        android.os.VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(180L)
+            }
+        }.onFailure { WeLogger.w(TAG, "密友消息震动失败", it) }
+    }
+
+
+    /**
+     * 「微信团队汇总提醒」：通知被吞掉后，改发一条聚合提醒。
+     *
+     * 为什么不用改原通知的标题：`:push` 进程拿不到 sender，而 mix 通知的构造点在混淆类里。
+     * 这里直接自己发一条 —— 固定通知 id，未读数累加在上面的 prefs 里，用户清掉通知后
+     * 下次进来继续累加（不追求精确等于微信未读，只作为「有人找过你」的提示）。
+     */
+    private fun postTeamSummary() {
+        if (!WePrefs.getBoolOrDef(HideContacts.SURFACE_TEAM_SUMMARY, false)) return
+        runCatching {
+            val ctx = com.Johnny.wcx.utils.HostInfo.application
+            val nm = ctx.getSystemService(android.content.Context.NOTIFICATION_SERVICE)
+                as? android.app.NotificationManager ?: return
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O
+                && nm.getNotificationChannel(CHANNEL_ID_TEAM) == null
+            ) {
+                nm.createNotificationChannel(
+                    android.app.NotificationChannel(
+                        CHANNEL_ID_TEAM,
+                        "密友消息汇总",
+                        android.app.NotificationManager.IMPORTANCE_LOW,
+                    )
+                )
+            }
+            val pending = WePrefs.getIntOrDef(KEY_TEAM_PENDING, 0) + 1
+            WePrefs.putInt(KEY_TEAM_PENDING, pending)
+
+            val builder = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                android.app.Notification.Builder(ctx, CHANNEL_ID_TEAM)
+            } else {
+                @Suppress("DEPRECATION")
+                android.app.Notification.Builder(ctx)
+            }
+            val notification = builder
+                .setContentTitle("微信团队")
+                .setContentText("你有 $pending 条未读消息")
+                .setSmallIcon(android.R.drawable.sym_action_chat)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(NOTIFY_ID_TEAM, notification)
+        }.onFailure { WeLogger.w(TAG, "汇总提醒发送失败", it) }
+    }
+
     private fun isSuppressed(wxId: String): Boolean =
         WePrefs.getBoolOrDef(HideContacts.technicalId, false) && wxId in HideContacts.hiddenContacts
 
@@ -158,6 +232,8 @@ object HideContactsNotifications : ApiFeature(), IResolveDex {
             val talker = args[1] as? String ?: return@hookBefore
             if (!isSuppressed(talker)) return@hookBefore
             WeLogger.i(TAG, "suppressing message notification from $talker")
+            vibrateIfRequested()
+            postTeamSummary()
             result = null
         }
 
@@ -170,6 +246,8 @@ object HideContactsNotifications : ApiFeature(), IResolveDex {
             val userName = args[1] as? String ?: return@hookBefore
             if (!isSuppressed(userName)) return@hookBefore
             WeLogger.i(TAG, "suppressing LightPush notification from $userName")
+            vibrateIfRequested()
+            postTeamSummary()
             result = null
         }
     }

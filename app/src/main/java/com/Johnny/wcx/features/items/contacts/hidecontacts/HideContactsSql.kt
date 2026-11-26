@@ -26,8 +26,23 @@ private const val TAG = "HideContacts.Sql"
  * `NOT IN ('...')` predicates is safe everywhere here.
  */
 internal fun HideContacts.installSqlHooks() {
-    installWrapperHook()
-    installFtsHook()
+    // wrapper 是所有列表查询的公共咽喉，只要有任意一个查询型面开着就得装。
+    if (surfaceOn(SURFACE_CONVERSATIONS) || surfaceOn(SURFACE_CONTACTS) ||
+        surfaceOn(SURFACE_MOMENTS_INLINE) || surfaceOn(SURFACE_NEW_FRIENDS) ||
+        surfaceOn(SURFACE_UNREAD)
+    ) {
+        installWrapperHook()
+    }
+    if (surfaceOn(SURFACE_SEARCH)) installFtsHook()
+}
+
+/** 把 SQL 规则映射到它所属的隐藏面，用于按面开关决定这条规则是否生效。 */
+private fun ruleSurface(ruleName: String): String = when (ruleName) {
+    "conversation-list" -> HideContacts.SURFACE_CONVERSATIONS
+    "unread-count" -> HideContacts.SURFACE_UNREAD
+    "new-friends" -> HideContacts.SURFACE_NEW_FRIENDS
+    "moments-comments" -> HideContacts.SURFACE_MOMENTS_INLINE
+    else -> HideContacts.SURFACE_CONTACTS
 }
 
 // ── the wrapper chokepoint ───────────────────────────────────────────────────────────────────
@@ -180,7 +195,9 @@ internal fun rewriteWrapperSql(sql: String, hidden: Set<String>): String? {
     if (hidden.isEmpty()) return null
 
     val lower = sql.lowercase()
-    val rule = WRAPPER_RULES.firstOrNull { it.matches(lower) } ?: return null
+    val rule = WRAPPER_RULES.firstOrNull {
+        it.matches(lower) && HideContacts.surfaceOn(ruleSurface(it.name))
+    } ?: return null
     return injectCondition(sql, rule.condition(hidden))
 }
 

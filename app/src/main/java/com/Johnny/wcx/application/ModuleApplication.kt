@@ -4,12 +4,17 @@ import android.app.Application
 import com.Johnny.wcx.utils.HostInfo
 import com.Johnny.wcx.utils.WeLogger
 import com.Johnny.wcx.utils.crash.JavaCrashHandler
+import com.Johnny.wcx.utils.hook_status.HookStatus
 
 class ModuleApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
         HostInfo.init(this)
+        // 框架服务监听尽早注册：MainActivity.onCreate 里注册会晚于 LSPosed 的首次绑定，
+        // 部分环境下拿不到 onServiceBind，表现为「未检测到 Xposed 框架」。
+        runCatching { HookStatus.init(this) }
+            .onFailure { WeLogger.e("ModuleApplication", "failed to register xposed service listener", it) }
         // 安装全局 Java 崩溃捕获，防止未捕获异常导致闪退
         runCatching { JavaCrashHandler.install() }
             .onFailure { WeLogger.e("ModuleApplication", "failed to install crash handler", it) }

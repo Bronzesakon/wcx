@@ -21,6 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.lang.reflect.Constructor
 import java.lang.reflect.Field
 import java.lang.reflect.Method
@@ -38,9 +39,9 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * ## 图片
  *
- * 复用已在「自动缓存图片」里验证过的通道: [WeMessageApi.cacheImage] →
- * `ImageService.downloadImage(...)`, 该通道**优先下载原图** (`ImgInfo2.hdImgId > 0` 时
- * 取原图那一行, 见 `WeMessageApi.ensureImageCachedFile`)。
+ * 复用 [WeMessageApi.cacheImage] 通道。v299 的实测已推翻「`hdImgId` 就是原图」与
+ * 「尾参 boolean 是画质开关」的猜想; 该通道现在会 hook 图片下载服务中所有带
+ * `MsgIdTalker` 的方法, 抓取微信自己点「查看原图」时的真实参数与返回值, 以探针结果为准。
  *
  * ## 视频 (原画质)
  *
@@ -406,6 +407,9 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
     /** 同时进行的下载任务上限 (原视频动辄几十 MB)。 */
     private const val MAX_CONCURRENT = 2
 
+    /** 等并发槽位的超时, 避免卡死任务占满槽位后视频消息永久饿死。 */
+    private const val PERMIT_WAIT_MS = 90_000L
+
     /** 已完成 (已拉到本地) 的消息, 键为 "type:msgSvrId"。 */
     private val doneKeys = ConcurrentHashMap.newKeySet<String>()
 
@@ -518,7 +522,17 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
                     TAG,
                     "检测到媒体消息 ($via): msgSvrId=$msgSvrId type=${row.type} talker=${row.talker}, 后台下载"
                 )
-                semaphore.withPermit { runTask(row, via, key) }
+                // 等槽位也要有上限: 拿不到就撤, inFlight 在 finally 里释放, 下轮补偿再来。
+                val acquired = withTimeoutOrNull(PERMIT_WAIT_MS) {
+                    semaphore.withPermit { runTask(row, via, key); true }
+                }
+                if (acquired == null) {
+                    WeLogger.w(
+                        TAG,
+                        "等待并发槽位超时 (${PERMIT_WAIT_MS / 1000}s) $key (via $via), " +
+                            "本轮不发起, 留给补偿扫描重试"
+                    )
+                }
             } finally {
                 inFlight.remove(msgSvrId)
             }
@@ -991,7 +1005,6 @@ object AutoPrefetchOriginalMedia : SwitchFeature(),
             logged.clear()
             lastLaunchAt.clear()
             rejectedLaunches.clear()
-            lastLaunchAt.clear()
             videoTable = null
             videoTableProbed = false
         }

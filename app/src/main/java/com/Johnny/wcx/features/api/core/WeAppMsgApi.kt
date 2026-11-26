@@ -25,7 +25,7 @@ object WeAppMsgApi : ApiFeature(), IResolveDex {
 
         val classAppMsgLogic = dexKit.findClass {
             matcher {
-                usingStrings("MicroMsg.AppMsgLogic", "summerbig sendAppMsg attachFilePath")
+                usingStrings("MicroMsg.AppMsgLogic", "summerbig sendAppMsg attachFilePath[%s], content[%s]")
             }
         }.single()
 

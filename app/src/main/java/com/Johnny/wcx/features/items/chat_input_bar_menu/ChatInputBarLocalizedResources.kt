@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.chat_input_bar_menu
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import android.content.Context
 import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
@@ -16,4 +17,4 @@ internal fun Context.localizedChatInputQuantity(
     @PluralsRes id: Int,
     quantity: Int,
     vararg formatArgs: Any,
-): String = resources.getQuantityString(id, quantity, *formatArgs)
+): String = resources.safeGetQuantityString(id, quantity, *formatArgs)

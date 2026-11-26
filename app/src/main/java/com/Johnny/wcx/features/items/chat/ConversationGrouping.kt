@@ -1,6 +1,7 @@
 package com.Johnny.wcx.features.items.chat
 
 import android.content.Context
+import android.view.View
 import android.widget.ListView
 import androidx.activity.ComponentActivity
 import androidx.compose.animation.core.Animatable
@@ -77,7 +78,6 @@ import com.composables.icons.materialsymbols.outlined.Delete
 import com.composables.icons.materialsymbols.outlined.Edit
 import com.composables.icons.materialsymbols.outlined.Settings
 import com.composables.icons.materialsymbols.outlined.Swap_vert
-import dev.ujhhgtg.reflekt.reflekt
 import com.Johnny.wcx.dexkit.abc.IResolveDex
 import com.Johnny.wcx.dexkit.dsl.dexMethod
 import com.Johnny.wcx.features.api.core.WeConversationApi
@@ -115,7 +115,15 @@ import java.lang.reflect.Modifier as JavaModifier
 @Feature(name = "对话分组", categories = ["聊天"], description = "向主页顶部添加 Tab 栏, 将对话分组\n建议同时启用「界面美化/隐藏主页下滑「最近」页」")
 object ConversationGrouping : ClickableFeature(), IResolveDex {
 
-    const val GROUP_PREFIX = "wekit_group_"
+    const val GROUP_PREFIX = "wcxlc_group_"
+
+    /**
+     * 分组 id 的历史前缀（旧品牌时期写入 `conversation_groups.json` 的值）。
+     * [loadGroups] 读到旧前缀时会就地改写为新前缀并回写，避免用户已存的分组
+     * 被 `isGroupId` 过滤器滤掉（表现为升级后分组全部消失）。
+     * 固定的「全部」tab id（`wekit_group_all`）同样以该前缀开头，一并被升级。
+     */
+    private const val LEGACY_GROUP_PREFIX = "wekit_group_"
 
     // The fixed "全部" tab. It behaves like a group for ordering purposes — it can be dragged to any
     // position and that position is persisted alongside the real groups — but it can never be
@@ -142,26 +150,92 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
 
     private val groupMembersCache = ConcurrentHashMap<String, List<String>>()
 
-    // Reference to the tab bar ComposeView added as a header to the conversation ListView.
-    // Used by onDisable() to remove the header when the master switch is toggled off.
     private var headerComposeView: ComposeView? = null
+    private var headerListHost: Any? = null
 
     override fun onEnable() {
         hookConversationListQuery()
 
         methodOnTabCreate.hookAfter {
-            val convListView = thisObject.reflekt()
-                .firstField {
-                    type = "com.tencent.mm.ui.conversation.ConversationListView"
-                }
-                .get()!! as ListView
+            thisObject?.let(::installGroupHeader)
+        }
+        // 返回首页时也尝试安装，覆盖主页已创建后才启用功能的情况。宿主未声明 onResume 时
+        // 仅记录日志跳过：不向父类扩大 Hook 范围，也不影响其余功能启用。
+        val hostClass = methodOnTabCreate.method.declaringClass
+        val onResume = runCatching { hostClass.getDeclaredMethod("onResume") }.getOrNull()
+        if (onResume == null) {
+            WeLogger.w(TAG, "宿主类未声明 onResume，跳过返回首页重装分组栏: ${hostClass.name}")
+        } else {
+            runCatching {
+                onResume.hookAfter { thisObject?.let(::installGroupHeader) }
+            }.onFailure { WeLogger.w(TAG, "注册 onResume 分组栏重装 Hook 失败", it) }
+        }
+    }
 
-            val composeView = ComposeView(convListView.context).apply {
-                headerComposeView = this
+    private fun findConversationListHost(mainUi: Any): Any? {
+        for (type in generateSequence<Class<*>>(mainUi.javaClass) { it.superclass }) {
+            for (field in type.declaredFields) {
+                if (JavaModifier.isStatic(field.modifiers)) continue
+                val hostType = field.type
+                // 8.0.79 将列表移到统一控制器中，ListView/RecyclerView 共用头部接口。
+                val hasHeaderApi = hostType.methods.any {
+                    it.name == "addHeaderView" && it.parameterTypes.contentEquals(arrayOf(View::class.java))
+                } && hostType.methods.any {
+                    it.name == "removeHeaderView" && it.parameterTypes.contentEquals(arrayOf(View::class.java))
+                }
+                if (!ListView::class.java.isAssignableFrom(hostType) && !hasHeaderApi) continue
+                val host = runCatching { field.isAccessible = true; field.get(mainUi) }.getOrNull()
+                if (host != null) return host
+            }
+        }
+        return null
+    }
+
+    private fun removeGroupHeader() {
+        val view = headerComposeView ?: return
+        val host = headerListHost ?: return
+        // 宿主接口可能不存在；即使移除失败也要丢弃引用，否则后续无法重建分组栏。
+        invokeHeaderMethod(host, "removeHeaderView", view)
+        view.disposeComposition()
+        headerComposeView = null
+        headerListHost = null
+    }
+
+    /**
+     * 宿主既可能是 ListView，也可能是 8.0.79 的统一会话列表控制器，头部接口一律反射调用。
+     * 任一环节缺失都不应中断功能启用，因此只记录日志并返回是否调用成功。
+     */
+    private fun invokeHeaderMethod(host: Any, name: String, view: View): Boolean = runCatching {
+        host.javaClass.getMethod(name, View::class.java).invoke(host, view)
+        true
+    }.getOrElse {
+        WeLogger.w(TAG, "调用会话列表 $name 失败: ${host.javaClass.name}", it)
+        false
+    }
+
+    /** 宿主可能是 View，也可能是不继承 View 的控制器；后者按 getContext() 取值。 */
+    private fun resolveHostContext(host: Any): Context? {
+        if (host is View) return host.context
+        return runCatching { host.javaClass.getMethod("getContext").invoke(host) as? Context }
+            .getOrNull()
+    }
+
+    private fun installGroupHeader(mainUi: Any) {
+        val host = findConversationListHost(mainUi) ?: run {
+            WeLogger.w(TAG, "未找到会话列表头部接口: ${mainUi.javaClass.name}")
+            return
+        }
+        if (headerListHost === host && headerComposeView != null) return
+        val context = resolveHostContext(host) ?: run {
+            WeLogger.w(TAG, "无法从会话列表宿主获取 Context: ${host.javaClass.name}")
+            return
+        }
+        removeGroupHeader()
+        val hadPredicate = activePredicate != null
+        activePredicate = null
+        val composeView = ComposeView(context).apply {
                 val lifecycleOwner = LifecycleOwnerProvider.lifecycleOwner
                 setLifecycleOwner(lifecycleOwner)
-
-                val context = convListView.context
 
                 // These values get lost when ComposeView becomes invisible, so we have to lift them
                 // out of the Composable.
@@ -226,8 +300,15 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
                     }
                 }
             }
-            convListView.addHeaderView(composeView)
+        if (!invokeHeaderMethod(host, "addHeaderView", composeView)) {
+            // 挂载失败时释放刚创建的 ComposeView，避免它永久脱离视图树。
+            composeView.disposeComposition()
+            return
         }
+        headerComposeView = composeView
+        headerListHost = host
+        if (hadPredicate) WeConversationApi.reloadConversations()
+        WeLogger.i(TAG, "分组栏已插入: ${host.javaClass.name}")
     }
 
     override fun onDisable() {
@@ -236,10 +317,7 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
         // Remove the tab bar header view from the ListView to clean up the UI.
         // Must run on the UI thread since it manipulates the View hierarchy.
         runOnUiThread {
-            headerComposeView?.let { view ->
-                (view.parent as? ListView)?.removeHeaderView(view)
-            }
-            headerComposeView = null
+            removeGroupHeader()
         }
         // Invalidate the cache so loadGroups re-reads from disk next time.
         groupsCache = null
@@ -426,9 +504,10 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
         val lower = sql.lowercase()
         if (!lower.contains("select")) return false
         if (!lower.contains("from rconversation")) return false
-        // Don't touch AggregateChats folder-container queries (scoped to a wekit_folder_ parentRef)
+        // Don't touch AggregateChats folder-container queries (scoped to a wcxlc_folder_ parentRef)
         // or WeChat's own conversation-box container; the tabs only apply to the homepage list.
-        if (lower.contains("wekit_folder_") || lower.contains("conversationboxservice")) return false
+        if (lower.contains(ConversationAggregation.FOLDER_PREFIX) ||
+            lower.contains("conversationboxservice")) return false
         // The homepage list query is the one carrying per-conversation display columns; ignore
         // aggregate/count/single-row lookups so we don't corrupt unrelated reads.
         return lower.contains("conversationtime") &&
@@ -1253,7 +1332,7 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
         return resolved
     }
 
-    /** WeKit 连带 ContactSelectors 需要: 群聊筛选选项。 */
+    /** 连带 ContactSelectors 需要: 群聊筛选选项。 */
     fun groupFilterOptions(localizedContext: Context?): List<ChatGroup> = loadGroups()
 
     private fun loadGroups(): List<ChatGroup> {
@@ -1266,16 +1345,33 @@ object ConversationGrouping : ClickableFeature(), IResolveDex {
             saveGroups(defaults)
             return defaults
         }
+        // 记录解码过程中是否真的升级了旧前缀，供下方决定是否回写。
+        var migratedLegacyPrefix = false
         val groups = runCatching {
             val raw = file.readText()
             DefaultJson.decodeFromString<List<ChatGroup>>(raw)
                 .map { group ->
                     group.copy(members = group.members.filter { it.isNotBlank() })
                 }
+                // 旧品牌时期写入的 id 前缀（wekit_group_*）必须先升级为新前缀，
+                // 否则下一行的 isGroupId 判定失败，用户已存的分组会被整批滤掉。
+                .map { group ->
+                    if (group.id.startsWith(LEGACY_GROUP_PREFIX)) {
+                        migratedLegacyPrefix = true
+                        group.copy(id = GROUP_PREFIX + group.id.removePrefix(LEGACY_GROUP_PREFIX))
+                    } else {
+                        group
+                    }
+                }
                 .filter { (isGroupId(it.id) || isAllTab(it.id)) && it.name.isNotBlank() }
         }.onFailure {
             WeLogger.w(TAG, "failed to decode groups config from $groupsFile", it)
         }.getOrDefault(emptyList())
+        // 发生过前缀升级才回写，使之只执行一次（幂等）。
+        if (migratedLegacyPrefix) {
+            WeLogger.i(TAG, "migrated legacy group id prefix to $GROUP_PREFIX")
+            saveGroups(groups)
+        }
         // Guarantee the fixed "全部" tab is present. Configs written before this tab was orderable
         // won't contain it, so inject it at the front; once the user reorders, its slot persists.
         val withAll = if (groups.any { isAllTab(it.id) }) groups else listOf(allTab()) + groups

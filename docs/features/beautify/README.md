@@ -4,12 +4,20 @@
 
 ## 功能列表
 
-- [莫奈引擎](monet-engine.md) — 从 Material You 动态壁纸取色, 应用到微信部分组件的配色 [需 SDK >= 31]
-- [对话框窗口级背景模糊](apply-dialog-background-blur.md) — 为对话框添加窗口级磨砂模糊效果 [需 SDK >= 31]
-- [美化首页底部导航栏](replace-navigation-bar.md) — 将底部导航栏替换为 Material Design 或 Backdrop 风格
-- [隐藏主页下滑「最近」页](hide-home-screen-swipe-down-page.md) — 禁用主页下拉进入「最近」页面
-- [隐藏其他设备横幅](hide-other-devices-banner.md) — 隐藏主页顶部其他设备登录横幅
-- [「我」页面精简](hide-me-tab-page-items.md) — 可隐藏「我」页面中的朋友圈、视频号、卡包、表情等组件
-- [资料卡居中](center-profile-card.md) — 居中「我」界面的个人资料卡
-- [DPI 修改](custom-dpi.md) — 自定义微信的屏幕密度 (DPI)
-- [主屏幕添加 FAB](add-main-screen-fab.md) — 在主页添加浮动操作按钮, 支持自定义快捷操作 (扫一扫、朋友圈、钱包、视频号、设置、全部已读等), 可自由增删和排序
+- [「我」页面精简](hide-me-tab-page-items.md) — 精简我的页面的部分组件
+- [主屏幕添加 FAB](add-main-screen-fab.md) — 向微信主屏幕添加浮动操作按钮
+- 主题 — 应用 THEMES_PATH 中的主题，切换后重启微信生效
+- 主题商城 — 六款卡通主题一键应用：全局沉浸壁纸（主页/设置/朋友圈等全部页面，扫一扫除外）+ 对应主题气泡，支持透明度调节与恢复默认主题
+- 四 Tab 主题背景 — 为微信主页、通讯录、发现、我四个页面分别设置背景图片，支持主题包导入导出
+- [对话框窗口级背景模糊](apply-dialog-background-blur.md) — 为模块与微信的对话框添加窗口级模糊处理 [需 SDK >= 31]
+- [微信主页侧边栏](apply-global-background.md) — 在微信主页添加左侧侧滑边栏：方式一为内置面板（头像/签名/天气/每日一言/4 槽快捷），方式二为 WeKit 负一屏全家桶，两者互斥见设置
+- 美化对话列表 — 为主页会话列表提供卡片布局、未读突出和分隔线设置
+- 美化活动过渡动画 — 将部分活动过渡动画替换为默认过渡或元素级共享动画
+- 美化组件按下效果 — 将 View 的背景替换为 RippleDrawable
+- [美化首页底部导航栏](replace-navigation-bar.md) — 将首页底部导航栏替换为 Material Design 或 Backdrop 风格
+- 自定义消息气泡 — 自定义聊天中的消息气泡图片和颜色
+- [莫奈引擎](monet-engine.md) — 根据模块设置的自定义配色为微信原生组件上色
+- [莫奈引擎 (模块)](monet-engine.md) — 为微信的部分组件启用动态壁纸取色 (基于 Overlay 模块的实现, 无性能开销) [需 SDK >= 31] 安装模块后, 请同时启用「莫奈引擎 (模块)」与「莫奈引擎」
+- [资料卡居中](center-profile-card.md) — 居中「我」界面的资料卡
+- [隐藏主页下滑「最近」页](hide-home-screen-swipe-down-page.md) — 禁用主页下滑进入「最近」页：在首页会话列表顶部拦截向下拖拽，并吞掉下拉弹层的下拉手势
+- [隐藏其他设备横幅](hide-other-devices-banner.md) — 隐藏主页顶部其他设备已登录横幅

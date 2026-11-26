@@ -63,6 +63,7 @@ import com.Johnny.wcx.features.api.core.models.SelfProfileField
 import com.Johnny.wcx.features.api.core.WeDatabaseListenerApi
 import com.Johnny.wcx.features.api.core.models.IWeContact
 import com.Johnny.wcx.features.api.ui.WeStartActivityApi
+import com.Johnny.wcx.features.api.ui.WeMainActivityBeautifyApi
 import com.Johnny.wcx.features.core.ClickableFeature
 import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.features.items.chat.ConversationAggregation.syncFoldersToDatabase
@@ -201,11 +202,19 @@ object ConversationAggregation : ClickableFeature(),
     }
     private val methodConversationStorageQueryByParent by dexMethod(allowFailure = true) {
         matcher {
-            usingStrings(
-                "select * from rconversation where ",
-                " order by flag desc, conversationTime desc"
+            // 8.0.80 起 "select * from rconversation where " 是孤儿串（无 const-string 引用），
+            // 只保留仍存活的排序子句。真实签名在两版都是 5 参：
+            // (int, List, String, boolean, String) → Cursor
+            // （原写的 4 参 (int,List,String,int) 一直匹配不上）。
+            // 8.0.76/8.0.79 = storage.l4.s、8.0.80 = storage.m4.s，三版均唯一命中。
+            usingStrings(" order by flag desc, conversationTime desc")
+            paramTypes(
+                "int",
+                "java.util.List",
+                "java.lang.String",
+                "boolean",
+                "java.lang.String"
             )
-            paramTypes("int", "java.util.List", "java.lang.String", "int")
             returnType("android.database.Cursor")
         }
     }
@@ -251,7 +260,7 @@ object ConversationAggregation : ClickableFeature(),
     // reflecting its members' (still-unread) state.
     private val methodConversationStorageUpdateUnreadByTalker by dexMethod(allowFailure = true) {
         matcher {
-            usingStrings("MicroMsg.ConversationStorage", "updateUnreadByTalker %s", "update conversation failed")
+            usingStrings("MicroMsg.ConversationStorage", "update conversation failed")
             paramTypes("java.lang.String")
             returnType("boolean")
         }
@@ -328,6 +337,7 @@ object ConversationAggregation : ClickableFeature(),
         hookMainUiRefresh()
         WeLogger.i(TAG, "onEnable: after hookMainUiRefresh")
         diagFile("onEnable: after hookMainUiRefresh")
+        hookColdStartResidualRecovery()
         hookOpenFolder()
         WeLogger.i(TAG, "onEnable: after hookOpenFolder")
         diagFile("onEnable: after hookOpenFolder")
@@ -432,6 +442,91 @@ object ConversationAggregation : ClickableFeature(),
             WeLogger.i(TAG, "released all folders on disable")
         }.onFailure {
             WeLogger.e(TAG, "failed to release folders on disable", it)
+        }
+    }
+
+    /**
+     * 冷启动残留回收。
+     *
+     * 归拢把成员会话的 parentRef 改写成文件夹 id、并在 rconversation/rcontact/img_flag
+     * 里插入文件夹行 —— 这些都是**写进微信库的持久状态**，微信自己就认 parentRef，
+     * 所以模块在不在它都照样折叠成员。而唯一的清理入口 [releaseAllFolders] 只挂在
+     * `onDisable` 上：用户在管理器里取消勾选本模块时，模块一行代码都不跑，残留就永远
+     * 留在库里 —— 表现为几百个会话从主页消失、只剩几个空壳文件夹。
+     *
+     * 这里把回收挂到 [WeMainActivityBeautifyApi.methodDoOnCreate]（每次冷启动必跑），
+     * 不再依赖 `onDisable`。
+     */
+    private fun hookColdStartResidualRecovery() {
+        runCatching {
+            WeMainActivityBeautifyApi.methodDoOnCreate.hookAfter {
+                recoverResidualFolders()
+            }
+        }.onFailure {
+            WeLogger.w(TAG, "残留回收 hook 安装失败（不影响其他功能）", it)
+        }
+    }
+
+    /**
+     * 释放库里残留的归拢痕迹。
+     *
+     * 与 [releaseAllFolders] 的区别：后者是「用户主动关闭归拢」的正常路径，这里只关心
+     * **库里是否还有残留** —— 有就清，没有就什么也不做。所以本函数**不依赖 isEnabled**：
+     * 正常启用的归拢，其文件夹行会被下次 [syncFoldersToDatabase] 重建，清了也不影响。
+     *
+     * 不能只在首次启动跑一次：用户可能先回退旧版本模块又切回来，所以每次冷启动都查一次
+     * （代价是一条 SELECT COUNT，可忽略）。
+     */
+    private fun recoverResidualFolders() {
+        // DB 未就绪就等下次冷启动。这是唯一允许失败的路径：残留不会自己消失，
+        // 但此刻强行操作会拿到空结果或报错，反而危险。
+        if (!WeDatabaseApi.isReady) {
+            WeLogger.w(TAG, "残留回收: DB 未就绪，跳过（下次冷启动重试）")
+            return
+        }
+
+        runCatching {
+            val folderRows = mutableListOf<String>()
+            withQueryRewriteSuppressed {
+                WeDatabaseApi.rawQuery(
+                    "SELECT ${ConversationTable.USERNAME} FROM ${ConversationTable.NAME} WHERE ${ConversationTable.USERNAME} LIKE ?",
+                    arrayOf("$FOLDER_PREFIX%")
+                ).use { c ->
+                    while (c.moveToNext()) folderRows += c.getString(0)
+                }
+            }
+
+            if (folderRows.isEmpty()) return@runCatching
+
+            val foldedCount = withQueryRewriteSuppressed {
+                WeDatabaseApi.rawQuery(
+                    "SELECT COUNT(*) FROM ${ConversationTable.NAME} WHERE ${ConversationTable.PARENT_REF} LIKE ?",
+                    arrayOf("$FOLDER_PREFIX%")
+                ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+            }
+
+            if (foldedCount == 0) return@runCatching
+
+            WeLogger.w(
+                TAG,
+                "残留回收: 发现残留文件夹=${folderRows.size} 被折叠会话=$foldedCount，开始释放"
+            )
+
+            withQueryRewriteSuppressed {
+                if (!isFolderSchemaReady()) {
+                    WeLogger.e(TAG, "残留回收: schema 未就绪，放弃（下次冷启动重试）")
+                    return@withQueryRewriteSuppressed
+                }
+                WeDatabaseApi.transaction { clearStaleFolderMappings() }
+            }
+            membersByFolder = emptyMap()
+            folderByMember = emptyMap()
+            folderMembersCache.clear()
+
+            WeConversationApi.reloadConversations()
+            WeLogger.i(TAG, "残留回收: 已释放 $foldedCount 个会话，它们应已回到主页")
+        }.onFailure {
+            WeLogger.e(TAG, "残留回收失败（不影响其他功能）", it)
         }
     }
 
@@ -736,6 +831,22 @@ object ConversationAggregation : ClickableFeature(),
             activeFolderId = readFolderIdFromIntent(activity.intent) ?: activeFolderId
         }
 
+        // 成员聊天返回容器时，系统使用的是聊天页的退出动画；只关容器页的 windowAnimations
+        // 不够，因为返回动画已经由 ChattingUI 发起。这里在任意页离开时取消这次转场，
+        // 防止状态栏从灰色遮罩下滑回文件夹，也避免文件夹标题再次抖动。
+        // 按类名 hook ChattingUI.onPause 在 8.0.78 上打不中（onPause 不在该类里），
+        // 所以直接在 Activity 层兜底，容器页自身除外。
+        runCatching {
+            val guard = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: XC_MethodHook.MethodHookParam) {
+                    disableMemberTransition(param.thisObject as? Activity ?: return)
+                }
+            }
+            de.robv.android.xposed.XposedBridge.hookAllMethods(Activity::class.java, "onPause", guard)
+            de.robv.android.xposed.XposedBridge.hookAllMethods(Activity::class.java, "finish", guard)
+            WeLogger.i(TAG, "activity transition guard installed")
+        }.onFailure { WeLogger.w(TAG, "activity transition guard failed", it) }
+
         BaseConversationUI::class.reflekt().apply {
             firstMethod("onResume").hookAfter {
                 val activity = thisObject as? BaseConversationUI ?: return@hookAfter
@@ -747,6 +858,18 @@ object ConversationAggregation : ClickableFeature(),
                 activeFolderId = null
             }
         }
+    }
+
+    /** 会话页离开时取消窗口转场，避免返回文件夹时露出一帧灰遮罩/整页下沉。 */
+    private fun disableMemberTransition(activity: Activity) {
+        if (activeFolderId == null) return
+        if (activity is ConvBoxServiceConversationUI) return
+        runCatching {
+            activity.overridePendingTransition(0, 0)
+            activity.window?.setWindowAnimations(0)
+            activity.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            activity.window?.attributes = activity.window?.attributes?.apply { dimAmount = 0f }
+        }.onFailure { WeLogger.d(TAG, "disableMemberTransition failed: $it") }
     }
 
     // The folder container (ConvBoxServiceConversationUI) does NOT use the homepage's
@@ -991,8 +1114,7 @@ object ConversationAggregation : ClickableFeature(),
             if (suppressQueryRewrite.get()!!) return@hookBefore
             val sql = args.firstOrNull() as? String ?: return@hookBefore
             if (sql.contains("rconversation") && (sql.contains("update", true) || sql.contains("unread", true))) {
-                WeLogger.i(TAG, "rawQuery: $sql")
-                diagFile("rawQuery: $sql")
+                WeLogger.d(TAG, "rawQuery: $sql")
             }
             onQuery(sql)?.let { args[0] = it }
         }
@@ -1145,8 +1267,7 @@ object ConversationAggregation : ClickableFeature(),
             tf.set(tv, spannable)
             tv.invalidate()
             tv.requestLayout()
-            diagFile("setTextSpanDirect applied: ${tv.javaClass.name}")
-        }.onFailure { diagFile("setTextSpanDirect FAILED: $it") }
+        }.onFailure { WeLogger.w(TAG, "setTextSpanDirect failed", it) }
     }
 
     /**
@@ -1409,6 +1530,8 @@ object ConversationAggregation : ClickableFeature(),
     }
 
     private fun diagFile(msg: String) {
+        // 仅调试构建落盘：release 下这是纯 IO 开销（会话列表每绑定一项都会走到这里）。
+        if (!com.Johnny.wcx.BuildConfig.DEBUG) return
         runCatching {
             val f = java.io.File("/sdcard/Android/data/com.tencent.mm/WCX/diag.log")
             f.parentFile?.mkdirs()
@@ -1524,13 +1647,9 @@ object ConversationAggregation : ClickableFeature(),
             holder.javaClass.getMethod("getItemView").invoke(holder) as? View
         }.getOrNull() ?: return
         val root = itemView as? ViewGroup ?: return
-        WeLogger.i(TAG, "bindViewHolder fired: root=${root.javaClass.simpleName} children=${root.childCount}")
-        diagFile("bindViewHolder fired: ${root.javaClass.simpleName} children=${root.childCount}")
         tintMentionLabels(root, "bind")
         markVirtualRow(root)
         root.post {
-            WeLogger.i(TAG, "bindViewHolder post fired: root=${root.javaClass.simpleName}")
-        diagFile("bindViewHolder post fired: ${root.javaClass.simpleName}")
             tintMentionLabels(root, "post")
             markVirtualRow(root)
         }
@@ -1601,8 +1720,7 @@ object ConversationAggregation : ClickableFeature(),
                     val sql = args?.getOrNull(0) as? String ?: return@hookBeforeDirectly
                     val low = sql.lowercase()
                     if (low.contains("rconversation") && (low.contains("update") || low.contains("unread"))) {
-                        WeLogger.i(TAG, "execSQL: $sql")
-                        diagFile("execSQL: $sql")
+                        WeLogger.d(TAG, "execSQL: $sql")
                     }
                 }
             WeLogger.i(TAG, "execSQL hook registered")
@@ -2420,6 +2538,9 @@ object ConversationAggregation : ClickableFeature(),
             .mapNotNull { intent.getStringExtra(it) }
             .firstOrNull(::isFolderId)
     }
+
+    /** 供「悬浮标题栏」等特性判断这个页面是不是一个归拢分组页。 */
+    fun folderIdFromIntent(intent: Intent?): String? = readFolderIdFromIntent(intent)
 
     private inline fun <T> withQueryRewriteSuppressed(action: () -> T): T {
         val oldValue = suppressQueryRewrite.get()

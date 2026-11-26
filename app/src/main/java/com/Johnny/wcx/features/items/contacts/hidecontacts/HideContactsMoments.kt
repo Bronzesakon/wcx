@@ -13,8 +13,9 @@ private const val TAG = "HideContacts.Moments"
 
 /** Every Moments-side surface a hidden contact can leak through. */
 internal fun HideContacts.installMomentsHooks() {
+    if (!surfaceOn(SURFACE_MOMENTS)) return
     installMomentsRedDotHook()
-    installMomentsInlineEntryHook()
+    if (surfaceOn(SURFACE_MOMENTS_INLINE)) installMomentsInlineEntryHook()
 }
 
 /**

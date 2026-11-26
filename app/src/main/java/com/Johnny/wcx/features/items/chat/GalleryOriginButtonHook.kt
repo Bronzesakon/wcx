@@ -17,26 +17,22 @@ import java.util.WeakHashMap
 /**
  * 打开图片 / 视频查看页时**无感点击**「查看原图 / 查看原视频」按钮。
  *
- * 原为独立功能「自动查看原图/原视频」(v283~v292)。v293 与「后台自动加载原图/原视频」
- * ([AutoPrefetchOriginalMedia]) 合并：两个开关描述的其实是同一件事的两个阶段 ——
- *  - 后台先把收到的原图 / 原视频拉下来 (不点开也拉)；
- *  - 拉得不够快或有漏项时，用户打开页面这一下由这里兜底，把按钮在帧级拦掉并点掉，
- *    用户既看不到按钮，点开也已是原画质。
- * 合并后功能列表里只保留「后台自动加载原图/原视频」一个入口。
+ * v293 起已并入「后台自动加载原图/原视频」([AutoPrefetchOriginalMedia]), 功能列表只保留
+ * 那一个入口: 后台先提前拉取, 本 hook 在用户打开页面时兜底, 把按钮在帧级拦掉并点掉。
  *
- * 实现要点（微信 8.0.76.3141 实测）：
- *  - `ImageGalleryUI` 未被混淆，onCreate / onResume 用 reflekt 定位，**不依赖 dex 适配**；
- *  - 按钮运行时是 `android.widget.Button`，文案带体积后缀（「查看原视频 64MB」），
- *    只能按渲染文本 + 关键字定位；
- *  - 点击「查看原图 / 查看原视频」不会弹网络确认框，静默点击不打断用户；
- *  - OnPreDrawListener 帧级拦截：命中后**先 GONE 再 performClick**，按钮一帧都不会
- *    被画出来；已命中的控件持续压制（微信下载中会改文案再显示按钮）。
+ * 实现要点 (微信 8.0.76.3141 实测):
+ *  - `ImageGalleryUI` 未被混淆, onCreate / onResume 用 reflekt 定位, **不依赖 dex 适配**;
+ *  - 按钮运行时是 `android.widget.Button`, 文案带体积后缀 (「查看原视频 64MB」),
+ *    只能按渲染文本 + 关键字定位;
+ *  - 点击「查看原图 / 查看原视频」不会弹网络确认框, 静默点击不打断用户;
+ *  - OnPreDrawListener 帧级拦截: 命中后**先 GONE 再 performClick**, 按钮一帧都不会
+ *    被画出来; 已命中的控件持续压制 (微信下载中会改文案再显示按钮)。
  */
 object GalleryOriginButtonHook {
 
     private const val TAG = "GalleryOriginBtn"
 
-    /** 聊天图片 / 视频查看页 (8.0.76 未被混淆, 与 Themes.kt 的运行时判定一致)。 */
+    /** 聊天图片 / 视频查看页 (8.0.76 未被混淆)。 */
     private const val GALLERY_UI_CLASS = "com.tencent.mm.ui.chatting.gallery.ImageGalleryUI"
 
     /** 按钮文案关键字 (中英双语兜底)。 */
@@ -63,20 +59,33 @@ object GalleryOriginButtonHook {
     /** 是否已安装 (避免重复 hook 生命周期)。 */
     private var installed = false
 
+    /** 引用计数: 兼容多个宿主, 避免重复安装或提前卸载仍在使用的 hook。 */
+    private var refCount = 0
+
     // ─────────────────────────────── 安装 / 卸载 ───────────────────────────────
 
     /**
      * 安装页面兜底点击。
+     *
      * @param host 宿主功能 —— `hookAfter` / `thisObject` 是 [BaseFeature] 的成员扩展,
      *   hook 也登记在它身上 (功能禁用时随 BaseFeature 的 unhook 机制一起清理)。
      */
+    @Synchronized
     fun install(host: BaseFeature) {
-        if (installed) return
+        if (refCount > 0) {
+            refCount++
+            return
+        }
         installGalleryLifecycleHook(host)
         installed = true
+        refCount = 1
     }
 
+    @Synchronized
     fun uninstall() {
+        if (refCount <= 0) return
+        refCount--
+        if (refCount > 0) return
         installed = false
         val snapshot = synchronized(watchers) { watchers.values.toList() }
         snapshot.forEach { stop(it) }
@@ -97,7 +106,11 @@ object GalleryOriginButtonHook {
             val method = runCatching {
                 clazz.reflekt().firstMethod { name = methodName; parameterCount = paramCount }
             }.getOrNull() ?: runCatching {
-                clazz.reflekt().firstMethod { name = methodName; parameterCount = paramCount; superclass() }
+                clazz.reflekt().firstMethod {
+                    name = methodName
+                    parameterCount = paramCount
+                    superclass()
+                }
             }.getOrNull() ?: return@forEach
 
             with(host) {
@@ -119,7 +132,7 @@ object GalleryOriginButtonHook {
 
     // ─────────────────────────────── 页面观察 ───────────────────────────────
 
-    /** 起（或续期）页面观察器; 同一 Activity 只跑一个。 */
+    /** 起 (或续期) 页面观察器; 同一 Activity 只跑一个。 */
     private fun armWatcher(activity: Activity) {
         val decor = activity.window?.decorView as? ViewGroup ?: return
 
@@ -158,7 +171,7 @@ object GalleryOriginButtonHook {
 
     /**
      * 处理一帧 / 一次兜底轮询。
-     * @return 是否继续（false 表示观察已结束）
+     * @return 是否继续 (false 表示观察已结束)
      */
     private fun processFrame(watcher: PageWatcher): Boolean {
         if (!isAlive(watcher)) {
@@ -193,10 +206,10 @@ object GalleryOriginButtonHook {
     }
 
     /**
-     * 在视图树里找「查看原图 / 查看原视频」按钮：
-     *  - 命中且首次发现 → **先隐藏（GONE）再点击**，按钮不会被绘制出来；
-     *  - 命中但已点过（文案不同 → 换到下一个视频）→ 隐藏后再次点击；
-     *  - 曾经命中过的控件（不论当前文案）→ 只要又显示出来就再压回 GONE。
+     * 在视图树里找「查看原图 / 查看原视频」按钮:
+     *  - 命中且首次发现 -> **先隐藏 (GONE) 再点击**, 按钮不会被绘制出来;
+     *  - 命中但已点过 (文案不同 -> 换到下一个视频) -> 隐藏后再次点击;
+     *  - 曾经命中过的控件 (不论当前文案) -> 只要又显示出来就再压回 GONE。
      */
     private fun suppressOriginButtons(watcher: PageWatcher) {
         for (view in watcher.decor.allViews) {
@@ -233,7 +246,7 @@ object GalleryOriginButtonHook {
         }
     }
 
-    /** 按钮本体可能不可点击（文字是子 TextView），向上找最近的可点击祖先。 */
+    /** 按钮本体可能不可点击 (文字是子 TextView), 向上找最近的可点击祖先。 */
     private fun clickTarget(view: View): View {
         var current: View? = view
         var depth = 0
@@ -248,10 +261,10 @@ object GalleryOriginButtonHook {
     /**
      * 单个图片/视频页的观察器。
      *
-     * [suppressed] 记录**曾经命中过关键字**的控件（按身份）：之后微信把它们重新显示
-     * （下载中会改文案再 setVisibility）时无条件压回 GONE，保证用户始终看不到这个按钮。
-     * [clicked] 按「控件身份 + 文案」去重：同一个控件换到下一个视频时文案会变
-     * （设备日志：64MB → 19MB → 2MB 各自触发过一次点击），必须允许再次点击。
+     * [suppressed] 记录**曾经命中过关键字**的控件 (按身份): 之后微信把它们重新显示
+     * (下载中会改文案再 setVisibility) 时无条件压回 GONE, 保证用户始终看不到这个按钮。
+     * [clicked] 按「控件身份 + 文案」去重: 同一个控件换到下一个视频时文案会变
+     * (设备日志: 64MB -> 19MB -> 2MB 各自触发过一次点击), 必须允许再次点击。
      */
     private class PageWatcher(val activity: Activity, val decor: ViewGroup) {
         val suppressed: MutableSet<Int> = Collections.synchronizedSet(HashSet())

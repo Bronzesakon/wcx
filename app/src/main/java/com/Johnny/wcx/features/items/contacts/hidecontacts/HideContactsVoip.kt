@@ -59,6 +59,7 @@ private const val TAG = "HideContacts.Voip"
  * "rejectByShortCut" entry WeChat's own Bluetooth quick-reject uses.
  */
 internal fun HideContacts.installVoipHooks() {
+    if (!surfaceOn(SURFACE_VOIP)) return
     installVoipMpHooks()
     installMultiTalkHooks()
     installVoipRecordHooks()

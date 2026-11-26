@@ -34,7 +34,7 @@ jobs:
   apk:
     name: Build & publish APKs
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Checkout
         # 浅克隆即可: 版本号不再依赖 commit 数 (见 app/build.gradle.kts 的 -Pwcx.versionCode),

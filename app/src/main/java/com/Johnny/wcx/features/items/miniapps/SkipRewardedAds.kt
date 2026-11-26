@@ -180,12 +180,12 @@ object SkipRewardedAds : SwitchFeature(), IResolveDex {
             val now = System.currentTimeMillis()
             val looksAd = type.startsWith("mbAd_") ||
                 AD_EVENT_MARKERS.any { type.contains(it, ignoreCase = true) }
-            val inSession = now <= adEventSessionUntil.get()
             if (looksAd) {
                 adEventSessionUntil.set(now + SESSION_WINDOW_MS)
-            }
-            if (looksAd || inSession) {
-                WeLogger.i(TAG, "bridge event type=$type data=${data.take(500)}")
+                // 只记录广告相关事件，且只进 logcat。
+                // 旧实现会在「广告会话窗口（30s）」内把所有 bridge 事件都写盘，其中加速度传感器
+                // onAccelerometerChange 每秒数十条，日志被瞬间灌满且持续占用 IO（卡顿来源）。
+                WeLogger.d(TAG, "bridge event type=$type data=${data.take(200)}")
             }
         }
     }

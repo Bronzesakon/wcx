@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.chat
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import android.content.Context
 import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
@@ -18,5 +19,5 @@ internal fun localizedChatQuantity(
     vararg formatArgs: Any,
 ): String {
     val app = android.app.ActivityThread.currentApplication() ?: return id.toString()
-    return app.resources.getQuantityString(id, quantity, *formatArgs)
+    return app.resources.safeGetQuantityString(id, quantity, *formatArgs)
 }

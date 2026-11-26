@@ -29,6 +29,7 @@ private const val TAG = "HideContacts.Search"
  * filtering the input would silently shift every member's data onto the wrong person.
  */
 internal fun HideContacts.installSearchHooks() {
+    if (!surfaceOn(SURFACE_SEARCH)) return
     installChatroomMemberSearchHook()
     installCommonChatroomUserSearchHook()
 }

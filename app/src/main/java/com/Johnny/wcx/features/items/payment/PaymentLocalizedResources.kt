@@ -1,5 +1,6 @@
 package com.Johnny.wcx.features.items.payment
 
+import com.Johnny.wcx.utils.safeGetQuantityString
 import android.content.Context
 import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
@@ -28,5 +29,5 @@ internal fun localizedPaymentQuantityString(
     vararg formatArgs: Any,
 ): String {
     val app = android.app.ActivityThread.currentApplication() ?: return id.toString()
-    return app.resources.getQuantityString(id, quantity, *formatArgs)
+    return app.resources.safeGetQuantityString(id, quantity, *formatArgs)
 }

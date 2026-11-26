@@ -19,8 +19,8 @@ dependencyResolutionManagement {
         // jitpack, 构建直接失败。镜像侧再加 excludeGroup 双保险。
         maven("https://jitpack.io") {
             content {
+                includeGroup("com.github.REAndroid")
                 includeGroup("com.github.Ujhhgtg")
-                includeGroup("com.github.Ujhhgtg.rhino")
                 includeGroup("com.github.topjohnwu.libsu")
             }
         }
@@ -50,6 +50,5 @@ include(
     ":app",
     ":libs:common:annotation-scanner",
     ":libs:common:stubs",
-    ":libs:common:bsh",
     ":libs:common:reflekt"
 )

@@ -19,9 +19,9 @@ WCX 是一个微信增强模块, 基于上游开源项目 WeKit 进行Fork二次
 
 | 状态 | 版本 | 下载 |
 | ------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ❌ 不支持 | < 8.0.65 | N/A |
-| 🔧 维护 | 8.0.65 ~ 8.0.68 | [8.0.65 官方](https://dldir1v6.qq.com/weixin/android/weixin8065android2960_0x28004137_arm64.apk) [8.0.66 官方](https://dldir1v6.qq.com/weixin/android/weixin8066android2980_0x28004234_arm64.apk) [8.0.67 官方](https://dldir1v6.qq.com/weixin/android/weixin8067android3000_0x28004332_arm64.apk) [8.0.68 官方](https://dldir1v6.qq.com/weixin/android/weixin8068android3020_0x28004434_arm64.apk) |
-| ✅ 支持 | 8.0.69 ~ 8.0.76 | [8.0.69 官方](https://dldir1v6.qq.com/weixin/android/weixin8069android3040_0x2800455a_arm64.apk) [8.0.70 官方](https://dldir1v6.qq.com/weixin/android/weixin8070android3060_0x28004634_arm64_1.apk) [8.0.71 官方](https://dldir1v6.qq.com/weixin/android/weixin8071android3080_0x28004734_arm64.apk) [8.0.72 官方](https://dldir1v6.qq.com/weixin/android/weixin8072android3100_0x28004835_arm64.apk) [8.0.74 官方](https://dldir1v6.qq.com/weixin/android/weixin8074android3120_0x28004a36_arm64.apk) [8.0.76 官方](https://dldir1v6.qq.com/weixin/android/weixin8076android3120_0x28004c10_arm64.apk) |
+| ❌ 不支持 | < 8.0.69 | N/A |
+| 🔧 维护 | 8.0.69 ~ 8.0.76 | [8.0.69 官方](https://dldir1v6.qq.com/weixin/android/weixin8069android3040_0x2800455a_arm64.apk) [8.0.70 官方](https://dldir1v6.qq.com/weixin/android/weixin8070android3060_0x28004634_arm64_1.apk) [8.0.71 官方](https://dldir1v6.qq.com/weixin/android/weixin8071android3080_0x28004734_arm64.apk) [8.0.72 官方](https://dldir1v6.qq.com/weixin/android/weixin8072android3100_0x28004835_arm64.apk) [8.0.74 官方](https://dldir1v6.qq.com/weixin/android/weixin8074android3120_0x28004a36_arm64.apk) [8.0.76 官方](https://dldir1v6.qq.com/weixin/android/weixin8076android3120_0x28004c10_arm64.apk) |
+| ✅ 支持 | 8.0.77 ~ 8.0.79 | — |
 | 🧪 初步适配 | N/A | N/A |
 
 #### 国际版 (Google Play)
@@ -40,7 +40,7 @@ WCX 是一个微信增强模块, 基于上游开源项目 WeKit 进行Fork二次
 | 🧪 初步适配 | 正在适配该版本, 模块未在该版本上充分测试 |
 | 🗑️ 废弃 | 曾适配过该版本, 但因故放弃, 不再维护 |
 
-> 模块开始开发时针对的版本为国内版 8.0.65, 小于该版本即为「不支持」, 且若无特殊情况不会尝试适配。
+> 模块开始开发时针对的版本为国内版 8.0.69, 小于该版本即为「不支持」, 且若无特殊情况不会尝试适配。
 
 ## 功能概述
 

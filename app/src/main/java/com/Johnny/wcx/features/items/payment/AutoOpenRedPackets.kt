@@ -230,14 +230,41 @@ object AutoOpenRedPackets : ClickableFeature(), WeDatabaseListenerApi.IInsertLis
                 )
             }
 
+            // 自动回复：支持 $amount / $sender / $chat 三个占位符。
+            //
+            // 注意 Kotlin 字符串转义：字面的 "$amount" 必须写成 "\$amount"，
+            // 写成 "\\$amount" 会被解析成「反斜杠 + amount 变量的值」，
+            // 导致 replace 永远匹配不到用户填的占位符（历史 bug：回复内容原样带着 $amount 发出去）。
             val reply = packetAutoReply
             if (reply.isNotBlank()) {
-                try {
-                    WeMessageApi.sendText(info.talker, reply.replace("\$amount", "¥$displayAmount"))
-                    WeLogger.i(TAG, "sent red packet auto-reply to ${info.talker}")
-                } catch (e: Throwable) {
-                    // 自动回复失败不能中断抢红包成功处理或通知逻辑。
-                    WeLogger.e(TAG, "red packet auto-reply failed (talker=${info.talker})", e)
+                val replyTalker = info.talker
+                val replyChatName = runCatching { WeDatabaseApi.getDisplayName(replyTalker) }.getOrDefault("")
+                val replyText = reply
+                    .replace("\$amount", "¥$displayAmount")
+                    .replace("\$sender", info.nickName)
+                    .replace("\$chat", replyChatName)
+                // 发送放到独立线程：本回调跑在主线程，而冷启动阶段 DexKit 可能还没定位到
+                // 发送组件，awaitSendReady 需要等待最多数秒，绝不能阻塞微信 UI。
+                // 旧实现直接调 sendText 且丢弃返回值，失败时仍打印「sent」，问题无法从日志定位。
+                thread(name = "WCX-RedPacketReply") {
+                    try {
+                        if (!WeMessageApi.awaitSendReady(6_000L)) {
+                            WeLogger.e(TAG, "red packet auto-reply skipped: send components not ready (talker=$replyTalker)")
+                            return@thread
+                        }
+                        if (WeMessageApi.sendText(replyTalker, replyText)) {
+                            WeLogger.i(TAG, "sent red packet auto-reply to $replyTalker")
+                        } else {
+                            WeLogger.e(
+                                TAG,
+                                "red packet auto-reply not sent (talker=$replyTalker): " +
+                                    WeMessageApi.sendTextDiagnostics(),
+                            )
+                        }
+                    } catch (e: Throwable) {
+                        // 自动回复失败不能中断抢红包成功处理或通知逻辑。
+                        WeLogger.e(TAG, "red packet auto-reply failed (talker=$replyTalker)", e)
+                    }
                 }
             }
 
@@ -554,9 +581,14 @@ object AutoOpenRedPackets : ClickableFeature(), WeDatabaseListenerApi.IInsertLis
                         TextField(
                             value = autoReplyInput,
                             onValueChange = { autoReplyInput = it.trim() },
-                            label = { Text("抢到后自动回复 (留空禁用)") },
+                            label = { Text("抢到后自动回复 (留空禁用，可用 \$amount / \$sender / \$chat)") },
                             supportingText = { Text("成功抢到红包后向来源对话发送自定义消息\n(使用占位符 \$amount 表示金额)") },
                             singleLine = true,
+                        )
+                        val sendDiag = remember { WeMessageApi.sendTextDiagnostics() }
+                        ListItem(
+                            supportingContent = { Text(sendDiag) },
+                            headlineContent = { Text("发送组件状态（自动回复依赖）") },
                         )
                     }
                 },

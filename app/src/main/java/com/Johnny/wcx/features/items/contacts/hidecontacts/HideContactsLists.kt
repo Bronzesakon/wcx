@@ -38,11 +38,14 @@ private const val TAG = "HideContacts.Lists"
  * retains would make "temporarily show" unable to bring the rows back until WeChat repopulates it.
  */
 internal fun HideContacts.installListHooks() {
-    installMvvmListHooks()
-    installContactCountHook()
-    installGroupMemberHooks()
-    installFavoriteHooks()
-    installFinderLikeHooks()
+    // 按面安装：每个面独立开关，关掉的面连 Hook 都不装。
+    if (surfaceOn(SURFACE_CONTACTS)) {
+        installMvvmListHooks()
+        installContactCountHook()
+    }
+    if (surfaceOn(SURFACE_GROUP_MEMBERS)) installGroupMemberHooks()
+    if (surfaceOn(SURFACE_FAVORITES)) installFavoriteHooks()
+    if (surfaceOn(SURFACE_FINDER_LIKE)) installFinderLikeHooks()
 }
 
 // ---------------------------------------------------------------------------------------------

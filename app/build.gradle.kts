@@ -43,9 +43,9 @@ android {
         applicationId = libs.versions.namespace.get()
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        // 跟随 v299 基线，保留 fork 的版本覆盖参数，且不降低已发布的版本号。
-        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 299
-        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v299"
+        // 版本号单一数据源：默认跟随 v310，fork 保留发布参数覆盖。
+        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 310
+        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v310"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")
@@ -100,7 +100,8 @@ android {
     //   2. gradle 属性同名 key
     //   3. 默认 keystore：~/wcx-keystore.jks → ~/.wcx/wcx-keystore.jks → <rootProject>/wcx-keystore.jks
     //      （alias=wcx，store/key 密码 wcx-store-pass，与历史交付 APK 一致）
-    //   4. 未配置密钥时允许本地/PR 使用 debug；发布 CI 必须传 -Pwcx.requireReleaseSigning=true
+    //   4. 未配置密钥时 debug 可使用 Android debug；release 不签名。
+    //      发布 CI 必须传 -Pwcx.requireReleaseSigning=true，并由 build.yml 验签。
     // 显式配置的路径无效时立即失败，避免错误路径静默生成另一张证书的 APK。
     // ────────────────────────────────────────────────────────────────────────
     @Suppress("LocalVariableName")
@@ -156,7 +157,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName(if (foundKeystore) "release" else "debug")
+            // 用户要求：release 永远使用固定签名，禁止回退 debug keystore
+            // （避免产出无法覆盖安装的包）。未找到固定签名时不设 signingConfig
+            // （产物未签名），并由 CI 的「Verify APK signatures」步骤兜底拦下。
+            if (foundKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                logger.warn("未找到固定签名 keystore：release 将不签名（已禁用 debug 兜底）。请检查 WEKIT_KEYSTORE_FILE 或项目根 wcx-keystore.jks。\n")
+            }
         }
     }
 
@@ -166,6 +174,10 @@ android {
     }
 
     packaging {
+        // 严禁开启 jniLibs.useLegacyPackaging：LSPosed 在微信进程内通过 System.loadLibrary
+        // 从模块 APK 直接 mmap 加载 .so，该机制只对 STORED(未压缩) 生效。开启后 .so 变
+        // DEFLATED，System.loadLibrary 抛 UnsatisfiedLinkError → NativeLoader 类初始化失败
+        // → 整个模块在初始化阶段崩溃，微信里看不到任何模块痕迹，LSPosed 日志也无记录。
         resources.excludes += listOf(
             "kotlin/**",
             "**.bin",
@@ -275,6 +287,7 @@ val generateMethodHashes = tasks.register<GenerateMethodHashesTask>("generateMet
 
 // --- end tasks ---
 
+
 ksp {
     // Room schema export for migration diffing
     arg("room.schemaLocation", "$projectDir/schemas")
@@ -298,11 +311,15 @@ dependencies {
     implementation(libs.aboutlibraries.core)
     implementation(libs.aboutlibraries.compose.m3)
     implementation(libs.androidx.profileinstaller)
-    implementation(libs.miuix.ui)
-    implementation(libs.miuix.icons)
-    implementation(libs.miuix.preference)
-    implementation(libs.miuix.blur)
-    implementation(libs.miuix.shader)
+    // miuix 0.9.4 内置 aar（对齐 Hchat 上游 app/libs；maven 0.9.3 API 与上游代码不兼容）
+    implementation(files("libs/miuix-ui-android-0.9.4.aar"))
+    implementation(files("libs/miuix-core-android-0.9.4.aar"))
+    implementation(files("libs/miuix-squircle-android-0.9.4.aar"))
+    implementation(files("libs/miuix-preference-android-0.9.4.aar"))
+    implementation(files("libs/miuix-icons-android-0.9.4.aar"))
+    implementation(files("libs/miuix-nav-android-0.9.4.aar"))
+    implementation(files("libs/miuix-blur-android-0.9.4.aar"))
+    implementation(files("libs/miuix-shader-android-0.9.4.aar"))
     implementation(libs.materialkolor)
     implementation(libs.coil)
     implementation(libs.coil.compose)
@@ -311,18 +328,42 @@ dependencies {
 
     implementation(libs.composablehorizons.material.symbols.filled)
     implementation(libs.composablehorizons.material.symbols.outlined)
+    implementation(libs.androidx.room.runtime)
+    ksp(libs.androidx.room.compiler)
 
     implementation(libs.google.protobuf.javalite)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.serialization.protobuf)
     implementation(libs.mmkv)
+    // Hchat 脚本子系统依赖（迁移）
+    // Hchat 设置浮层渲染依赖 lifecycle-viewmodel-compose（LocalViewModelStoreOwner），
+    // 缺了会 NoClassDefFoundError 导致脚本页打不开（上游 build.gradle 里有这两项）
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
+    implementation("androidx.savedstate:savedstate:1.2.1")
+    implementation("io.github.billywei01:fastkv:3.0.1")
+    implementation("com.google.flatbuffers:flatbuffers-java:23.5.26")
+    implementation("dev.rikka.ndk.thirdparty:cxx:1.2.0")
+    // 内置 ARSCLib：JitPack 在该构件上经常 30s+ 才响应，CI 里会直接判成 Could not find。
+    // 该库无传递依赖（POM 只有自身坐标），内置后构建可复现。升级时手动替换 jar 即可。
+    implementation(files("libs/ARSCLib-V1.3.8.jar"))
+    implementation("io.github.skylot:jadx-dex-input:1.5.5") {
+        exclude(group = "com.google.guava", module = "guava")
+    }
+    implementation("com.google.guava:guava:33.5.0-android")
+    implementation("com.android.tools.smali:smali-baksmali:3.0.9")
+    implementation("com.highcapable.kavaref:kavaref-core:1.1.0")
+    implementation("com.jakewharton.android.repackaged:dalvik-dx:16.0.1")
+    implementation("com.alibaba.fastjson2:fastjson2:2.0.61.android8")
+    implementation("androidx.navigationevent:navigationevent:1.1.2")
+    implementation("androidx.navigationevent:navigationevent-compose:1.1.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.5.1")
 
-    implementation(project(":libs:common:bsh"))
-
-    compileOnly(libs.legacyxposed.api)
+    // 内置 Xposed API 82：Maven Central / 腾讯镜像都没有该构件，只能从 api.xposed.info 拉，
+    // 而该源在 CI 上偶发超时会导致整个 master 构建失败（缓存丢失时必现）。内置后构建可复现。
+    compileOnly(files("libs/xposed-api-82.jar"))
     compileOnly(libs.libxposed.api)
     implementation(libs.libxposed.service)
-    implementation(libs.dexkit)
+    implementation(files("libs/dexkit-2.2.0-76551eb-idle.aar"))
     implementation(libs.hiddenapibypass)
     implementation(project(":libs:common:reflekt"))
     implementation(libs.libsu.core)
@@ -339,8 +380,6 @@ dependencies {
     implementation(libs.okhttp3.okhttp)
     implementation(libs.jsoup)
 
-    implementation(libs.rhino)
-
     implementation(libs.fastjson2)
 
     compileOnly(libs.lombok)
@@ -354,8 +393,6 @@ dependencies {
 
     implementation(libs.mcp.server)
     implementation(libs.mcp.client)
-    implementation(libs.androidx.room.runtime)
-    ksp(libs.androidx.room.compiler)
     implementation(platform(libs.ktor.bom))
     implementation(libs.ktor.server.cio)
     implementation(libs.ktor.server.cors)

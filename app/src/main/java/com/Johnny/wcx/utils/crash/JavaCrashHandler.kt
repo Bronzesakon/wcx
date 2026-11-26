@@ -76,11 +76,49 @@ object JavaCrashHandler : Thread.UncaughtExceptionHandler {
             // The logger is asynchronous; make the crash details durable before the process exits.
             runCatching { WeLogger.flush() }
 
+            // 模块自己的后台线程/协程抛异常时只记录、不结束宿主进程。
+            // Android 上任意线程的未捕获异常都会结束整个进程，用户看到的就是「微信像被强行停止」。
+            if (isModuleBackgroundCrash(thread, throwable)) {
+                WeLogger.e(
+                    TAG,
+                    "module background thread crashed, host process kept alive: " + thread.name,
+                )
+                return
+            }
+
             if (defaultHandler != null) {
                 defaultHandler.uncaughtException(thread, throwable)
             } else {
                 exitProcess(1)
             }
         }
+    }
+
+    private val MODULE_PACKAGE_PREFIXES = arrayOf(
+        "com.Johnny.wcx", "h.Hchat", "me.hd.wauxv", "bsh.", "org.luckypray.dexkit",
+    )
+
+    /**
+     * 判定是否为「模块自身后台线程」的崩溃。
+     *
+     * 只拦截同时满足以下条件的崩溃（仅记录、不杀进程）：
+     * 1) 不是主线程——主线程崩溃仍交给宿主，避免掩盖真正的启动失败；
+     * 2) 堆栈里出现模块/脚本运行时的包名；
+     * 3) 线程是 daemon，或线程名属于模块命名规范。
+     */
+    private fun isModuleBackgroundCrash(thread: Thread, throwable: Throwable): Boolean {
+        if (thread === android.os.Looper.getMainLooper()?.thread) return false
+        val involvesModule = throwable.stackTrace.any { element ->
+            MODULE_PACKAGE_PREFIXES.any { prefix -> element.className.startsWith(prefix) }
+        }
+        if (!involvesModule) return false
+        val name = thread.name
+        return thread.isDaemon ||
+            name.startsWith("WCX") ||
+            name.startsWith("Hchat") ||
+            name.startsWith("hchat") ||
+            name.startsWith("WeKit") ||
+            name.startsWith("DefaultDispatcher") ||
+            name.startsWith("kotlinx.coroutines")
     }
 }

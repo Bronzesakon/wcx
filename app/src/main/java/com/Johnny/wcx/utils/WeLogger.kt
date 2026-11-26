@@ -34,14 +34,8 @@ object WeLogger {
 
     /**
      * 关闭后：不输出 logcat（全部等级）、不写模块日志文件（moduleData/logs）。
-     *
-     * 每次直接读 MMKV（mmap 共享内存，跨进程即时可见），不做进程内缓存，
-     * 保证设置页切换后微信所有进程立即生效。mmap 布尔读取开销低于单次
-     * LocalDateTime.now()，对日志热路径影响可忽略。
-     *
-     * MMKV 尚未初始化的极早期调用（NativeLoader.init 之前的少数日志）无法读 MMKV，
-     * 回退到 moduleData 下的标记文件 [DISABLE_FLAG_FILE]，由设置页切换时同步写入，
-     * 这样连加载阶段的日志也能被关掉。任何一步失败都绝不抛异常影响宿主。
+     * 每次直接读 MMKV（mmap 共享内存，跨进程即时可见），不做进程内缓存。
+     * MMKV 尚未初始化的极早期调用回退到 moduleData 下的标记文件。任何失败都不抛异常影响宿主。
      */
     private fun isDisabled(): Boolean {
         runCatching {
@@ -49,7 +43,7 @@ object WeLogger {
                 .getBoolean(com.Johnny.wcx.constants.Preferences.DISABLE_ALL_LOGS, false)
         }
         return runCatching {
-            java.nio.file.Files.exists(KnownPaths.moduleData / DISABLE_FLAG_FILE)
+            Files.exists(KnownPaths.moduleData / DISABLE_FLAG_FILE)
         }.getOrDefault(false)
     }
 
@@ -66,7 +60,7 @@ object WeLogger {
         }
     }
 
-    /** 供日志门面之外的消息量日志（崩溃日志文件）等旁路通道查询开关状态 */
+    /** 供崩溃日志文件等旁路通道查询开关状态 */
     fun isAllLogsDisabled(): Boolean = isDisabled()
 
     private const val CHUNK_SIZE = 4000
@@ -548,4 +542,118 @@ object WeLogger {
         Log.ASSERT -> "A"
         else -> "?"
     }
+
+    // ========== Diagnostics: compact digest for the in-app cards ==========
+
+    /** 单条问题记录（W/E/A 级日志 + 其后续行，如堆栈）。 */
+    data class LogProblem(val level: String, val header: String, val detail: List<String>)
+
+    /** 运行日志的精简摘要，供三个诊断页展示与一键复制。 */
+    data class LogDigest(
+        val fileName: String?,
+        val fileSizeText: String,
+        val totalRecords: Int,
+        val errorCount: Int,
+        val warnCount: Int,
+        val droppedCount: Long,
+        val problems: List<LogProblem>,
+    ) {
+        /** 结构化、可分享的精简文本（问题优先，控制每条堆栈行数）。 */
+        fun toShareText(): String = buildString {
+            appendLine("【WCX 运行日志摘要】")
+            appendLine("文件：${fileName ?: "无"}（$fileSizeText）")
+            appendLine("记录：$totalRecords 条 ｜ 错误 $errorCount ｜ 警告 $warnCount" +
+                if (droppedCount > 0L) " ｜ 队列丢弃 $droppedCount" else "")
+            if (problems.isEmpty()) {
+                append("问题：无（未见错误或警告）")
+            } else {
+                appendLine("问题（最近 ${problems.size} 条，新→旧）：")
+                problems.forEach { p ->
+                    appendLine("· ${p.header}")
+                    p.detail.take(8).forEach { detail -> appendLine("    $detail") }
+                }
+            }
+        }
+    }
+
+    private const val TAIL_READ_BYTES = 256 * 1024L
+    private val recordHeadRegex = Regex("""^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [VDIWEA]/""")
+    private val recordLevelRegex = Regex("""^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} ([VDIWEA])/""")
+
+    /**
+     * 收集最近日志的精简摘要（问题列表 + 计数）。
+     *
+     * 只读取文件尾部固定字节数，避免把整份日志（可能数 MB）读进内存；随后按行首时间戳
+     * 切分成记录，仅保留 W/E/A 级，供诊断页展示与「复制问题摘要」使用。
+     */
+    fun digest(maxProblems: Int = 40): LogDigest {
+        flush()
+        val file = allLogFiles.firstOrNull()
+            ?: return LogDigest(null, "0 B", 0, 0, 0, droppedRecords.get(), emptyList())
+        val bytes = runCatching { Files.size(file) }.getOrDefault(0L)
+        val records = splitRecords(readTail(file, TAIL_READ_BYTES))
+        var errors = 0
+        var warns = 0
+        val problems = ArrayList<LogProblem>()
+        records.forEach { rec ->
+            when (recordLevelRegex.find(rec.first())?.groupValues?.get(1)) {
+                "E", "A" -> {
+                    errors++
+                    problems += LogProblem("E", rec.first(), rec.drop(1))
+                }
+                "W" -> {
+                    warns++
+                    problems += LogProblem("W", rec.first(), rec.drop(1))
+                }
+            }
+        }
+        return LogDigest(
+            fileName = file.fileName.toString(),
+            fileSizeText = formatBytes(bytes),
+            totalRecords = records.size,
+            errorCount = errors,
+            warnCount = warns,
+            droppedCount = droppedRecords.get(),
+            problems = problems.takeLast(maxProblems).asReversed(),
+        )
+    }
+
+    /** 最近 [maxLines] 行原始日志（当前日志文件，按时间正序）。 */
+    fun readRecentLines(maxLines: Int = 300): Pair<String?, List<String>> {
+        flush()
+        val file = allLogFiles.firstOrNull() ?: return null to emptyList()
+        return file.fileName.toString() to readTail(file, TAIL_READ_BYTES).split('\n').takeLast(maxLines)
+    }
+
+    private fun readTail(file: java.nio.file.Path, maxBytes: Long): String = runCatching {
+        val size = Files.size(file)
+        val start = maxOf(0L, size - maxBytes)
+        val text = Files.newByteChannel(file, StandardOpenOption.READ).use { channel ->
+            channel.position(start)
+            val buf = java.nio.ByteBuffer.allocate((size - start).toInt())
+            while (buf.hasRemaining() && channel.read(buf) > 0) Unit
+            String(buf.array(), 0, buf.position(), StandardCharsets.UTF_8)
+        }
+        // 从文件中部截断时，丢掉首个不完整的行
+        if (start > 0L) text.substringAfter('\n', "") else text
+    }.getOrDefault("")
+
+    private fun splitRecords(text: String): List<List<String>> {
+        if (text.isBlank()) return emptyList()
+        val out = ArrayList<List<String>>()
+        var current = ArrayList<String>()
+        for (line in text.split('\n')) {
+            val isHead = recordHeadRegex.containsMatchIn(line)
+            if (isHead) {
+                if (current.isNotEmpty()) out += current
+                current = ArrayList()
+            }
+            if (isHead || current.isNotEmpty()) current += line
+        }
+        if (current.isNotEmpty()) out += current
+        return out
+    }
+
+    private fun formatBytes(bytes: Long): String =
+        if (bytes >= 1024L) "${bytes / 1024L} KB" else "$bytes B"
 }
