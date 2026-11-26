@@ -8,10 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
-import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -37,10 +34,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.fragment.app.FragmentActivity
-import com.Johnny.wcx.activity.TransparentActivity
 import com.Johnny.wcx.features.api.core.WeDatabaseApi
 import com.Johnny.wcx.features.api.core.WeMessageApi
+import com.Johnny.wcx.features.api.core.WeServiceApi
+import com.Johnny.wcx.features.api.core.models.MessageInfo
 import com.Johnny.wcx.features.core.ClickableFeature
 import com.Johnny.wcx.features.core.Feature
 import com.Johnny.wcx.utils.HostInfo
@@ -51,23 +48,25 @@ import com.Johnny.wcx.ui.content.DefaultColumn
 import com.Johnny.wcx.ui.content.TextButton
 import com.Johnny.wcx.ui.utils.showComposeDialog
 import com.Johnny.wcx.utils.WeLogger
+import com.Johnny.wcx.utils.AudioUtils
 import com.Johnny.wcx.utils.android.showToast
 import com.Johnny.wcx.utils.fs.KnownPaths
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CancellationException
-import kotlin.io.path.absolutePathString
 
 @Feature(
     name = "定时发送消息",
@@ -80,6 +79,28 @@ object ScheduledMessage : ClickableFeature() {
     private const val ALARM_ACTION = "com.Johnny.wcx.SCHEDULED_MESSAGE"
     private const val EXTRA_SCHEDULE_ID = "schedule_id"
 
+    /**
+     * 漏发补发窗口: 微信进程被杀/闹钟被系统吞掉时, 下次拉起微信后只要还没超过这个时长,
+     * 就补发一次当天漏掉的任务。原实现只有 15 分钟, 用户几小时后才打开微信就会整天漏发。
+     */
+    private const val CATCHUP_WINDOW_MS = 12 * 60 * 60 * 1000L
+    /** 守护轮询间隔: 进程内存活时兜底扫描到点任务, 同时补回丢失的进程内定时器 */
+    private const val MONITOR_INTERVAL_MS = 30_000L
+    /** 单段发送失败后的重试等待 */
+    private const val SEGMENT_RETRY_DELAY_MS = 2_000L
+    /** 单次任务迟到重试的间隔 */
+    private const val ONETIME_RETRY_DELAY_MS = 30_000L
+    /** 多接收方时, 切换到下一个接收方之间的间隔 (避免连续发送被判为风控) */
+    private const val TARGET_GAP_MS = 800L
+    /** 单个任务当天最多尝试次数, 超出则等明天, 防止失败时无限重试 */
+    private const val MAX_FIRE_ATTEMPTS = 3
+
+    /**
+     * IMAGE 段 filePath 为空时, content 存 "svr:<msgSvrId>" 作为延迟下载标记:
+     * 创建任务时图片 CDN 下载未落地不再让整个任务创建失败, 发送时自动重试下载。
+     */
+    const val DEFERRED_IMAGE_PREFIX = "svr:"
+
     private val json = Json { ignoreUnknownKeys = true }
 
     @Serializable
@@ -87,7 +108,12 @@ object ScheduledMessage : ClickableFeature() {
         val type: MessageType,
         val content: String = "",
         val filePath: String = "",
-        val duration: Int = 0
+        val duration: Int = 0,
+        // 复读式引用: 创建时媒体未落地的消息只记录来源 (与转发/复读同一通道),
+        // 发送时按引用从聊天记录现场解析媒体再发出
+        val srcTalker: String = "",
+        val srcMsgId: Long = 0,
+        val srcSvrId: Long = 0
     ) : java.io.Serializable
 
     @Serializable
@@ -95,6 +121,15 @@ object ScheduledMessage : ClickableFeature() {
         val id: String,
         val talker: String,
         val talkerName: String,
+        /**
+         * 除 [talker] 之外额外勾选的发送对象 (定时发送支持多选)。
+         * 旧任务没有该字段, 反序列化时为空列表, 行为与原来一致。
+         */
+        val extraTalkers: List<String> = emptyList(),
+        /** 与 [extraTalkers] 一一对应的显示名 */
+        val extraTalkerNames: List<String> = emptyList(),
+        // 任务主题（消息菜单创建时必填；旧数据无该字段，反序列化时取默认空串）
+        val subject: String = "",
         val messageType: MessageType = MessageType.TEXT,
         val content: String = "",
         val filePath: String = "",
@@ -105,8 +140,33 @@ object ScheduledMessage : ClickableFeature() {
         var enabled: Boolean = true,
         val oneTimeOnly: Boolean = false,
         var nextSendTime: Long = 0,
-        val segments: List<MessageSegment> = emptyList()
-    ) : java.io.Serializable
+        val segments: List<MessageSegment> = emptyList(),
+        /**
+         * 最近一次成功发送的日期 (yyyy-MM-dd)。用于"漏发补发"判定:
+         * 进程被杀 / 闹钟被系统吞掉后重新拉起微信时, 只有当天还没发过才补发,
+         * 避免每次冷启动都重复补发同一条消息。旧数据无此字段, 反序列化为空串。
+         */
+        var lastFiredDate: String = "",
+        /** 当天已尝试发送的次数, 成功或跨天时归零; 用于限制失败重试次数 */
+        var fireAttempts: Int = 0,
+        /**
+         * 当天已经成功收到消息的接收方。
+         * 多接收方任务里部分失败需要重试时, 跳过这些已成功的接收方, 避免重复发送。
+         */
+        var sentTargets: List<String> = emptyList()
+    ) : java.io.Serializable {
+        /** 任务的全部发送对象 (第一个是 talker, 其余是额外勾选的) */
+        fun targetTalkers(): List<String> {
+            val all = (listOf(talker) + extraTalkers).filter { it.isNotBlank() }
+            return all.distinct()
+        }
+
+        /** 全部发送对象的显示名 */
+        fun targetNames(): List<String> {
+            val names = (listOf(talkerName) + extraTalkerNames).filter { it.isNotBlank() }
+            return names.ifEmpty { targetTalkers() }
+        }
+    }
 
     enum class MessageType(val description: String) {
         TEXT("文本"),
@@ -114,24 +174,88 @@ object ScheduledMessage : ClickableFeature() {
         VOICE("语音"),
         VIDEO("视频"),
         FILE("文件"),
-        LINK("链接")
+        LINK("链接"),
+        // 微信收藏项: content 存收藏 localId, 发送时交给微信原生收藏发送通道,
+        // 因此图片/语音/视频/文件/链接/位置/音乐/小程序/聊天记录都能原样发出。
+        FAVORITE("收藏")
     }
 
-    private var schedules by prefOption("scheduled_messages", emptyList<ScheduleConfig>())
+    // 存储改用 kotlinx JSON (ignoreUnknownKeys=true): 原先的 Java 序列化对类结构零容忍,
+    // ScheduleConfig 每加一个字段 serialVersionUID 就变, 导致旧任务整批读不出
+    // (InvalidClassException: stream classdesc serialVersionUID 与 local 不一致)
+    private var schedulesJson by prefOption("scheduled_messages_json", "")
+
+    // 旧版 Java 序列化存储, 仅用于一次性迁移最近版本写入的任务
+    private var legacySchedules by prefOption("scheduled_messages", emptyList<ScheduleConfig>())
+
+    private var schedules: List<ScheduleConfig>
+        get() {
+            val raw = schedulesJson
+            if (raw.isNotBlank()) {
+                return runCatching { json.decodeFromString<List<ScheduleConfig>>(raw) }
+                    .onFailure { WeLogger.e(TAG, "failed to parse schedules json", it) }
+                    .getOrDefault(emptyList())
+            }
+            return migrateLegacySchedules()
+        }
+        set(value) {
+            schedulesJson = runCatching { json.encodeToString(value) }
+                .onFailure { WeLogger.e(TAG, "failed to encode schedules json", it) }
+                .getOrDefault("[]")
+        }
+
+    private fun migrateLegacySchedules(): List<ScheduleConfig> {
+        val legacy = runCatching { legacySchedules }
+            .onFailure { WeLogger.e(TAG, "failed to read legacy schedules", it) }
+            .getOrDefault(emptyList())
+        if (legacy.isEmpty()) return emptyList()
+        WeLogger.i(TAG, "migrated ${legacy.size} legacy schedules to json storage")
+        schedules = legacy
+        return legacy
+    }
+    /**
+     * 任务存储的读写锁。
+     * 多个任务可能同时触发, 而 updateSchedule 是"读出整表 -> 替换一项 -> 整表写回",
+     * 无锁并发会互相覆盖: 后写的一份把先写的 nextSendTime/lastFiredDate 抹掉,
+     * 表现为任务状态回退、下次触发时间算错, 是定时发送偶发失灵的诱因之一。
+     */
+    private val storageLock = Any()
+
+    /**
+     * 闹钟 requestCode 分配表。
+     * 原实现直接用 schedule.id.hashCode() 作 requestCode: 不同 id 一旦哈希相撞,
+     * PendingIntent(FLAG_UPDATE_CURRENT) 会互相覆盖, 被覆盖的那个任务再也收不到闹钟。
+     * 这里改为按任务 id 分配稳定且互不相同的小整数并持久化, 哈希不再参与。
+     */
+    private val alarmCodes = ConcurrentHashMap<String, Int>()
+    private var alarmCodeSeq by prefOption("scheduled_alarm_code_seq", 1000)
+
     private val activeAlarms = ConcurrentHashMap<String, PendingIntent>()
     private val timerJobs = ConcurrentHashMap<String, Job>()
 
-    /** 同一触发时刻只处理一次：进程内定时器与 AlarmManager 双源同刻触发时去重。 */
-    private val firedSlots = ConcurrentHashMap<String, Boolean>()
-
+    /** 统一作用域: 子协程失败不会连坐取消其它任务的定时器 */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var monitorJob: Job? = null
+    // 在途互斥: 进程内定时器与 AlarmManager 闹钟会在同一时刻先后触发,
+    // 时间守卫只能挡"提前触发"; 若第一个触发者正在发送(媒体解析/下载可能耗时数十秒),
+    // 第二个触发者重读任务时 nextSendTime 尚未推进, 守卫照样放行 → 重复发送。
+    // 发送开始前占位、结束后释放, 保证同一任务同一时刻只有一个触发者在执行。
+    private val triggering = ConcurrentHashMap.newKeySet<String>()
     private lateinit var alarmReceiver: BroadcastReceiver
 
     override fun onEnable() {
         alarmReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val scheduleId = intent?.getStringExtra(EXTRA_SCHEDULE_ID) ?: return
-                CoroutineScope(Dispatchers.IO).launch {
-                    handleScheduleTrigger(scheduleId)
+                // goAsync: 声明本次广播需要延长生命周期, 避免 onReceive 返回后
+                // 系统提前回收广播上下文导致发送中途被中断
+                val pending = goAsync()
+                scope.launch {
+                    try {
+                        handleScheduleTrigger(scheduleId)
+                    } finally {
+                        runCatching { pending.finish() }
+                    }
                 }
             }
         }
@@ -150,15 +274,71 @@ object ScheduledMessage : ClickableFeature() {
         }
 
         runCatching {
-            schedules.filter { it.enabled }.forEach { schedule ->
-                scheduleAlarm(schedule)
+            // 注意: 先取一次快照再逐个排期, 不要边遍历边改存储
+            val enabled = synchronized(storageLock) { schedules }.filter { it.enabled }
+            enabled.forEach { schedule ->
+                // 冷启动允许补发当天漏掉的任务（宽限窗仅此一处使用）
+                scheduleAlarm(schedule, allowCatchUp = true)
             }
         }.onFailure {
             WeLogger.e(TAG, "failed to schedule alarms", it)
         }
+
+        startMonitor()
+    }
+
+    /**
+     * 守护轮询: 进程内存活时兜底扫描。
+     * 进程内定时器用 delay 计时, 一旦 job 因异常/取消而消失、或设备深度休眠期间
+     * 计时未推进, 到点了也没人触发; 这里每 30 秒按墙上时钟复查一次,
+     * 到点即触发, 并顺手补回丢失的定时器。
+     */
+    private fun startMonitor() {
+        monitorJob?.cancel()
+        monitorJob = scope.launch {
+            while (isActive) {
+                try {
+                    delay(MONITOR_INTERVAL_MS)
+                    sweepSchedules()
+                } catch (e: CancellationException) {
+                    return@launch
+                } catch (e: Throwable) {
+                    WeLogger.e(TAG, "monitor loop error", e)
+                }
+            }
+        }
+    }
+
+    private fun sweepSchedules() {
+        val now = System.currentTimeMillis()
+        val list = runCatching { synchronized(storageLock) { schedules } }
+            .onFailure { WeLogger.e(TAG, "failed to read schedules in monitor", it) }
+            .getOrDefault(emptyList())
+        list.filter { it.enabled }.forEach { schedule ->
+            runCatching {
+                when {
+                    // 到点未触发(定时器丢失/休眠错过): 立即执行
+                    schedule.nextSendTime in 1..now -> {
+                        WeLogger.i(TAG, "monitor: ${schedule.id} overdue (next=${schedule.nextSendTime}), triggering now")
+                        scope.launch { handleScheduleTrigger(schedule.id) }
+                    }
+                    // 定时器缺失(异常退出)但还没到点: 重新挂上
+                    schedule.nextSendTime > now && timerJobs[schedule.id]?.isActive != true -> {
+                        WeLogger.i(TAG, "monitor: re-arm in-process timer for ${schedule.id}")
+                        scheduleInProcess(schedule)
+                    }
+                    // 从未排过期(存储被清理/新增任务时进程忙): 重新计算
+                    schedule.nextSendTime <= 0 -> scheduleAlarm(schedule, allowCatchUp = true)
+                }
+            }.onFailure {
+                WeLogger.e(TAG, "monitor: failed to handle ${schedule.id}", it)
+            }
+        }
     }
 
     override fun onDisable() {
+        monitorJob?.cancel()
+        monitorJob = null
         activeAlarms.values.forEach { it.cancel() }
         activeAlarms.clear()
         timerJobs.values.forEach { it.cancel() }
@@ -170,7 +350,24 @@ object ScheduledMessage : ClickableFeature() {
         }
     }
 
-    private fun scheduleAlarm(schedule: ScheduleConfig, allowCatchUp: Boolean = true) {
+    /**
+     * 为每个任务分配稳定唯一的闹钟 requestCode 并持久化。
+     * 不能再用 id.hashCode(): 哈希相撞时两个任务共用一个 PendingIntent,
+     * FLAG_UPDATE_CURRENT 会让后者顶掉前者, 被顶掉的那个从此收不到闹钟。
+     */
+    private fun requestCodeFor(scheduleId: String): Int {
+        alarmCodes[scheduleId]?.let { return it }
+        return synchronized(storageLock) {
+            alarmCodes[scheduleId] ?: run {
+                val code = alarmCodeSeq + 1
+                alarmCodeSeq = code
+                alarmCodes[scheduleId] = code
+                code
+            }
+        }
+    }
+
+    private fun scheduleAlarm(schedule: ScheduleConfig, allowCatchUp: Boolean = false) {
         val context = HostInfo.application
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(ALARM_ACTION).apply {
@@ -179,16 +376,25 @@ object ScheduledMessage : ClickableFeature() {
 
         val pendingIntent = PendingIntent.getBroadcast(
             context,
-            schedule.id.hashCode(),
+            requestCodeFor(schedule.id),
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val triggerTime =
-            if (allowCatchUp) calculateNextTriggerTime(schedule) else calculateNextOccurrence(schedule)
-        if (triggerTime <= 0) return
+        val triggerTime = calculateNextTriggerTime(schedule, allowCatchUp)
+        if (triggerTime <= 0) {
+            // 单次任务已过窗口期 / 重试次数用尽: 关掉它,
+            // 否则任务会一直挂在"已启用"却永远不再触发, 用户以为它还在工作
+            if (schedule.enabled) {
+                schedule.enabled = false
+                synchronized(storageLock) { updateSchedule(schedule) }
+                cancelAlarm(schedule)
+                WeLogger.i(TAG, "schedule ${schedule.id} retired: no further trigger time")
+            }
+            return
+        }
         schedule.nextSendTime = triggerTime
-        updateSchedule(schedule)
+        synchronized(storageLock) { updateSchedule(schedule) }
 
         // 进程内定时器：只要微信进程存活就保证准点触发，不受系统闹钟权限/省电策略影响
         scheduleInProcess(schedule)
@@ -237,8 +443,10 @@ object ScheduledMessage : ClickableFeature() {
         val next = schedule.nextSendTime
         val delayMs = next - System.currentTimeMillis()
         if (delayMs <= 0) return
-        val job = CoroutineScope(Dispatchers.IO).launch {
+        val job = scope.launch {
             try {
+                // 深度休眠期间 delay 依赖的单调时钟不会推进, 醒来时可能已经过点了;
+                // 过点也照常触发, 由 handleScheduleTrigger 内部的时间守卫与去重兜底
                 delay(delayMs)
                 handleScheduleTrigger(schedule.id)
             } catch (e: CancellationException) {
@@ -250,42 +458,54 @@ object ScheduledMessage : ClickableFeature() {
         timerJobs[schedule.id] = job
     }
 
-    private const val CATCH_UP_WINDOW_MS = 15 * 60 * 1000L
-    private const val DAY_MS = 24 * 60 * 60 * 1000L
+    private fun todayKey(): String = LocalDate.now().toString()
 
-    private fun todayTargetMillis(schedule: ScheduleConfig): Long =
-        java.time.LocalDateTime.now()
-            .with(LocalTime.of(schedule.hour, schedule.minute))
+    private fun tomorrowTarget(schedule: ScheduleConfig): Long {
+        val targetTime = LocalTime.of(schedule.hour, schedule.minute)
+        return java.time.LocalDateTime.now().plusDays(1).with(targetTime)
             .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-
-    /**
-     * 下一次触发时刻（仅用于启用/注册任务时，允许 15 分钟错过补发）：
-     * 今天目标已过且在补发窗口内 → 立即补发；否则取 [calculateNextOccurrence]。
-     */
-    private fun calculateNextTriggerTime(schedule: ScheduleConfig): Long {
-        val now = System.currentTimeMillis()
-        val todayTarget = todayTargetMillis(schedule)
-        if (todayTarget > now) return todayTarget
-        if (!schedule.repeatDaily) return -1L
-        // 错过不久（15分钟内）视为“上次未发”，立即补发一次
-        return if (now - todayTarget < CATCH_UP_WINDOW_MS) now + 2000L
-        else calculateNextOccurrence(schedule)
     }
 
-    /**
-     * 严格取下一次自然触发时刻：今天目标已过则取明天同一时间。
-     * 发送完成后的重排必须走这里，绝不能再进补发窗口，
-     * 否则每次发送后 2 秒又触发一次，形成无限重发循环。
-     */
-    private fun calculateNextOccurrence(schedule: ScheduleConfig): Long {
-        if (!schedule.repeatDaily) return -1L
-        val todayTarget = todayTargetMillis(schedule)
-        return if (todayTarget > System.currentTimeMillis()) todayTarget
-        else todayTarget + DAY_MS
+    private fun todayTargetOf(schedule: ScheduleConfig): Long {
+        val targetTime = LocalTime.of(schedule.hour, schedule.minute)
+        return java.time.LocalDateTime.now().with(targetTime).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+    }
+
+    private fun calculateNextTriggerTime(schedule: ScheduleConfig, allowCatchUp: Boolean): Long {
+        val now = System.currentTimeMillis()
+        val todayTarget = todayTargetOf(schedule)
+
+        if (todayTarget > now) return todayTarget
+
+        val missed = now - todayTarget
+        // 只有"确实排过闹钟且已经过点"才算漏发, 才允许补发。
+        // nextSendTime==0 表示这个任务从未排过期(新建 / 首次升级 / 存储被清理),
+        // 此时凭空补发一条几小时前的旧消息只会吓用户一跳, 直接按明天(或作废)处理。
+        val wasScheduled = schedule.nextSendTime > 0 && schedule.nextSendTime <= now
+        if (!wasScheduled) {
+            return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
+        }
+        // 当天已经成功发过 -> 只能等明天(重复任务)或作废(单次任务)。
+        // 这条判据取代了原来的 15 分钟窗口: 现在哪怕用户隔了几个小时才打开微信,
+        // 只要当天还没发成功就补发一次, 而发过的绝不会二次补发。
+        if (schedule.lastFiredDate == todayKey()) {
+            return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
+        }
+        // 试过太多次仍失败 -> 今天不再折腾, 避免半夜疯狂重试
+        if (schedule.fireAttempts >= MAX_FIRE_ATTEMPTS) {
+            WeLogger.w(TAG, "schedule ${schedule.id} exhausted ${schedule.fireAttempts} attempts today, giving up")
+            return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
+        }
+        // 超出补发窗口(比如隔天甚至更晚才拉起微信) -> 按明天/作废处理
+        if (missed > CATCHUP_WINDOW_MS) {
+            return if (schedule.repeatDaily) tomorrowTarget(schedule) else -1L
+        }
+        // 当天应发而未发: 重复任务立刻补发, 单次任务稍作退避后重试
+        return if (schedule.repeatDaily) now + 2000L else now + ONETIME_RETRY_DELAY_MS
     }
 
     private suspend fun handleScheduleTrigger(scheduleId: String) {
-        val schedule = schedules.find { it.id == scheduleId } ?: return
+        val schedule = synchronized(storageLock) { schedules.find { it.id == scheduleId } } ?: return
 
         if (!schedule.enabled) return
 
@@ -295,114 +515,394 @@ object ScheduledMessage : ClickableFeature() {
             WeLogger.i(TAG, "trigger for ${schedule.id} fired too early, skipping (next=${schedule.nextSendTime}, now=$nowMs)")
             return
         }
-
-        // 同刻占位去重：同一触发时刻（闹钟+进程内定时器双源）只处理一次
-        val slot = schedule.nextSendTime
-        if (firedSlots.putIfAbsent("${schedule.id}#$slot", true) != null) {
-            WeLogger.i(TAG, "duplicate trigger for ${schedule.id} at slot $slot, skipping")
-            return
-        }
         WeLogger.i(TAG, "scheduled trigger fired for ${schedule.id} (next=${schedule.nextSendTime}, now=$nowMs)")
 
-        // 发送前先把每日任务的 nextSendTime 推进到下一个自然日并落库：
-        // 迟到/重复的同刻触发会被上面的时间守卫直接拦截，确保同一时间窗内只发送一次
-        if (!schedule.oneTimeOnly && schedule.repeatDaily) {
-            schedule.nextSendTime = calculateNextOccurrence(schedule)
-            updateSchedule(schedule)
+        if (!triggering.add(scheduleId)) {
+            WeLogger.i(TAG, "trigger for ${schedule.id} already in flight, skipping duplicate")
+            return
         }
+        try {
+            // 当天已成功发过: 只推进排期, 不再重复发送
+            if (schedule.lastFiredDate == todayKey()) {
+                WeLogger.i(TAG, "schedule ${schedule.id} already fired today, advancing schedule only")
+                advanceAfterTrigger(schedule, sentOk = true)
+                return
+            }
 
+            schedule.fireAttempts += 1
+            // 跨天重置"当天已成功的接收方", 否则昨天的记录会让今天直接跳过发送
+            if (schedule.lastFiredDate != todayKey() && schedule.sentTargets.isNotEmpty()) {
+                schedule.sentTargets = emptyList()
+            }
+            val sentOk = runCatching {
+                if (schedule.segments.isNotEmpty()) {
+                    sendSegments(schedule)
+                } else {
+                    sendLegacySingle(schedule)
+                }
+            }.onFailure {
+                WeLogger.e(TAG, "failed to send scheduled message for ${schedule.id}", it)
+            }.getOrDefault(false)
+
+            if (sentOk) {
+                schedule.lastFiredDate = todayKey()
+                schedule.fireAttempts = 0
+                WeLogger.i(TAG, "scheduled message sent to ${schedule.targetTalkers()}")
+            } else {
+                WeLogger.w(
+                    TAG,
+                    "scheduled message to ${schedule.targetTalkers()} incomplete " +
+                            "(attempt ${schedule.fireAttempts}/$MAX_FIRE_ATTEMPTS, " +
+                            "sent=${schedule.sentTargets})"
+                )
+            }
+            advanceAfterTrigger(schedule, sentOk)
+        } finally {
+            triggering.remove(scheduleId)
+        }
+    }
+
+    /**
+     * 逐段发送: 每段独立成败互不影响。
+     * 原实现把整段循环包在一个 runCatching 里, 第一段(常见于图片/视频)一旦抛异常,
+     * 后面的文本段就全都发不出去了 —— 用户看到的就是"整条定时消息没发出来"。
+     * 媒体段常常只是文件还没落地/CDN 未就绪, 因此对失败段退避重试一次。
+     *
+     * 定时任务可以勾选多个接收方: 逐个接收方依次发送, 每个接收方内部按消息段顺序发,
+     * 保证"每人先收到第1段、再收到第2段"。当天已成功的接收方会被跳过, 避免重试时重复发送。
+     */
+    private suspend fun sendSegments(schedule: ScheduleConfig): Boolean {
+        var allOk = true
+        val targets = schedule.targetTalkers()
+        if (targets.isEmpty()) {
+            WeLogger.e(TAG, "schedule ${schedule.id} has no target talker")
+            return false
+        }
+        for (target in targets) {
+            if (target in schedule.sentTargets) {
+                WeLogger.i(TAG, "schedule ${schedule.id}: target $target already succeeded today, skipping")
+                continue
+            }
+            val ok = sendSegmentsTo(schedule, target)
+            if (ok) {
+                schedule.sentTargets = (schedule.sentTargets + target).distinct()
+            } else {
+                WeLogger.e(TAG, "schedule ${schedule.id}: target $target failed")
+                allOk = false
+            }
+            delay(TARGET_GAP_MS)
+        }
+        return allOk
+    }
+
+    /** 把全部消息段发给单个接收方; 单段失败退避重试一次。 */
+    private suspend fun sendSegmentsTo(schedule: ScheduleConfig, target: String): Boolean {
+        var allOk = true
+        schedule.segments.forEachIndexed { index, segment ->
+            val ok = runCatching { sendSegment(target, segment) }
+                .onFailure { WeLogger.e(TAG, "segment $index (${segment.type}) threw", it) }
+                .getOrDefault(false)
+            if (!ok) {
+                WeLogger.w(TAG, "segment $index (${segment.type}) failed, retrying once")
+                delay(SEGMENT_RETRY_DELAY_MS)
+                val retried = runCatching { sendSegment(target, segment) }
+                    .onFailure { WeLogger.e(TAG, "segment $index (${segment.type}) retry threw", it) }
+                    .getOrDefault(false)
+                if (!retried) {
+                    WeLogger.e(TAG, "segment $index (${segment.type}) gave up for ${schedule.id}")
+                    allOk = false
+                }
+            }
+            if (index < schedule.segments.size - 1) {
+                delay(500)
+            }
+        }
+        return allOk
+    }
+
+    /** 触发结束后的收尾: 落库 -> 单次任务关闭 -> 重排下一次(含失败重试) */
+    private fun advanceAfterTrigger(schedule: ScheduleConfig, sentOk: Boolean) {
         runCatching {
-            if (schedule.segments.isNotEmpty()) {
-                schedule.segments.forEachIndexed { index, segment ->
-                    sendSegment(schedule.talker, segment)
-                    if (index < schedule.segments.size - 1) {
-                        delay(500)
+            if (schedule.oneTimeOnly && sentOk) {
+                schedule.enabled = false
+            }
+            synchronized(storageLock) { updateSchedule(schedule) }
+            if (schedule.oneTimeOnly && sentOk) {
+                cancelAlarm(schedule)
+                return
+            }
+            scheduleAlarm(schedule)
+        }.onFailure {
+            WeLogger.e(TAG, "failed to advance schedule ${schedule.id}", it)
+        }
+    }
+
+    /** 返回 true 表示这一段确实发出去了; false 交给上层决定是否重试 */
+    private fun sendSegment(talker: String, segment: MessageSegment): Boolean {
+        return when (segment.type) {
+            MessageType.TEXT -> sendTextSafely(talker, segment.content)
+            MessageType.LINK -> sendTextSafely(talker, segment.content)
+            MessageType.IMAGE -> {
+                when {
+                    segment.filePath.isNotBlank() ->
+                        runCatching { WeMessageApi.sendImage(talker, segment.filePath); true }
+                            .onFailure { WeLogger.e(TAG, "send image failed (path=${segment.filePath})", it) }
+                            .getOrDefault(false)
+                    segment.content.startsWith(DEFERRED_IMAGE_PREFIX) -> {
+                        // 旧版本创建的延迟段: svrId 存在 content 里
+                        val svrId = segment.content.removePrefix(DEFERRED_IMAGE_PREFIX).toLongOrNull() ?: 0
+                        sendImageByReference(talker, segment.srcTalker.ifEmpty { talker }, svrId, segment.srcMsgId)
+                    }
+                    segment.srcSvrId > 0 || segment.srcMsgId > 0 ->
+                        // 复读式引用段: 与转发功能同一通道, 发送时从聊天记录现场解析
+                        sendImageByReference(talker, segment.srcTalker.ifEmpty { talker }, segment.srcSvrId, segment.srcMsgId)
+                    else -> {
+                        WeLogger.e(TAG, "image segment has neither path nor source reference")
+                        false
                     }
                 }
-            } else {
-                sendLegacySingle(schedule)
             }
+            MessageType.VOICE -> {
+                if (segment.filePath.isNotBlank()) {
+                    runCatching { WeMessageApi.sendVoice(talker, segment.filePath, segment.duration); true }
+                        .onFailure { WeLogger.e(TAG, "send voice failed (path=${segment.filePath})", it) }
+                        .getOrDefault(false)
+                } else if (segment.srcSvrId > 0 || segment.srcMsgId > 0) {
+                    sendVoiceByReference(talker, segment.srcTalker.ifEmpty { talker }, segment)
+                } else {
+                    WeLogger.e(TAG, "voice segment has neither path nor source reference")
+                    false
+                }
+            }
+            MessageType.VIDEO -> {
+                if (segment.filePath.isNotBlank()) {
+                    runCatching { WeMessageApi.sendVideo(talker, segment.filePath); true }
+                        .onFailure { WeLogger.e(TAG, "send video failed (path=${segment.filePath})", it) }
+                        .getOrDefault(false)
+                } else if (segment.srcSvrId > 0 || segment.srcMsgId > 0) {
+                    sendVideoByReference(talker, segment.srcTalker.ifEmpty { talker }, segment)
+                } else {
+                    WeLogger.e(TAG, "video segment has neither path nor source reference")
+                    false
+                }
+            }
+            MessageType.FILE -> {
+                when {
+                    segment.filePath.isNotBlank() -> {
+                        val fileName = segment.filePath.substringAfterLast('/')
+                        runCatching { WeMessageApi.sendFile(talker, segment.filePath, fileName); true }
+                            .onFailure { WeLogger.e(TAG, "send file failed (path=${segment.filePath})", it) }
+                            .getOrDefault(false)
+                    }
+                    segment.srcSvrId > 0 || segment.srcMsgId > 0 ->
+                        // 复读式引用段: 发送时现场触发文件下载 (与用户手动下载文件同机制)
+                        sendFileByReference(talker, segment.srcTalker.ifEmpty { talker }, segment)
+                    else -> {
+                        WeLogger.e(TAG, "file segment has neither path nor source reference")
+                        false
+                    }
+                }
+            }
+            MessageType.FAVORITE -> sendFavoriteSegment(talker, segment)
+        }
+    }
 
-            WeLogger.i(TAG, "scheduled message sent to ${schedule.talker}")
+    /**
+     * 收藏段: 交给微信原生收藏发送通道 (与 Hchat 定时任务的 TYPE_FAVORITE 同一条路径)。
+     * content 存收藏 localId。图片/语音/视频/文件等各种类型均由微信自己处理,
+     * 我们无需解析 favProto 或定位媒体文件。
+     */
+    private fun sendFavoriteSegment(talker: String, segment: MessageSegment): Boolean {
+        val localId = segment.content.trim().toLongOrNull()
+        if (localId == null || localId <= 0L) {
+            WeLogger.e(TAG, "favorite segment has invalid localId: ${segment.content}")
+            return false
+        }
+        return runCatching {
+            h.Hchat.hooks.api.core.WeChatApis.media()?.favorites()?.send(talker, localId) == true
         }.onFailure {
-            WeLogger.e(TAG, "failed to send scheduled message", it)
-        }
-
-        if (schedule.oneTimeOnly) {
-            schedule.enabled = false
-            updateSchedule(schedule)
-            cancelAlarm(schedule)
-        } else if (schedule.repeatDaily) {
-            // 发送完成后的重排严格取下一个自然日，不进补发窗口（补发仅限启用/注册时的错过场景）
-            scheduleAlarm(schedule, allowCatchUp = false)
-        }
+            WeLogger.e(TAG, "send favorite failed (localId=$localId)", it)
+        }.getOrDefault(false)
     }
 
-    private fun sendSegment(talker: String, segment: MessageSegment) {
-        when (segment.type) {
-            MessageType.TEXT -> {
-                if (segment.content.isNotBlank()) {
-                    WeMessageApi.sendText(talker, segment.content)
-                }
-            }
-            MessageType.LINK -> {
-                if (segment.content.isNotBlank()) {
-                    WeMessageApi.sendText(talker, segment.content)
-                }
-            }
-            MessageType.IMAGE -> {
-                if (segment.filePath.isNotBlank()) {
-                    WeMessageApi.sendImage(talker, segment.filePath)
-                }
-            }
-            MessageType.VOICE -> {
-                if (segment.filePath.isNotBlank()) {
-                    WeMessageApi.sendVoice(talker, segment.filePath, segment.duration)
-                }
-            }
-            MessageType.VIDEO -> {
-                if (segment.filePath.isNotBlank()) {
-                    WeMessageApi.sendVideo(talker, segment.filePath)
-                }
-            }
-            MessageType.FILE -> {
-                if (segment.filePath.isNotBlank()) {
-                    val fileName = segment.filePath.substringAfterLast('/')
-                    WeMessageApi.sendFile(talker, segment.filePath, fileName)
-                }
-            }
+    private fun sendTextSafely(talker: String, content: String): Boolean {
+        if (content.isBlank()) {
+            // 空文本段视为无需发送, 不算失败
+            return true
         }
+        return runCatching { WeMessageApi.sendText(talker, content); true }
+            .onFailure { WeLogger.e(TAG, "send text failed (talker=$talker)", it) }
+            .getOrDefault(false)
     }
 
-    private fun sendLegacySingle(schedule: ScheduleConfig) {
-        when (schedule.messageType) {
-            MessageType.TEXT -> {
-                WeMessageApi.sendText(schedule.talker, schedule.content)
+    /**
+     * 复读式发送: 按引用重建权威消息对象后, 走与 ForwardMessages(转发) 完全相同的通道
+     * (图片 md5 / 语音本地 silk / 视频本地 mp4), 媒体在发送时刻从聊天记录解析。
+     * 本地缓存已被清理时退回 CDN 下载。
+     */
+    private fun resolveSourceInstance(srcTalker: String, svrId: Long, msgId: Long): Any? {
+        return runCatching {
+            when {
+                svrId > 0 -> WeMessageApi.getMsgInfoInstanceByMsgSvrId(svrId, srcTalker.takeIf { it.isNotEmpty() })
+                msgId > 0 -> WeMessageApi.getMsgInfoInstanceByMsgId(msgId)
+                else -> null
             }
-            MessageType.LINK -> {
-                WeMessageApi.sendText(schedule.talker, schedule.content)
-            }
-            MessageType.IMAGE -> {
-                if (schedule.filePath.isNotBlank()) {
-                    WeMessageApi.sendImage(schedule.talker, schedule.filePath)
+        }.onFailure {
+            WeLogger.w(TAG, "resolve source instance failed (svrId=$svrId, msgId=$msgId)", it)
+        }.getOrNull()
+    }
+
+    private fun sendImageByReference(talker: String, srcTalker: String, svrId: Long, msgId: Long): Boolean {
+        val instance = resolveSourceInstance(srcTalker, svrId, msgId)
+        if (instance != null) {
+            runCatching {
+                val md5 = WeServiceApi.getImageMd5FromMsgInfo(MessageInfo(instance))
+                if (md5.isNotBlank()) {
+                    WeMessageApi.sendImageByMd5(talker, md5, null)
+                    return true
                 }
+                WeLogger.w(TAG, "repeat-path image md5 blank (svrId=$svrId)")
+            }.onFailure {
+                WeLogger.w(TAG, "repeat-path image via md5 failed, fallback to cdn (svrId=$svrId)", it)
+            }
+        }
+        // 本地缓存已清理等场景: 退回 CDN 下载
+        val path = svrId.takeIf { it > 0 }?.let { WeMessageApi.downloadImage(it) }
+        if (path != null) {
+            return runCatching { WeMessageApi.sendImage(talker, path); true }
+                .onFailure { WeLogger.e(TAG, "send image failed (path=$path)", it) }
+                .getOrDefault(false)
+        }
+        WeLogger.e(TAG, "deferred image failed at send time (svrId=$svrId, msgId=$msgId)")
+        return false
+    }
+
+    private fun sendVoiceByReference(talker: String, srcTalker: String, segment: MessageSegment): Boolean {
+        val instance = resolveSourceInstance(srcTalker, segment.srcSvrId, segment.srcMsgId)
+        if (instance == null) {
+            WeLogger.e(TAG, "voice source not found at send time (svrId=${segment.srcSvrId}, msgId=${segment.srcMsgId})")
+            return false
+        }
+        return runCatching {
+            val msgInfo = MessageInfo(instance)
+            val encPath = msgInfo.imagePath ?: error("voice encPath missing")
+            val voicePath = WeMessageApi.getVoiceFullPath(encPath)
+            // 微信语音仅在落盘后可重发; 文件不存在时 getDurationMs(JNI) 行为不可控, 先行拦截
+            if (!java.io.File(voicePath).exists()) error("voice file not on disk at send time: $voicePath")
+            val durationMs = segment.duration.takeIf { it > 0 }
+                ?: AudioUtils.getDurationMs(voicePath).toInt()
+            if (durationMs <= 0) error("voice duration unavailable at send time: $voicePath")
+            WeMessageApi.sendVoice(talker, voicePath, durationMs)
+            true
+        }.onFailure {
+            WeLogger.e(TAG, "repeat-path voice failed (svrId=${segment.srcSvrId})", it)
+        }.getOrDefault(false)
+    }
+
+    private fun sendVideoByReference(talker: String, srcTalker: String, segment: MessageSegment): Boolean {
+        val instance = resolveSourceInstance(srcTalker, segment.srcSvrId, segment.srcMsgId)
+        if (instance == null) {
+            WeLogger.e(TAG, "video source not found at send time (svrId=${segment.srcSvrId}, msgId=${segment.srcMsgId})")
+            return false
+        }
+        return runCatching {
+            val msgInfo = MessageInfo(instance)
+            val mp4Path = WeServiceApi.getVideoMp4PathFromMsgInfo(msgInfo)
+            if (mp4Path.isBlank()) error("video mp4 path blank")
+            if (!java.io.File(mp4Path).exists()) error("video mp4 not on disk at send time: $mp4Path")
+            WeMessageApi.sendVideo(talker, mp4Path)
+            true
+        }.onFailure {
+            WeLogger.e(TAG, "repeat-path video failed (svrId=${segment.srcSvrId})", it)
+        }.getOrDefault(false)
+    }
+
+    private fun sendFileByReference(talker: String, srcTalker: String, segment: MessageSegment): Boolean {
+        val instance = resolveSourceInstance(srcTalker, segment.srcSvrId, segment.srcMsgId)
+        if (instance == null) {
+            WeLogger.e(TAG, "file source not found at send time (svrId=${segment.srcSvrId}, msgId=${segment.srcMsgId})")
+            return false
+        }
+        return runCatching {
+            val path = WeMessageApi.downloadFile(instance) ?: error("file download failed at send time")
+            WeMessageApi.sendFile(talker, path, path.substringAfterLast('/'))
+            true
+        }.onFailure {
+            WeLogger.e(TAG, "repeat-path file failed (svrId=${segment.srcSvrId})", it)
+        }.getOrDefault(false)
+    }
+
+    /** 老版本创建的单条任务(无 segments) */
+    private suspend fun sendLegacySingle(schedule: ScheduleConfig): Boolean {
+        val targets = schedule.targetTalkers()
+        if (targets.isEmpty()) {
+            WeLogger.e(TAG, "legacy schedule ${schedule.id} has no target talker")
+            return false
+        }
+        var allOk = true
+        for (target in targets) {
+            if (target in schedule.sentTargets) {
+                WeLogger.i(TAG, "legacy schedule ${schedule.id}: target $target already succeeded today, skipping")
+                continue
+            }
+            val ok = sendLegacySingleTo(schedule, target)
+            if (ok) {
+                schedule.sentTargets = (schedule.sentTargets + target).distinct()
+            } else {
+                WeLogger.e(TAG, "legacy schedule ${schedule.id}: target $target failed")
+                allOk = false
+            }
+            delay(TARGET_GAP_MS)
+        }
+        return allOk
+    }
+
+    /** 老版本单条任务对单个接收方的发送 */
+    private fun sendLegacySingleTo(schedule: ScheduleConfig, talker: String): Boolean {
+        return when (schedule.messageType) {
+            MessageType.TEXT -> sendTextSafely(talker, schedule.content)
+            MessageType.LINK -> sendTextSafely(talker, schedule.content)
+            MessageType.IMAGE -> {
+                if (schedule.filePath.isBlank()) {
+                    WeLogger.e(TAG, "legacy image schedule has no file path")
+                    return false
+                }
+                runCatching { WeMessageApi.sendImage(talker, schedule.filePath); true }
+                    .onFailure { WeLogger.e(TAG, "legacy image send failed", it) }
+                    .getOrDefault(false)
             }
             MessageType.VOICE -> {
-                if (schedule.filePath.isNotBlank()) {
-                    WeMessageApi.sendVoice(schedule.talker, schedule.filePath, schedule.duration)
+                if (schedule.filePath.isBlank()) {
+                    WeLogger.e(TAG, "legacy voice schedule has no file path")
+                    return false
                 }
+                runCatching { WeMessageApi.sendVoice(talker, schedule.filePath, schedule.duration); true }
+                    .onFailure { WeLogger.e(TAG, "legacy voice send failed", it) }
+                    .getOrDefault(false)
             }
             MessageType.VIDEO -> {
-                if (schedule.filePath.isNotBlank()) {
-                    WeMessageApi.sendVideo(schedule.talker, schedule.filePath)
+                if (schedule.filePath.isBlank()) {
+                    WeLogger.e(TAG, "legacy video schedule has no file path")
+                    return false
                 }
+                runCatching { WeMessageApi.sendVideo(talker, schedule.filePath); true }
+                    .onFailure { WeLogger.e(TAG, "legacy video send failed", it) }
+                    .getOrDefault(false)
             }
             MessageType.FILE -> {
-                if (schedule.filePath.isNotBlank()) {
-                    val fileName = schedule.filePath.substringAfterLast('/')
-                    WeMessageApi.sendFile(schedule.talker, schedule.filePath, fileName)
+                if (schedule.filePath.isBlank()) {
+                    WeLogger.e(TAG, "legacy file schedule has no file path")
+                    return false
                 }
+                val fileName = schedule.filePath.substringAfterLast('/')
+                runCatching { WeMessageApi.sendFile(talker, schedule.filePath, fileName); true }
+                    .onFailure { WeLogger.e(TAG, "legacy file send failed", it) }
+                    .getOrDefault(false)
             }
+            MessageType.FAVORITE -> sendFavoriteSegment(
+                talker,
+                MessageSegment(type = MessageType.FAVORITE, content = schedule.content)
+            )
         }
     }
 
@@ -416,107 +916,44 @@ object ScheduledMessage : ClickableFeature() {
         }.onFailure { WeLogger.w(TAG, "cancel alarm failed for ${schedule.id}", it) }
     }
 
-    private fun addSchedule(schedule: ScheduleConfig) {
-        schedules = schedules + schedule
+    fun addSchedule(schedule: ScheduleConfig) {
+        synchronized(storageLock) {
+            schedules = schedules + schedule
+        }
         if (schedule.enabled) {
             scheduleAlarm(schedule)
         }
+    }
+
+    fun getSchedulesFor(talker: String): List<ScheduleConfig> {
+        // 多接收方任务: 只要包含该会话就算命中, 否则"取消定时发送"会漏掉群发任务
+        return synchronized(storageLock) { schedules.filter { talker in it.targetTalkers() } }
     }
 
     private fun updateSchedule(schedule: ScheduleConfig) {
         schedules = schedules.map { if (it.id == schedule.id) schedule else it }
     }
 
-    private fun deleteSchedule(schedule: ScheduleConfig) {
+    /** 任务列表标题: 单个接收方显示名字, 多个显示「A、B 等N个对象」 */
+    private fun scheduleTitle(schedule: ScheduleConfig): String {
+        val names = schedule.targetNames()
+        return when {
+            names.isEmpty() -> "未选择发送对象"
+            names.size == 1 -> names.first()
+            else -> "${names.take(2).joinToString("、")} 等${names.size}个对象"
+        }
+    }
+
+    fun deleteSchedule(schedule: ScheduleConfig) {
         cancelAlarm(schedule)
-        schedules = schedules.filter { it.id != schedule.id }
-    }
-
-    private fun segmentsSummary(segments: List<MessageSegment>): String {
-        if (segments.isEmpty()) return ""
-        val typesStr = segments.joinToString("+") { it.type.description }
-        return "${segments.size}段消息: $typesStr"
-    }
-
-    private fun MessageSegment.summary(): String {
-        return when (type) {
-            MessageType.TEXT -> "文本: ${content.take(20)}"
-            MessageType.LINK -> "链接: ${content.take(20)}"
-            MessageType.IMAGE -> "图片: ${filePath.substringAfterLast('/').take(20)}"
-            MessageType.VOICE -> "语音: ${duration}ms"
-            MessageType.VIDEO -> "视频: ${filePath.substringAfterLast('/').take(20)}"
-            MessageType.FILE -> "文件: ${filePath.substringAfterLast('/').take(20)}"
+        synchronized(storageLock) {
+            schedules = schedules.filter { it.id != schedule.id }
         }
     }
 
-    /**
-     * 通过 TransparentActivity 拉起系统文件选择器，把选中的 Uri 内容拷贝到 moduleCache
-     * 并把本地路径回调给调用方。IMAGE/VIDEO 走 PickVisualMedia，VOICE/FILE 走 OpenDocument。
-     */
-    private fun pickMediaFile(
-        type: MessageType,
-        onPicked: (String) -> Unit
-    ) {
-        TransparentActivity.launch(HostInfo.application) {
-            if (type == MessageType.IMAGE || type == MessageType.VIDEO) {
-                val launcher = registerForActivityResult(
-                    ActivityResultContracts.PickVisualMedia()
-                ) { uri ->
-                    finish()
-                    if (uri == null) return@registerForActivityResult
-                    copyUriToCache(uri, type)?.let(onPicked)
-                }
-                val visualMediaType = if (type == MessageType.IMAGE) {
-                    ActivityResultContracts.PickVisualMedia.ImageOnly
-                } else {
-                    ActivityResultContracts.PickVisualMedia.VideoOnly
-                }
-                launcher.launch(PickVisualMediaRequest(visualMediaType))
-            } else {
-                val mimeTypes = when (type) {
-                    MessageType.VOICE -> arrayOf("audio/*")
-                    MessageType.FILE -> arrayOf("*/*")
-                    else -> arrayOf("*/*")
-                }
-                val launcher = registerForActivityResult(
-                    ActivityResultContracts.OpenDocument()
-                ) { uri ->
-                    finish()
-                    if (uri == null) return@registerForActivityResult
-                    copyUriToCache(uri, type)?.let(onPicked)
-                }
-                launcher.launch(mimeTypes)
-            }
-        }
-    }
 
-    private fun FragmentActivity.copyUriToCache(uri: Uri, type: MessageType): String? {
-        return try {
-            val resolver = contentResolver
-            val displayName = resolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) cursor.getString(0) else null
-            } ?: "picked_${System.currentTimeMillis()}"
-            val safeName = displayName.ifBlank { "picked_${System.currentTimeMillis()}" }
-            val destFile = KnownPaths.moduleCache.resolve("sched_${System.currentTimeMillis()}_$safeName")
-            resolver.openInputStream(uri)?.use { input ->
-                Files.copy(input, destFile, StandardCopyOption.REPLACE_EXISTING)
-            } ?: run {
-                WeLogger.e(TAG, "copyUriToCache: openInputStream returned null for $uri")
-                return null
-            }
-            WeLogger.i(TAG, "picked media file cached: ${destFile.absolutePathString()}")
-            destFile.absolutePathString()
-        } catch (e: Exception) {
-            WeLogger.e(TAG, "copyUriToCache failed for type=$type uri=$uri", e)
-            null
-        }
-    }
+
+
 
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onClick(context: ComponentActivity) {
@@ -524,6 +961,10 @@ object ScheduledMessage : ClickableFeature() {
             var showAddDialog by remember { mutableStateOf(false) }
             var showEditDialog by remember { mutableStateOf(false) }
             var editingSchedule by remember { mutableStateOf<ScheduleConfig?>(null) }
+            // 本地可观察快照: schedules 每次访问都会重新解析 JSON, 不是可观察状态,
+            // 开关/增删改后必须刷新本快照才能驱动列表 UI 即时重组
+            var taskItems by remember { mutableStateOf(synchronized(storageLock) { schedules }) }
+            fun refreshTasks() { taskItems = synchronized(storageLock) { schedules } }
 
             if (showAddDialog) {
                 ScheduleEditorDialog(
@@ -532,6 +973,7 @@ object ScheduledMessage : ClickableFeature() {
                         addSchedule(schedule)
                         showToast("定时任务已添加")
                         showAddDialog = false
+                        refreshTasks()
                     }
                 )
             } else if (showEditDialog && editingSchedule != null) {
@@ -539,10 +981,11 @@ object ScheduledMessage : ClickableFeature() {
                     onDismiss = { showEditDialog = false },
                     onSave = { schedule ->
                         updateSchedule(schedule)
-                        // 编辑后重新计算并设置闹钟（时间可能已变更）
-                        if (schedule.enabled) scheduleAlarm(schedule)
+                        // 编辑后重新计算并设置闹钟（时间可能已变更）；关闭时务必撤掉旧闹钟
+                        if (schedule.enabled) scheduleAlarm(schedule) else cancelAlarm(schedule)
                         showToast("定时任务已更新")
                         showEditDialog = false
+                        refreshTasks()
                     },
                     existing = editingSchedule!!
                 )
@@ -551,28 +994,31 @@ object ScheduledMessage : ClickableFeature() {
                     title = { Text("定时发送消息") },
                     text = {
                         DefaultColumn(scrollable = true) {
-                            if (schedules.isEmpty()) {
+                            if (taskItems.isEmpty()) {
                                 Text(
                                     "还没有定时任务，点击下方按钮添加",
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(vertical = 16.dp)
                                 )
                             } else {
-                                schedules.forEach { schedule ->
+                                taskItems.forEach { schedule ->
                                     ListItem(
                                         modifier = Modifier.clickable {
                                             editingSchedule = schedule
                                             showEditDialog = true
                                         },
-                                        headlineContent = { Text(schedule.talkerName) },
+                                        headlineContent = { Text(scheduleTitle(schedule)) },
                                         supportingContent = {
                                             val summary = if (schedule.segments.isNotEmpty()) {
                                                 segmentsSummary(schedule.segments)
                                             } else {
                                                 schedule.messageType.description
                                             }
+                                            // 有主题时前置显示，便于对应消息菜单创建的任务
+                                            val subjectPrefix =
+                                                if (schedule.subject.isBlank()) "" else "「${schedule.subject}」"
                                             Text(
-                                                "${schedule.hour.toString().padStart(2, '0')}:${schedule.minute.toString().padStart(2, '0')} " +
+                                                "$subjectPrefix${schedule.hour.toString().padStart(2, '0')}:${schedule.minute.toString().padStart(2, '0')} " +
                                                         "${if (schedule.repeatDaily) "每天" else "单次"} $summary"
                                             )
                                         },
@@ -580,13 +1026,17 @@ object ScheduledMessage : ClickableFeature() {
                                             Switch(
                                                 checked = schedule.enabled,
                                                 onCheckedChange = { enabled ->
-                                                    schedule.enabled = enabled
+                                                    // 先写本地副本并持久化, 再刷新快照驱动开关即时翻转
+                                                    val updated = schedule.copy(enabled = enabled)
                                                     if (enabled) {
-                                                        scheduleAlarm(schedule)
+                                                        scheduleAlarm(updated)
                                                     } else {
-                                                        cancelAlarm(schedule)
+                                                        cancelAlarm(updated)
                                                     }
-                                                    updateSchedule(schedule)
+                                                    updateSchedule(updated)
+                                                    taskItems = taskItems.map {
+                                                        if (it.id == updated.id) updated else it
+                                                    }
                                                 }
                                             )
                                         }
@@ -612,338 +1062,90 @@ object ScheduledMessage : ClickableFeature() {
         existing: ScheduleConfig? = null
     ) {
         val isEditing = existing != null
-        val contacts = remember {
-            WeDatabaseApi.getFriends().map { it.wxId to it.nickname } +
-                    WeDatabaseApi.getGroups().map { it.wxId to it.displayName }
+        val initialSegments = remember {
+            existing?.let {
+                if (it.segments.isNotEmpty()) {
+                    it.segments
+                } else if (it.content.isNotBlank() || it.filePath.isNotBlank()) {
+                    listOf(
+                        MessageSegment(
+                            type = it.messageType,
+                            content = it.content,
+                            filePath = it.filePath,
+                            duration = it.duration
+                        )
+                    )
+                } else {
+                    emptyList()
+                }
+            } ?: emptyList()
         }
 
-        var selectedTalker by remember { mutableStateOf(existing?.talker ?: "") }
-        var selectedTalkerName by remember { mutableStateOf(existing?.talkerName ?: "") }
-        var segments by remember {
-            mutableStateOf(
-                existing?.let {
-                    if (it.segments.isNotEmpty()) {
-                        it.segments
-                    } else if (it.content.isNotBlank() || it.filePath.isNotBlank()) {
-                        listOf(
-                            MessageSegment(
-                                type = it.messageType,
-                                content = it.content,
-                                filePath = it.filePath,
-                                duration = it.duration
-                            )
-                        )
-                    } else {
-                        emptyList()
-                    }
-                } ?: emptyList()
-            )
+        // 与长按菜单端「定时发送」共用同一个编辑器组件, 两个入口功能完全一致:
+        // 发送对象(可多选) / 消息段列表 / 添加消息段 / 从收藏添加 / 发送时间 / 每天重复 / 启用。
+        val initialTargets = remember {
+            existing?.let {
+                val extras = it.extraTalkers.mapIndexed { index, wxId ->
+                    ScheduleTarget(wxId, it.extraTalkerNames.getOrNull(index).orEmpty())
+                }
+                listOf(ScheduleTarget(it.talker, it.talkerName)) + extras
+            } ?: emptyList()
         }
-        val timePickerState = rememberTimePickerState(
+
+        ScheduleTaskEditor(
+            title = if (isEditing) "编辑定时任务" else "添加定时任务",
+            initialTargets = initialTargets,
+            initialSegments = initialSegments,
             initialHour = existing?.hour ?: 9,
             initialMinute = existing?.minute ?: 0,
-            is24Hour = true
-        )
-        var repeatDaily by remember { mutableStateOf(existing?.repeatDaily ?: true) }
-        var enabled by remember { mutableStateOf(existing?.enabled ?: true) }
-        var showTalkerSelector by remember { mutableStateOf(false) }
-        var talkerSearchQuery by remember { mutableStateOf("") }
-        var showSegmentTypeDialog by remember { mutableStateOf(false) }
-        var pendingSegmentType by remember { mutableStateOf<MessageType?>(null) }
-        var showSegmentEditDialog by remember { mutableStateOf(false) }
-
-        var tempContent by remember { mutableStateOf("") }
-        var tempFilePath by remember { mutableStateOf("") }
-        var tempDuration by remember { mutableStateOf("0") }
-
-        AlertDialogContent(
-            title = { Text(if (isEditing) "编辑定时任务" else "添加定时任务") },
-            text = {
-                DefaultColumn(scrollable = true) {
-                    ListItem(
-                        modifier = Modifier.clickable { showTalkerSelector = true },
-                        headlineContent = { Text(if (selectedTalkerName.isNotBlank()) selectedTalkerName else "选择发送对象") },
-                        supportingContent = { Text(selectedTalker) }
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("消息段列表", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-
-                    if (segments.isEmpty()) {
-                        Text(
-                            "还没有消息段，点击下方按钮添加",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-                    } else {
-                        segments.forEachIndexed { index, segment ->
-                            ListItem(
-                                headlineContent = { Text(segment.summary()) },
-                                supportingContent = { Text("第${index + 1}段 - ${segment.type.description}") },
-                                trailingContent = {
-                                    TextButton(onClick = {
-                                        segments = segments.toMutableList().also { it.removeAt(index) }
-                                    }) { Text("删除") }
-                                }
-                            )
-                        }
-                    }
-
-                    Button(
-                        onClick = { showSegmentTypeDialog = true },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("+ 添加消息段") }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text("发送时间", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-
-                    TimePicker(state = timePickerState)
-
-                    ListItem(
-                        modifier = Modifier.clickable { repeatDaily = !repeatDaily },
-                        trailingContent = { Switch(checked = repeatDaily, onCheckedChange = null) },
-                        headlineContent = { Text("每天重复") },
-                        supportingContent = { Text(if (repeatDaily) "每天同一时间发送" else "仅发送一次") }
-                    )
-
-                    ListItem(
-                        modifier = Modifier.clickable { enabled = !enabled },
-                        trailingContent = { Switch(checked = enabled, onCheckedChange = null) },
-                        headlineContent = { Text("启用") },
-                        supportingContent = { Text(if (enabled) "任务将在指定时间执行" else "任务不会执行") }
-                    )
+            initialRepeatDaily = existing?.repeatDaily ?: true,
+            initialEnabled = existing?.enabled ?: true,
+            subjectRequired = false,
+            onDismiss = onDismiss,
+            onConfirm = { draft ->
+                if (draft.targets.isEmpty() || draft.talker.isBlank()) {
+                    showToast("请选择发送对象")
+                    return@ScheduleTaskEditor
                 }
-            },
-            dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-            confirmButton = {
-                Button(onClick = {
-                    val h = timePickerState.hour
-                    val m = timePickerState.minute
-
-                    if (selectedTalker.isBlank()) {
-                        showToast("请选择发送对象")
-                        return@Button
+                if (draft.segments.isEmpty()) {
+                    showToast("请至少添加一个消息段")
+                    return@ScheduleTaskEditor
+                }
+                draft.segments.forEachIndexed { index, segment ->
+                    val valid = when (segment.type) {
+                        MessageType.TEXT, MessageType.LINK, MessageType.FAVORITE -> segment.content.isNotBlank()
+                        MessageType.IMAGE, MessageType.VOICE,
+                        MessageType.VIDEO, MessageType.FILE -> segment.filePath.isNotBlank()
                     }
-
-                    if (segments.isEmpty()) {
-                        showToast("请至少添加一个消息段")
-                        return@Button
+                    if (!valid) {
+                        showToast("第${index + 1}段消息内容无效")
+                        return@ScheduleTaskEditor
                     }
+                }
 
-                    segments.forEachIndexed { index, segment ->
-                        val valid = when (segment.type) {
-                            MessageType.TEXT, MessageType.LINK -> segment.content.isNotBlank()
-                            MessageType.IMAGE, MessageType.VOICE,
-                            MessageType.VIDEO, MessageType.FILE -> segment.filePath.isNotBlank()
-                        }
-                        if (!valid) {
-                            showToast("第${index + 1}段消息内容无效")
-                            return@Button
-                        }
-                    }
-
-                    val schedule = ScheduleConfig(
+                onSave(
+                    ScheduleConfig(
                         id = existing?.id ?: "${System.currentTimeMillis()}",
-                        talker = selectedTalker,
-                        talkerName = selectedTalkerName,
+                        talker = draft.talker,
+                        talkerName = draft.talkerName,
+                        extraTalkers = draft.extraTalkers,
+                        extraTalkerNames = draft.extraTalkerNames,
+                        subject = draft.subject,
                         messageType = existing?.messageType ?: MessageType.TEXT,
                         content = existing?.content ?: "",
                         filePath = existing?.filePath ?: "",
                         duration = existing?.duration ?: 0,
-                        hour = h,
-                        minute = m,
-                        repeatDaily = repeatDaily,
-                        enabled = enabled,
-                        segments = segments
+                        hour = draft.hour,
+                        minute = draft.minute,
+                        repeatDaily = draft.repeatDaily,
+                        // 关闭"每天重复"即为一次性任务：发送一次后自动停用
+                        oneTimeOnly = !draft.repeatDaily,
+                        enabled = draft.enabled,
+                        segments = draft.segments
                     )
-
-                    onSave(schedule)
-                }) { Text(if (isEditing) "保存" else "添加") }
+                )
             }
         )
-
-        if (showTalkerSelector) {
-            val filteredContacts = remember(talkerSearchQuery, contacts) {
-                if (talkerSearchQuery.isBlank()) contacts
-                else contacts.filter { (wxId, name) ->
-                    name.contains(talkerSearchQuery, ignoreCase = true) ||
-                            wxId.contains(talkerSearchQuery, ignoreCase = true)
-                }
-            }
-            AlertDialogContent(
-                title = { Text("选择发送对象") },
-                text = {
-                    DefaultColumn {
-                        OutlinedTextField(
-                            value = talkerSearchQuery,
-                            onValueChange = { talkerSearchQuery = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            placeholder = { Text("搜索昵称或微信号") },
-                            singleLine = true
-                        )
-                        if (filteredContacts.isEmpty()) {
-                            Text(
-                                "无匹配的联系人",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(vertical = 16.dp)
-                            )
-                        } else {
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(max = 400.dp),
-                                verticalArrangement = Arrangement.spacedBy(0.dp)
-                            ) {
-                                items(filteredContacts, key = { it.first }) { (wxId, name) ->
-                                    ListItem(
-                                        modifier = Modifier.clickable {
-                                            selectedTalker = wxId
-                                            selectedTalkerName = name
-                                            showTalkerSelector = false
-                                            talkerSearchQuery = ""
-                                        },
-                                        headlineContent = { Text(name) },
-                                        supportingContent = { Text(wxId) },
-                                        trailingContent = { Text(if (selectedTalker == wxId) "✓" else "") }
-                                    )
-                                }
-                            }
-                        }
-                    }
-                },
-                dismissButton = { TextButton(onClick = {
-                    showTalkerSelector = false
-                    talkerSearchQuery = ""
-                }) { Text("取消") } },
-                confirmButton = {}
-            )
-        }
-
-        if (showSegmentTypeDialog) {
-            AlertDialogContent(
-                title = { Text("选择消息段类型") },
-                text = {
-                    DefaultColumn {
-                        MessageType.values().forEach { type ->
-                            ListItem(
-                                modifier = Modifier.clickable {
-                                    pendingSegmentType = type
-                                    tempContent = ""
-                                    tempFilePath = ""
-                                    tempDuration = "0"
-                                    showSegmentTypeDialog = false
-                                    showSegmentEditDialog = true
-                                },
-                                headlineContent = { Text(type.description) }
-                            )
-                        }
-                    }
-                },
-                dismissButton = { TextButton(onClick = { showSegmentTypeDialog = false }) { Text("取消") } },
-                confirmButton = {}
-            )
-        }
-
-        if (showSegmentEditDialog && pendingSegmentType != null) {
-            val type = pendingSegmentType!!
-            AlertDialogContent(
-                title = { Text("添加${type.description}消息段") },
-                text = {
-                    DefaultColumn {
-                        when (type) {
-                            MessageType.TEXT -> {
-                                OutlinedTextField(
-                                    value = tempContent,
-                                    onValueChange = { tempContent = it },
-                                    label = { Text("消息内容") },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    minLines = 3
-                                )
-                            }
-                            MessageType.LINK -> {
-                                OutlinedTextField(
-                                    value = tempContent,
-                                    onValueChange = { tempContent = it },
-                                    label = { Text("链接URL") },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    minLines = 2
-                                )
-                            }
-                            MessageType.VOICE -> {
-                                Button(
-                                    onClick = {
-                                        pickMediaFile(type) { path -> tempFilePath = path }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("选择语音文件") }
-                                if (tempFilePath.isNotBlank()) {
-                                    Text(
-                                        "已选: ${tempFilePath.substringAfterLast('/')}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                OutlinedTextField(
-                                    value = tempDuration,
-                                    onValueChange = { tempDuration = it.filter { c -> c.isDigit() } },
-                                    label = { Text("语音时长（毫秒）") },
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            }
-                            MessageType.IMAGE, MessageType.VIDEO -> {
-                                Button(
-                                    onClick = {
-                                        pickMediaFile(type) { path -> tempFilePath = path }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("选择${type.description}文件") }
-                                if (tempFilePath.isNotBlank()) {
-                                    Text(
-                                        "已选: ${tempFilePath.substringAfterLast('/')}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            MessageType.FILE -> {
-                                Button(
-                                    onClick = {
-                                        pickMediaFile(type) { path -> tempFilePath = path }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("选择文件") }
-                                if (tempFilePath.isNotBlank()) {
-                                    Text(
-                                        "已选: ${tempFilePath.substringAfterLast('/')}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = {
-                        showSegmentEditDialog = false
-                        pendingSegmentType = null
-                    }) { Text("取消") }
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        val newSegment = MessageSegment(
-                            type = type,
-                            content = tempContent,
-                            filePath = tempFilePath,
-                            duration = tempDuration.toIntOrNull() ?: 0
-                        )
-                        segments = segments + newSegment
-                        showSegmentEditDialog = false
-                        pendingSegmentType = null
-                    }) { Text("添加") }
-                }
-            )
-        }
     }
 
     @Composable

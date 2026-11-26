@@ -46,8 +46,9 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         // 版本号单一数据源：CI（.github/workflows/ci.yml）直接读取此处，
         // 发版时只需在此递增 versionCode / versionName
-        versionCode = 348
-        versionName = "v348"
+        // 跟随 J v348 基线；保留 fork 的发布参数覆盖。
+        versionCode = (project.findProperty("wcx.versionCode") as String?)?.toIntOrNull() ?: 348
+        versionName = (project.findProperty("wcx.versionName") as String?)?.takeIf { it.isNotBlank() } ?: "v348"
 
         buildConfigField("String", "COMMIT_HASH", "\"${gitHash}\"")
         buildConfigField("String", "TAG", "\"WCX\"")

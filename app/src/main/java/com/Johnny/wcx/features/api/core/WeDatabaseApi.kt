@@ -85,6 +85,12 @@ object WeDatabaseApi : ApiFeature(), IResolveDex {
 
     val isReady: Boolean get() = ::db.isInitialized
 
+    /** 微信收藏库（enFavorite.db）的连接，由 openDatabase hook 捕获；未就绪为 null。 */
+    @Volatile
+    var favoriteDb: SQLiteDatabase? = null
+
+    val isFavoriteReady: Boolean get() = favoriteDb != null
+
     /**
      * `message.createTime` 的单位倍数：`1` = 秒，`1000` = 毫秒。
      *
@@ -513,22 +519,34 @@ object WeDatabaseApi : ApiFeature(), IResolveDex {
             initializeDatabase(storageObj)
         }
 
-        if (Preferences.verboseLog) {
+        // 收藏库（enFavorite.db）是独立数据库，主库 db 里没有 FavItemInfo 表。
+        // 这里在微信打开库时按库名捕获其连接，供「定时发送 → 从收藏添加」读取收藏列表。
+        runCatching {
             SQLiteDatabase::class.reflekt().firstMethod {
                 name = "openDatabase"
                 parameters(BString, ByteArray::class, SQLiteCipherSpec::class, SQLiteDatabase.CursorFactory::class, int, DatabaseErrorHandler::class, int)
-            }.hookBefore {
-                val cipherSpec = args[2] as SQLiteCipherSpec?
-                WeLogger.d(
-                    TAG,
-                    "openDatabase() called with: name=${args[0] as String?}, password=${String(args[1] as? ByteArray? ?: return@hookBefore)}, cipherSpec=${
-                        cipherSpec.run {
-                            "${this?.hmacAlgorithm},${this?.hmacEnabled},${this?.kdfAlgorithm},${this?.kdfIteration},${this?.pageSize}"
-                        }
-                    }"
-                )
+            }.let { m ->
+                m.hookAfter {
+                    val name = args[0]?.toString().orEmpty()
+                    if (name.contains("enFavorite", ignoreCase = true)) {
+                        (result as? SQLiteDatabase)?.let { favoriteDb = it }
+                    }
+                }
+                if (Preferences.verboseLog) {
+                    m.hookBefore {
+                        val cipherSpec = args[2] as SQLiteCipherSpec?
+                        WeLogger.d(
+                            TAG,
+                            "openDatabase() called with: name=${args[0] as String?}, password=${String(args[1] as? ByteArray? ?: return@hookBefore)}, cipherSpec=${
+                                cipherSpec.run {
+                                    "${this?.hmacAlgorithm},${this?.hmacEnabled},${this?.kdfAlgorithm},${this?.kdfIteration},${this?.pageSize}"
+                                }
+                            }"
+                        )
+                    }
+                }
             }
-        }
+        }.onFailure { WeLogger.e(TAG, "hook openDatabase 失败", it) }
     }
 
     @Synchronized
