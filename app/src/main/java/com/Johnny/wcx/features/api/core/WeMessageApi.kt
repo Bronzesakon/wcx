@@ -253,7 +253,7 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                     cls.declaredConstructors.firstOrNull { c ->
                         c.parameterCount == 7 &&
                             c.parameterTypes[0].name == "android.content.Context" &&
-                            java.util.List::class.java.isAssignableFrom(c.parameterTypes[1]) &&
+                            List::class.java.isAssignableFrom(c.parameterTypes[1]) &&
                             c.parameterTypes[3].name == "java.lang.String" &&
                             (c.parameterTypes[4].name == "int" || c.parameterTypes[4].name == "java.lang.Integer") &&
                             (c.parameterTypes[6].name == "boolean" || c.parameterTypes[6].name == "java.lang.Boolean")
@@ -744,7 +744,7 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             field.set(
                 when (field.type) {
                     Integer.TYPE -> value.toInt()
-                    Integer::class.java -> value.toInt()
+                    Int::class.java -> value.toInt()
                     else -> value
                 }
             )
@@ -1272,7 +1272,7 @@ object WeMessageApi : ApiFeature(), IResolveDex {
             val thread = ctor.newInstance(
                 HostInfo.application,
                 java.util.Collections.singletonList(videoPath),
-                null, toUser, 2, null, java.lang.Boolean.TRUE
+                null, toUser, 2, null, true
             ) as Thread
             thread.start()
             true
@@ -1517,11 +1517,11 @@ object WeMessageApi : ApiFeature(), IResolveDex {
                     1 -> content
                     else -> null
                 }
-                t == java.lang.Integer.TYPE || t == java.lang.Integer::class.java -> if (i == 2) 1 else 0
-                t == java.lang.Long.TYPE || t == java.lang.Long::class.java -> 0L
-                t == java.lang.Boolean.TYPE || t == java.lang.Boolean::class.java -> false
-                t == java.lang.Byte.TYPE || t == java.lang.Byte::class.java -> 0.toByte()
-                t == java.lang.Character.TYPE || t == java.lang.Character::class.java -> '\u0000'
+                t == Int::class.java || t == Int::class.javaObjectType -> if (i == 2) 1 else 0
+                t == Long::class.java || t == Long::class.javaObjectType -> 0L
+                t == Boolean::class.java || t == Boolean::class.javaObjectType -> false
+                t == Byte::class.java || t == Byte::class.javaObjectType -> 0.toByte()
+                t == Char::class.java || t == Char::class.javaObjectType -> '\u0000'
                 else -> null
             }
         }
