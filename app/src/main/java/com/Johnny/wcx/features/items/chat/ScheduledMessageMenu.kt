@@ -74,8 +74,6 @@ object ScheduledMessageMenu : SwitchFeature(),
     private const val TAG = "ScheduledMessageMenu"
 
     private val SUPPORTED_MSG_TYPES = setOf(
-        MessageType.TEXT,
-        MessageType.QUOTE,
         MessageType.IMAGE,
         MessageType.VOICE,
         MessageType.VIDEO,
@@ -83,7 +81,8 @@ object ScheduledMessageMenu : SwitchFeature(),
         MessageType.FILE
     )
 
-    fun isSupportedMsg(msgInfo: MessageInfo): Boolean = msgInfo.type in SUPPORTED_MSG_TYPES
+    fun isSupportedMsg(msgInfo: MessageInfo): Boolean =
+        msgInfo.type?.isText == true || msgInfo.type in SUPPORTED_MSG_TYPES
 
     override fun onEnable() {
         WeChatMessageContextMenuApi.addProvider(this)

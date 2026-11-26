@@ -690,7 +690,7 @@ object ScheduledMessage : ClickableFeature() {
                 }
             }
             val handler = schedulerHandler
-            if (Thread.currentThread().id == schedulerThread?.id || handler == null) {
+            if (schedulerThread === Thread.currentThread() || handler == null) {
                 restore.run()
             } else {
                 handler.post(restore)

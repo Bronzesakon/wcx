@@ -82,7 +82,6 @@
 -repackageclasses
 -allowaccessmodification
 -overloadaggressively
--useuniqueclassmembernames
 
 # ─── Attributes ─────────────────────────────────────────────────────
 -keepattributes Signature
