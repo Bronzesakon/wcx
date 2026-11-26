@@ -1,0 +1,284 @@
+name: build
+
+# 推 master / 打 tag / 手动触发 → 云端构建 4 个 APK → 发布下载。
+# 发布策略沿用 sevnX / Mimo 的 CI 模式：
+#   - master 推送 → 覆盖发布固定 tag `latest` 的滚动 pre-release
+#     （资产 --clobber 覆盖、tag 强制移动、标题/说明刷新，页面与二进制始终一致）
+#   - v* tag → 该 tag 的正式 release
+# 签名复用 zcode-remote（android-shell）的 keystore：材料经 4 个 WEKIT_* Secrets
+# 注入，与 E:\Zcode_harmony\android-shell 的 ANDROID_* 流同源同key。
+# 发布必须使用固定证书；只有无 Secrets 的 PR 检查允许 debug 签名且不发布。
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      full_build:
+        description: '构建全部 4 个 variant（默认只出 standard × arm64-v8a）'
+        type: boolean
+        default: false
+
+# 同一 ref 有新提交时取消旧运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # 发布 release 资产
+
+jobs:
+  apk:
+    name: Build & publish APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        # 浅克隆即可: 版本号不再依赖 commit 数 (见 app/build.gradle.kts 的 -Pwcx.versionCode),
+        # 时间戳只用 git log -1, 哈希只用 git rev-parse HEAD
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record timestamps (UTC+8)
+        shell: bash
+        run: |
+          cst() {
+            local epoch
+            if [ -n "$1" ]; then epoch=$(date -u -d "$1" +%s); else epoch=$(date -u +%s); fi
+            date -u -d "@$((epoch + 28800))" "$2"
+          }
+          build_start=$(cst '' '+%Y-%m-%d %H:%M:%S')
+          push_time=$(cst "$(git log -1 --pretty=%cI)" '+%Y-%m-%d %H:%M:%S')
+          {
+            echo "BUILD_START_UTC8=$build_start"
+            echo "PUSH_TIME_UTC8=$push_time"
+          } >> "$GITHUB_ENV"
+          echo "build start $build_start (UTC+8) - commit $push_time (UTC+8)"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore release keystore
+        shell: bash
+        env:
+          WEKIT_KEYSTORE_BASE64: ${{ secrets.WEKIT_KEYSTORE_BASE64 }}
+          WEKIT_KEYSTORE_PASSWORD: ${{ secrets.WEKIT_KEYSTORE_PASSWORD }}
+          WEKIT_KEY_ALIAS: ${{ secrets.WEKIT_KEY_ALIAS }}
+          WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keys=(WEKIT_KEYSTORE_BASE64 WEKIT_KEYSTORE_PASSWORD WEKIT_KEY_ALIAS WEKIT_KEY_PASSWORD)
+          configured=0
+          for key in "${keys[@]}"; do
+            if [ -n "${!key:-}" ]; then configured=$((configured + 1)); fi
+          done
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$configured" -eq 0 ]; then
+            echo "SIGNING=debug" >> "$GITHUB_ENV"
+            echo "::notice::PR without signing secrets: debug artifact only, no release."
+            exit 0
+          fi
+          for key in "${keys[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Required release signing secret is missing: $key"
+              exit 1
+            fi
+          done
+          umask 077
+          keystore_path="$RUNNER_TEMP/wcx-release.p12"
+          if ! printf '%s' "$WEKIT_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$keystore_path" || ! test -s "$keystore_path"; then
+            echo "::error::Release keystore could not be decoded"
+            exit 1
+          fi
+          expected=$(tr -d '[:space:]' < .github/signing-certificate.sha256)
+          if ! actual=$(keytool -exportcert -storetype PKCS12 -keystore "$keystore_path" \
+            -alias "$WEKIT_KEY_ALIAS" -storepass:env WEKIT_KEYSTORE_PASSWORD | sha256sum | cut -d ' ' -f 1); then
+            echo "::error::Cannot read release signing certificate; check PKCS12 password and alias"
+            exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Release keystore certificate mismatch: expected $expected, got $actual"
+            exit 1
+          fi
+          {
+            echo "WEKIT_KEYSTORE_FILE=$keystore_path"
+            echo "SIGNING=release"
+          } >> "$GITHUB_ENV"
+          echo "Verified release keystore certificate SHA-256: $actual"
+
+      - name: Check scheduled-message timing
+        shell: pwsh
+        run: ./scripts/check-scheduled-message-timing.ps1
+
+      # v293 的音频等功能依赖 Rust 原生库；Gradle 打包前必须按所选 ABI 构建。
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Prepare native build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_version=$(sed -n 's/^ndk = "\([^"]*\)"/\1/p' gradle/libs.versions.toml)
+          test -n "$ndk_version"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-multilib libclang-dev pkg-config
+
+      - name: Build native library
+        shell: bash
+        env:
+          FULL_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+        run: |
+          set -euo pipefail
+          cargo xtask configure
+          if [ "$FULL_BUILD" = "true" ]; then
+            cargo xtask build --native-only
+            test -s app/src/main/jniLibs/armeabi-v7a/libwekit_native.so
+          else
+            cargo xtask build --native-only --abi arm64-v8a
+          fi
+          test -s app/src/main/jniLibs/arm64-v8a/libwekit_native.so
+
+      # Gradle 缓存由 setup-gradle 自带；这里只补 wrapper 下载缓存已在其中，
+      # 不额外缓存 build/ —— APK 产物本身不缓存。
+
+      - name: Set build task
+        # 默认只编 standard flavor 且只出 arm64-v8a 分包（-Pwcx.abi 过滤，见
+        # app/build.gradle.kts 的 splits 块）；手动勾选 full_build 时编全部 4 个。
+        # 注意：AGP 的 splits.abi 不生成按 ABI 命名的 assemble 任务，
+        # 变体任务就是 assemble<Flavor>Release，分包在打包期完成。
+        env:
+          FULL_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+        run: |
+          set -euo pipefail
+          if [ "$FULL_BUILD" = "true" ]; then
+            echo "BUILD_TASK=assembleRelease" >> "$GITHUB_ENV"
+            echo "BUILD_PROPS=" >> "$GITHUB_ENV"
+            echo "APK_DIR_PATTERN=app/build/outputs/apk/*/release" >> "$GITHUB_ENV"
+            echo "build task: assembleRelease (all variants)"
+          else
+            echo "BUILD_TASK=assembleStandardRelease" >> "$GITHUB_ENV"
+            echo "BUILD_PROPS=-Pwcx.abi=arm64-v8a" >> "$GITHUB_ENV"
+            echo "APK_DIR_PATTERN=app/build/outputs/apk/standard/release" >> "$GITHUB_ENV"
+            echo "build task: assembleStandardRelease -Pwcx.abi=arm64-v8a"
+          fi
+
+      - name: Build release APKs
+        env:
+          # wcx 的 build.gradle.kts 签名解析优先读这 4 个环境变量
+          # WEKIT_KEYSTORE_FILE 由恢复步骤写入 GITHUB_ENV，直接继承真实绝对路径。
+          WEKIT_KEYSTORE_PASSWORD: ${{ secrets.WEKIT_KEYSTORE_PASSWORD }}
+          WEKIT_KEY_ALIAS: ${{ secrets.WEKIT_KEY_ALIAS }}
+          WEKIT_KEY_PASSWORD: ${{ secrets.WEKIT_KEY_PASSWORD }}
+          # 写入 BuildConfig.RELEASE_TAG 供应用内更新判等
+          WCX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+        run: ./gradlew --no-daemon --console=plain -Pwcx.requireReleaseSigning="${{ env.SIGNING == 'release' }}" $BUILD_PROPS "$BUILD_TASK"
+
+      - name: Verify APK signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=($APK_DIR_PATTERN/*.apk)
+          test "${#apks[@]}" -gt 0
+          expected=$(tr -d '[:space:]' < .github/signing-certificate.sha256)
+          build_tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          if [ "$SIGNING" = "release" ]; then
+            # 直接使用 SDK 验签 API，避免依赖不同 build-tools 的 CLI 输出格式。
+            if ! java -cp "$build_tools/lib/apksigner.jar" scripts/VerifyApkSigning.java "$expected" "${apks[@]}"; then
+              echo "::error::APK signature or certificate verification failed"
+              exit 1
+            fi
+            echo "APK_CERT_SHA256=$expected" >> "$GITHUB_ENV"
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            for apk in "${apks[@]}"; do "$build_tools/apksigner" verify --verbose --print-certs "$apk"; done
+          else
+            echo "::error::Refusing to publish a debug-signed APK"
+            exit 1
+          fi
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcx-apks-${{ github.run_id }}
+          path: ${{ env.APK_DIR_PATTERN }}/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # 发布：PR 不发；tag → 正式 release；master 推送 → 滚动 pre-release `latest`。
+      # `latest` 刻意不带 v 前缀，避免匹配本 workflow 的 `v*` 触发造成循环。
+      - name: Publish release (rolling pre-release on master / release on tag)
+        # 手动 dispatch 只产出 artifact，不发布 release（避免旧仓库的 latest 被覆盖）。
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$SIGNING" = "release"
+          test -n "$APK_CERT_SHA256"
+          shopt -s nullglob
+          apks=(${{ env.APK_DIR_PATTERN }}/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "no APK was produced" >&2
+            exit 1
+          fi
+
+          build_start="${BUILD_START_UTC8:-$(date -u -d "@$(( $(date -u +%s) + 28800 ))" '+%Y-%m-%d %H:%M:%S')}"
+          push_time="${PUSH_TIME_UTC8:-$(date -u -d "@$(( $(git log -1 --pretty=%ct) + 28800 ))" '+%Y-%m-%d %H:%M:%S')}"
+          notes="build start ${build_start} (UTC+8) - commit ${push_time} (UTC+8) - ${GITHUB_SHA:0:7} - signing: ${SIGNING} - certificate-sha256: ${APK_CERT_SHA256}"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            title="WCX ${tag}"
+            options=(--notes "$notes" --generate-notes)
+            rolling=false
+          else
+            tag="latest"
+            title="Latest build (master, ${build_start} UTC+8)"
+            options=(--prerelease --notes "$notes")
+            rolling=true
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 先上传 (--clobber 覆盖同名资产), 再清理本次未产出的旧资产。
+            # 顺序不能反: 先删后传会让 release 在两步之间出现"无资产"空窗期,
+            # 外部工具(例如按 assets[0] 取下载地址)会拿到空值。
+            # 清理这一步仍必要: 从"全量 4 个"切回"精简 1 个"时,
+            # --clobber 只覆盖同名文件, 上次多出来的资产会一直留着。
+            gh release upload "$tag" "${apks[@]}" --clobber
+            keep=()
+            for a in "${apks[@]}"; do keep+=("$(basename "$a")"); done
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if ! printf '%s\n' "${keep[@]}" | grep -qxF "$name"; then
+                echo "removing stale asset: $name"
+                gh release delete-asset "$tag" "$name" --yes || true
+              fi
+            done < <(gh release view "$tag" --json assets --jq '.assets[].name')
+            if [ "$rolling" = true ]; then
+              # 换资产的同时移动 tag 并刷新标题/说明，使页面与本次二进制一致
+              git push --force origin "HEAD:refs/tags/$tag"
+              gh release edit "$tag" --title "$title" --notes "$notes"
+            fi
+          else
+            gh release create "$tag" --title "$title" "${options[@]}" "${apks[@]}"
+          fi
+          gh release view "$tag" --json tagName,isPrerelease,assets \
+            --jq '"published " + .tagName + " prerelease=" + (.isPrerelease|tostring) + " assets=" + ([.assets[].name]|join(","))'
